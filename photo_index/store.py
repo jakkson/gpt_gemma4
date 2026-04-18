@@ -14,6 +14,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # Wait up to 2 minutes for our index DB if another process holds a write lock
+    conn.execute("PRAGMA busy_timeout=120000")
     return conn
 
 

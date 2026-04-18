@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -10,6 +11,7 @@ from ollama import ResponseError, chat
 
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.paths import resolve_local_image_path
+from photo_index.retry_busy import retry_on_transient_lock
 
 _PHOTOS_ACCESS_HELP = """
 macOS blocked read access to your Photos library (Photos.sqlite).
@@ -21,24 +23,28 @@ Fix:
        • Terminal.app / iTerm2 (if you run Python there).
   3. Quit and reopen that app, then run the script again.
 
-If the Photos app is open and the library is locked, quit Photos and retry.
+If the Photos app is open, the indexer will wait and retry (see PHOTO_INDEX_DB_RETRY_WAIT).
 """
+
+_DEFAULT_DB_WAIT = float(os.environ.get("PHOTO_INDEX_DB_RETRY_WAIT", "30"))
+_DEFAULT_DB_MAX = int(os.environ.get("PHOTO_INDEX_DB_RETRY_MAX", "120"))
 
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _photos_db():
-    """Open the system Photos library; may raise on macOS privacy restrictions."""
-    return osxphotos.PhotosDB()
-
-
 def main() -> None:
     _log("[osxphotos] Opening Photos library…")
     t0 = time.perf_counter()
     try:
-        photosdb = _photos_db()
+        photosdb = retry_on_transient_lock(
+            lambda: osxphotos.PhotosDB(),
+            log=_log,
+            wait_seconds=_DEFAULT_DB_WAIT,
+            max_attempts=_DEFAULT_DB_MAX,
+            what="open Photos library",
+        )
     except OSError as e:
         err = str(e).lower()
         if "operation not permitted" in err or "permission denied" in err or getattr(e, "errno", None) in (1, 13):
@@ -48,7 +54,13 @@ def main() -> None:
     _log(f"[osxphotos] OK — library path: {photosdb.library_path}")
     _log("[osxphotos] Loading image list (can take a while on large libraries)…")
 
-    all_images = photosdb.photos(images=True, movies=False)
+    all_images = retry_on_transient_lock(
+        lambda: photosdb.photos(images=True, movies=False),
+        log=_log,
+        wait_seconds=_DEFAULT_DB_WAIT,
+        max_attempts=_DEFAULT_DB_MAX,
+        what="read Photos image list",
+    )
     _log(f"[osxphotos] OK — {len(all_images)} images in library (movies excluded)")
 
     batch = all_images[:10]
