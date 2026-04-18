@@ -1,1 +1,2 @@
-Commit after each logical batch of changes.
+Commit after each logical batch of changes, then push to GitHub:
+https://github.com/jakkson/gpt_gemma4.git

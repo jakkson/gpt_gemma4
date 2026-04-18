@@ -1,11 +1,15 @@
 ---
-description: Commit after each logical batch of changes
+description: Commit and push to GitHub after each logical batch
 alwaysApply: true
 ---
 
 # Git commit workflow
 
-After finishing a **logical batch** of edits (one feature, one fix, one coherent refactor, or one documentation/rules update), **create a git commit** with a clear message before moving on to unrelated work.
+After finishing a **logical batch** of edits (one feature, one fix, one coherent refactor, or one documentation/rules update):
+
+1. **Create a git commit** with a clear message.
+2. **Push to GitHub** so the work lands on the remote: **`https://github.com/jakkson/gpt_gemma4.git`** (remote name: `origin`, typically `git push origin main` or the current branch).
 
 - Do not leave large uncommitted mixed changes when switching tasks.
-- If a batch is incomplete, it is fine to wait until that batch is done before committing.
+- If a batch is incomplete, wait until that batch is done before committing and pushing.
+- Ensure `origin` points at that repository before pushing; if the user uses another remote name, follow their setup but the canonical repo URL is above.
