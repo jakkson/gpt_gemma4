@@ -71,6 +71,7 @@ def upsert_photo(
     ocr_text: str,
     vlm_text: str,
     image_path_used: str,
+    commit: bool = True,
 ) -> None:
     now = time.time()
     conn.execute("DELETE FROM photo_meta WHERE uuid = ?", (uuid,))
@@ -90,6 +91,12 @@ def upsert_photo(
         ]
     )
     conn.execute("INSERT INTO photo_lex (uuid, doc) VALUES (?, ?)", (uuid, doc))
+    if commit:
+        conn.commit()
+
+
+def commit_ingest(conn: sqlite3.Connection) -> None:
+    """Flush a batched ingest (call at checkpoints and end of run)."""
     conn.commit()
 
 
