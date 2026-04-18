@@ -6,7 +6,10 @@ import sys
 import time
 
 import osxphotos
-from ollama import chat
+from ollama import ResponseError, chat
+
+from photo_index.ollama_image import image_path_for_ollama
+from photo_index.paths import resolve_local_image_path
 
 _PHOTOS_ACCESS_HELP = """
 macOS blocked read access to your Photos library (Photos.sqlite).
@@ -49,47 +52,65 @@ def main() -> None:
     _log(f"[osxphotos] OK — {len(all_images)} images in library (movies excluded)")
 
     batch = all_images[:10]
-    _log(f"[osxphotos] Using first {len(batch)} images from that list (not necessarily newest)")
-    _log("[ollama] Sending each image with a local path to gemma4:26b (slow per image)…")
+    _log(f"[osxphotos] Using first {len(batch)} images (previews preferred over full originals)")
+    _log("[ollama] Images are re-encoded to JPEG for Gemma/Ollama (fixes HEIC / unknown format).")
     _log("-" * 60)
 
-    processed = 0
+    ok = 0
     skipped_no_path = 0
+    skipped_image = 0
 
     for i, photo in enumerate(batch, start=1):
-        if not photo.path:
+        img_path = resolve_local_image_path(photo, prefer="derivatives")
+        if not img_path:
             skipped_no_path += 1
             _log(
-                f"[osxphotos] [{i}/{len(batch)}] skip (no local file): "
-                f"{photo.filename or photo.uuid} — often iCloud-only; download in Photos first"
+                f"[osxphotos] [{i}/{len(batch)}] skip (no local preview/file): "
+                f"{photo.filename or photo.uuid}"
             )
             continue
 
-        processed += 1
         _log(f"[osxphotos] [{i}/{len(batch)}] Processing: {photo.filename}")
-        _log(f"           path: {photo.path}")
+        _log(f"           source: {img_path}")
 
-        response = chat(
-            model="gemma4:26b",
-            messages=[
-                {
-                    "role": "user",
-                    "content": "Describe this photo for my personal search index.",
-                    "images": [photo.path],
-                },
-            ],
-        )
+        try:
+            with image_path_for_ollama(img_path) as ollama_img:
+                response = chat(
+                    model="gemma4:26b",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "Describe this photo for my personal search index.",
+                            "images": [ollama_img],
+                        },
+                    ],
+                )
+        except ResponseError as e:
+            skipped_image += 1
+            _log(f"[ollama] skip (vision error): {e}")
+            _log("-" * 60)
+            continue
+        except (OSError, ValueError) as e:
+            skipped_image += 1
+            _log(f"[image] skip (could not decode): {e}")
+            _log("-" * 60)
+            continue
+
+        ok += 1
         text = response.message.content or ""
         _log(f"[ollama] Gemma says: {text[:500]}{'…' if len(text) > 500 else ''}")
         _log("-" * 60)
 
     elapsed = time.perf_counter() - t0
-    _log(f"[done] Processed with vision: {processed} image(s); skipped (no local path): {skipped_no_path}; time: {elapsed:.1f}s")
+    _log(
+        f"[done] vision_ok={ok} skipped_no_path={skipped_no_path} "
+        f"skipped_decode_or_ollama={skipped_image} time={elapsed:.1f}s"
+    )
 
-    if processed == 0 and skipped_no_path:
+    if ok == 0 and skipped_no_path:
         _log(
-            "[hint] All sampled images lacked a downloaded file on disk. "
-            "Open Photos, select them, and use “Download Originals” (or similar), then rerun."
+            "[hint] No local preview/file for these items. "
+            "Open Photos and let thumbnails generate, or enable iCloud downloads for a subset."
         )
 
 

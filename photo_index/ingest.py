@@ -14,6 +14,7 @@ import osxphotos
 from ollama import chat
 
 from photo_index.checkpoint import checkpoint_path_for_db, write_checkpoint
+from photo_index.ollama_image import image_path_for_ollama
 from photo_index.paths import PreferPath, resolve_local_image_path
 from photo_index.store import already_indexed, commit_ingest, connect, init_schema, upsert_photo
 
@@ -91,20 +92,21 @@ def run_ingest(
         vlm_text = ""
         if not skip_vlm:
             try:
-                response = chat(
-                    model=vlm_model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": (
-                                "Describe this image briefly for a personal search index. "
-                                "Focus on subjects, setting, text visible, and notable objects. "
-                                "2–4 sentences."
-                            ),
-                            "images": [img_path],
-                        },
-                    ],
-                )
+                with image_path_for_ollama(img_path) as ollama_img:
+                    response = chat(
+                        model=vlm_model,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Describe this image briefly for a personal search index. "
+                                    "Focus on subjects, setting, text visible, and notable objects. "
+                                    "2–4 sentences."
+                                ),
+                                "images": [ollama_img],
+                            },
+                        ],
+                    )
                 vlm_text = (response.message.content or "").strip()
             except Exception as e:
                 _log(f"[warn] VLM failed for {photo.uuid}: {e}")
