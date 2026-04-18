@@ -1,3 +1,4 @@
 ollama>=0.6
 osxphotos>=0.75
 Pillow>=10.0
+twilio>=9.0

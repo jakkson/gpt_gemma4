@@ -17,6 +17,7 @@ from photo_index.checkpoint import checkpoint_path_for_db, write_checkpoint
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.paths import PreferPath, resolve_local_image_path
 from photo_index.retry_busy import retry_on_transient_lock
+from photo_index.sms_notify import notify_ingest_failure, notify_ingest_success
 from photo_index.store import already_indexed, commit_ingest, connect, init_schema, upsert_photo
 
 _PHOTOS_ACCESS_HELP = """
@@ -43,7 +44,7 @@ def run_ingest(
     checkpoint_every: int,
     db_retry_wait_seconds: float,
     db_retry_max_attempts: int,
-) -> None:
+) -> dict[str, float | int]:
     _log("[osxphotos] Opening Photos library…")
 
     def open_db():
@@ -208,6 +209,14 @@ def run_ingest(
         f"[done] indexed={ok} skipped_no_local_file={skip_no_path} "
         f"skipped_already={skip_dup} vlm_errors={errors} time={elapsed:.1f}s db={db_path}"
     )
+    return {
+        "ok": ok,
+        "skip_no_path": skip_no_path,
+        "skip_dup": skip_dup,
+        "errors": errors,
+        "elapsed": elapsed,
+        "total": total,
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -261,25 +270,38 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="Max retries after a lock/busy error per operation (default: 120).",
     )
+    p.add_argument(
+        "--no-sms",
+        action="store_true",
+        help="Do not send SMS on success/failure (even if PHOTO_INDEX_SMS and Twilio are set).",
+    )
     args = p.parse_args(argv)
 
     if args.commit_every < 1:
         p.error("--commit-every must be >= 1")
 
     db_path = Path(os.path.abspath(args.db))
-    run_ingest(
-        db_path=db_path,
-        limit=args.limit,
-        force=args.force,
-        vlm_model=args.vlm_model,
-        skip_vlm=args.skip_vlm,
-        progress_every=args.progress_every,
-        prefer=args.prefer,
-        commit_every=args.commit_every,
-        checkpoint_every=args.checkpoint_every,
-        db_retry_wait_seconds=args.db_retry_wait,
-        db_retry_max_attempts=args.db_retry_max,
-    )
+    try:
+        stats = run_ingest(
+            db_path=db_path,
+            limit=args.limit,
+            force=args.force,
+            vlm_model=args.vlm_model,
+            skip_vlm=args.skip_vlm,
+            progress_every=args.progress_every,
+            prefer=args.prefer,
+            commit_every=args.commit_every,
+            checkpoint_every=args.checkpoint_every,
+            db_retry_wait_seconds=args.db_retry_wait,
+            db_retry_max_attempts=args.db_retry_max,
+        )
+    except Exception as e:
+        if not args.no_sms:
+            notify_ingest_failure(e)
+        raise
+    else:
+        if not args.no_sms:
+            notify_ingest_success(stats)
 
 
 if __name__ == "__main__":
