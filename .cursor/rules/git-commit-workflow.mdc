@@ -1,0 +1,11 @@
+---
+description: Commit after each logical batch of changes
+alwaysApply: true
+---
+
+# Git commit workflow
+
+After finishing a **logical batch** of edits (one feature, one fix, one coherent refactor, or one documentation/rules update), **create a git commit** with a clear message before moving on to unrelated work.
+
+- Do not leave large uncommitted mixed changes when switching tasks.
+- If a batch is incomplete, it is fine to wait until that batch is done before committing.
