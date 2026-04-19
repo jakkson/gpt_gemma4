@@ -6,11 +6,16 @@ import os
 import traceback
 from typing import Any
 
+# --- Twilio SMS: disabled while account login is sorted out. Set True to re-enable. ---
+TWILIO_INGEST_SMS_ENABLED = False
+
 # Default destination (E.164). Override with PHOTO_INDEX_SMS_TO.
 _DEFAULT_SMS_TO = "+14158770063"
 
 
 def _sms_enabled() -> bool:
+    if not TWILIO_INGEST_SMS_ENABLED:
+        return False
     if os.environ.get("PHOTO_INDEX_SMS", "").strip().lower() not in (
         "1",
         "true",
@@ -45,6 +50,7 @@ def send_sms(body: str) -> bool:
     if len(body) > 1500:
         body = body[:1497] + "..."
 
+    # --- Twilio client (disabled via TWILIO_INGEST_SMS_ENABLED until account works) ---
     try:
         from twilio.rest import Client
     except ImportError as e:

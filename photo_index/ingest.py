@@ -16,8 +16,8 @@ from ollama import chat
 from photo_index.checkpoint import checkpoint_path_for_db, write_checkpoint
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.paths import PreferPath, resolve_local_image_path
+from photo_index.keep_awake import start_keep_awake
 from photo_index.retry_busy import retry_on_transient_lock
-from photo_index.sms_notify import notify_ingest_failure, notify_ingest_success
 from photo_index.store import already_indexed, commit_ingest, connect, init_schema, upsert_photo
 
 _PHOTOS_ACCESS_HELP = """
@@ -44,7 +44,11 @@ def run_ingest(
     checkpoint_every: int,
     db_retry_wait_seconds: float,
     db_retry_max_attempts: int,
+    keep_awake: bool,
 ) -> dict[str, float | int]:
+    if keep_awake:
+        start_keep_awake(_log)
+
     _log("[osxphotos] Opening Photos library…")
 
     def open_db():
@@ -275,33 +279,43 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Do not send SMS on success/failure (even if PHOTO_INDEX_SMS and Twilio are set).",
     )
+    p.add_argument(
+        "--no-keep-awake",
+        action="store_true",
+        help="Do not run macOS caffeinate (screen lock / idle may pause long ingests).",
+    )
     args = p.parse_args(argv)
 
     if args.commit_every < 1:
         p.error("--commit-every must be >= 1")
 
     db_path = Path(os.path.abspath(args.db))
-    try:
-        stats = run_ingest(
-            db_path=db_path,
-            limit=args.limit,
-            force=args.force,
-            vlm_model=args.vlm_model,
-            skip_vlm=args.skip_vlm,
-            progress_every=args.progress_every,
-            prefer=args.prefer,
-            commit_every=args.commit_every,
-            checkpoint_every=args.checkpoint_every,
-            db_retry_wait_seconds=args.db_retry_wait,
-            db_retry_max_attempts=args.db_retry_max,
-        )
-    except Exception as e:
-        if not args.no_sms:
-            notify_ingest_failure(e)
-        raise
-    else:
-        if not args.no_sms:
-            notify_ingest_success(stats)
+    # Twilio SMS hooks (disabled — set TWILIO_INGEST_SMS_ENABLED in sms_notify.py, then wrap below):
+    # try:
+    #     stats = run_ingest(...)
+    # except Exception as e:
+    #     if not args.no_sms:
+    #         from photo_index.sms_notify import notify_ingest_failure
+    #         notify_ingest_failure(e)
+    #     raise
+    # else:
+    #     if not args.no_sms:
+    #         from photo_index.sms_notify import notify_ingest_success
+    #         notify_ingest_success(stats)
+    run_ingest(
+        db_path=db_path,
+        limit=args.limit,
+        force=args.force,
+        vlm_model=args.vlm_model,
+        skip_vlm=args.skip_vlm,
+        progress_every=args.progress_every,
+        prefer=args.prefer,
+        commit_every=args.commit_every,
+        checkpoint_every=args.checkpoint_every,
+        db_retry_wait_seconds=args.db_retry_wait,
+        db_retry_max_attempts=args.db_retry_max,
+        keep_awake=not args.no_keep_awake,
+    )
 
 
 if __name__ == "__main__":
