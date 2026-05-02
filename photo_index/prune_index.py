@@ -98,18 +98,26 @@ def main(argv: list[str] | None = None) -> int:
         if total > args.sample:
             print(f"  …and {total - args.sample} more")
 
-        if total == 0 or args.dry_run:
+        if args.dry_run:
             return 0
-        if not args.yes:
+        if total > 0 and not args.yes:
             print("[prune] refusing to delete without --yes (use --dry-run for a preview).")
             return 1
 
-        uuids = [u for (u, _) in matches]
-        delete_uuids(conn, uuids)
-        print(f"[prune] deleted {total} rows from photo_meta + photo_lex.")
+        if total > 0:
+            uuids = [u for (u, _) in matches]
+            delete_uuids(conn, uuids)
+            print(f"[prune] deleted {total} rows from photo_meta + photo_lex.")
 
         if args.vacuum:
-            print("[prune] running VACUUM (this may take a while)…")
+            print(
+                "[prune] running VACUUM (rebuilds the DB file; needs ~equal free disk; "
+                "expect 30+ min on a multi-GB index)…"
+            )
+            # VACUUM cannot run inside an explicit transaction. The Python sqlite3
+            # driver opens a transaction on first DML; a no-op INSERT/COMMIT pair
+            # plus isolation_level=None ensures we're outside any txn.
+            conn.isolation_level = None
             conn.execute("VACUUM")
             print("[prune] VACUUM complete.")
     finally:

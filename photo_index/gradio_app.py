@@ -8,9 +8,12 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
+import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
 try:
@@ -22,6 +25,9 @@ from pathlib import Path
 from typing import Any
 
 import gradio as gr
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from ollama import chat
 from PIL import Image
 
@@ -665,14 +671,14 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         snippet = ocr_excerpt or vlm_excerpt or "(no snippet)"
         title = filename or uuid
         when = _format_local_dt(date_iso) or "n/a"
-        # "Reference attachment" link: file:// URI for local images so the
-        # user gets a clickable hyperlink directly in the result block.
+        # "Reference attachment" link: route the click through our own
+        # /open-local-file endpoint so the OS default app actually opens
+        # (browsers silently block `file://` navigation from `http://` pages,
+        # which is why direct file:// links did nothing).
         if image_path:
-            try:
-                href = Path(image_path).as_uri()
-            except Exception:
-                href = ""
-            link_md = f"[Open local file]({href})" if href else "(no local link)"
+            encoded = urllib.parse.quote(image_path, safe="")
+            href = f"/open-local-file?path={encoded}"
+            link_md = f"[Open local file]({href})"
             ref = f"`{image_path}`"
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
@@ -1370,7 +1376,56 @@ def build_app(
         alias_load_btn.click(fn=load_alias_json, outputs=[alias_json, alias_status])
         alias_save_btn.click(fn=save_alias_json, inputs=[alias_json], outputs=[alias_status])
 
+        # Inject keyboard binding (Enter-to-search) on every page load. This used
+        # to live on `Blocks.launch(js=...)`, but we now bypass `launch()` to
+        # mount Gradio onto our own FastAPI app (so /open-local-file works), and
+        # `Blocks.__init__` doesn't take `js`. `load(js=...)` runs the same JS.
+        demo.load(fn=lambda: None, js=_KEYBOARD_JS)
+
     return demo
+
+
+def _open_local_file_handler(path: str) -> Response:
+    """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
+
+    The hit summary in the UI links to ``/open-local-file?path=<encoded>``.
+    Browsers won't navigate from a localhost HTTP page directly to ``file://``
+    URIs, so we route the click through this server-side handler. Returns
+    HTTP 204 No Content on success so the browser stays on the current page
+    while the file pops open in its native app.
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="missing path")
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail=f"not a regular file: {path}")
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        elif sys.platform == "win32":
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as e:  # pragma: no cover - depends on host environment
+        raise HTTPException(status_code=500, detail=f"open failed: {e}")
+    return Response(status_code=204)
+
+
+def _find_free_port(host: str, start: int, attempts: int = 10) -> int:
+    """Probe ports starting at ``start``, return the first that's bindable."""
+    last_err: OSError | None = None
+    for port in range(start, start + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, port))
+                return port
+            except OSError as e:
+                last_err = e
+                continue
+    raise OSError(
+        f"No free port in {start}..{start + attempts - 1} on {host}: {last_err}"
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1403,7 +1458,7 @@ def main(argv: list[str] | None = None) -> None:
 
     db_path = Path(os.path.abspath(args.db))
     installed_models = _installed_ollama_models()
-    app = build_app(
+    blocks = build_app(
         db_path=db_path,
         top_k=args.top_k,
         qa_model=args.qa_model,
@@ -1412,14 +1467,20 @@ def main(argv: list[str] | None = None) -> None:
         auto_correct=not args.no_auto_correct,
         installed_models=installed_models,
     )
-    # Prefer requested port; fall back to nearby ports when occupied.
-    for port in range(args.port, args.port + 10):
-        try:
-            app.launch(server_name=args.host, server_port=port, js=_KEYBOARD_JS)
-            return
-        except OSError:
-            if port >= args.port + 9:
-                raise
+    # Build our own FastAPI app so we can register /open-local-file (the
+    # server-side helper that backs the "Open local file" hit links) alongside
+    # the mounted Gradio routes. Gradio's own launch() doesn't expose a way to
+    # add arbitrary HTTP routes, so we bypass it.
+    api_app = FastAPI(title="photo-index")
+    api_app.add_api_route(
+        "/open-local-file",
+        _open_local_file_handler,
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    port = _find_free_port(args.host, args.port, attempts=10)
+    gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host, server_port=port)
+    uvicorn.run(api_app, host=args.host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
