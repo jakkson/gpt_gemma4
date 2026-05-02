@@ -12,6 +12,7 @@ _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sql
 
 from ollama import chat
 
+from photo_index.query_expand import expand_query_terms, reset_synonym_cache
 from photo_index.store import (
     connect,
     init_schema,
@@ -28,18 +29,29 @@ def run_search(
     top_k: int,
     qa_model: str,
 ) -> None:
+    reset_synonym_cache()
     conn = connect(db_path)
     init_schema(conn)
 
     rows: list[sqlite3.Row] = []
-    try:
-        rows = search_meta(conn, question, limit=top_k)
-    except sqlite3.OperationalError as e:
-        print(f"[warn] FTS query issue: {e}; using substring fallback.", file=sys.stderr)
-        rows = search_meta_fallback_substring(conn, question, limit=top_k)
+    merged: dict[str, sqlite3.Row] = {}
+    for expanded in expand_query_terms(question):
+        try:
+            hits = search_meta(conn, expanded, limit=top_k)
+        except sqlite3.OperationalError as e:
+            print(f"[warn] FTS query issue: {e}; using substring fallback.", file=sys.stderr)
+            hits = search_meta_fallback_substring(conn, expanded, limit=top_k)
+        for r in hits:
+            merged[r["uuid"]] = r
+    rows = list(merged.values())[:top_k]
 
-    if not rows:
-        rows = search_meta_fallback_substring(conn, question, limit=top_k)
+    for expanded in expand_query_terms(question):
+        hits = search_meta_fallback_substring(conn, expanded, limit=top_k)
+        for r in hits:
+            merged[r["uuid"]] = r
+        if len(merged) >= max(top_k * 2, top_k):
+            break
+    rows = list(merged.values())[:top_k]
 
     if not rows:
         print("No matches in index. Run: python -m photo_index.ingest", file=sys.stderr)

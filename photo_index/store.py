@@ -8,6 +8,44 @@ import sqlite3
 import time
 from pathlib import Path
 
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "latest",
+    "me",
+    "most",
+    "my",
+    "of",
+    "on",
+    "or",
+    "recent",
+    "show",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+}
+
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +90,12 @@ def fts_token_prefix_query(q: str) -> str:
         # FTS5 treats "special" chars; keep alnum-heavy tokens
         safe = re.sub(r"[^\w.-]", "", r, flags=re.UNICODE)
         if not safe:
+            continue
+        low = safe.lower()
+        # Drop very common words so natural language questions remain searchable.
+        if low in _STOPWORDS:
+            continue
+        if len(low) < 3:
             continue
         parts.append(f"{safe}*")
     if not parts:
@@ -121,14 +165,41 @@ def search_meta(conn: sqlite3.Connection, fts_query: str, limit: int = 25) -> li
 def search_meta_fallback_substring(
     conn: sqlite3.Connection, needle: str, limit: int = 25
 ) -> list[sqlite3.Row]:
-    """If FTS MATCH fails or returns nothing, fall back to LIKE."""
-    like = f"%{needle}%"
-    sql = """
-    SELECT *, 0 AS rank FROM photo_meta
-    WHERE ocr_text LIKE ? OR vlm_text LIKE ? OR filename LIKE ?
+    """
+    If FTS MATCH fails or returns nothing, fall back to token LIKE.
+
+    Natural language questions rarely exist as exact substrings in indexed rows.
+    So we tokenize and OR-match meaningful terms (while preserving UUID/date order).
+    """
+    raw = re.findall(r"[\w'.-]+", needle or "", re.UNICODE)
+    terms: list[str] = []
+    for r in raw:
+        safe = re.sub(r"[^\w.-]", "", r, flags=re.UNICODE).lower()
+        if not safe or safe in _STOPWORDS or len(safe) < 3:
+            continue
+        if safe not in terms:
+            terms.append(safe)
+    if not terms:
+        terms = [needle.strip()] if (needle or "").strip() else []
+    if not terms:
+        return []
+
+    clauses: list[str] = []
+    params: list[str | int] = []
+    for t in terms:
+        like = f"%{t}%"
+        clauses.append("(lower(ocr_text) LIKE ? OR lower(vlm_text) LIKE ? OR lower(filename) LIKE ?)")
+        params.extend([like, like, like])
+
+    sql = f"""
+    SELECT *, 0 AS rank
+    FROM photo_meta
+    WHERE {" OR ".join(clauses)}
+    ORDER BY date_iso DESC, ingested_at DESC
     LIMIT ?
     """
-    return list(conn.execute(sql, (like, like, like, limit)))
+    params.append(limit)
+    return list(conn.execute(sql, params))
 
 
 def row_to_prompt_block(row: sqlite3.Row) -> str:

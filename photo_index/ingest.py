@@ -14,6 +14,7 @@ import osxphotos
 from ollama import chat
 
 from photo_index.checkpoint import checkpoint_path_for_db, write_checkpoint
+from photo_index.ingest_lock import global_ingest_lock
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.paths import PreferPath, resolve_local_image_path
 from photo_index.keep_awake import start_keep_awake
@@ -70,6 +71,11 @@ def run_ingest(
 
     conn = connect(db_path)
     init_schema(conn)
+
+    _log(
+        "[osxphotos] Loading image list (no per-photo progress yet; "
+        "large libraries can take several minutes before indexing starts)…"
+    )
 
     def load_photo_list():
         p = photosdb.photos(images=True, movies=False)
@@ -255,8 +261,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument(
         "--vlm-model",
-        default=os.environ.get("PHOTO_INDEX_VLM_MODEL", "gemma4:e2b"),
-        help="Ollama vision model for captions (default: gemma4:e2b or PHOTO_INDEX_VLM_MODEL).",
+        default=os.environ.get("PHOTO_INDEX_VLM_MODEL", "gemma4:26b"),
+        help="Ollama vision model for captions (default: gemma4:26b or PHOTO_INDEX_VLM_MODEL).",
     )
     p.add_argument("--skip-vlm", action="store_true", help="OCR only (Apple Vision); no Gemma captioning.")
     p.add_argument("--progress-every", type=int, default=50, help="Log progress every N images (0=off).")
@@ -284,6 +290,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Do not run macOS caffeinate (screen lock / idle may pause long ingests).",
     )
+    p.add_argument(
+        "--no-global-ingest-lock",
+        action="store_true",
+        help="Disable shared content-ingest lock (not recommended).",
+    )
     args = p.parse_args(argv)
 
     if args.commit_every < 1:
@@ -302,20 +313,41 @@ def main(argv: list[str] | None = None) -> None:
     #     if not args.no_sms:
     #         from photo_index.sms_notify import notify_ingest_success
     #         notify_ingest_success(stats)
-    run_ingest(
-        db_path=db_path,
-        limit=args.limit,
-        force=args.force,
-        vlm_model=args.vlm_model,
-        skip_vlm=args.skip_vlm,
-        progress_every=args.progress_every,
-        prefer=args.prefer,
-        commit_every=args.commit_every,
-        checkpoint_every=args.checkpoint_every,
-        db_retry_wait_seconds=args.db_retry_wait,
-        db_retry_max_attempts=args.db_retry_max,
-        keep_awake=not args.no_keep_awake,
-    )
+    if args.no_global_ingest_lock:
+        run_ingest(
+            db_path=db_path,
+            limit=args.limit,
+            force=args.force,
+            vlm_model=args.vlm_model,
+            skip_vlm=args.skip_vlm,
+            progress_every=args.progress_every,
+            prefer=args.prefer,
+            commit_every=args.commit_every,
+            checkpoint_every=args.checkpoint_every,
+            db_retry_wait_seconds=args.db_retry_wait,
+            db_retry_max_attempts=args.db_retry_max,
+            keep_awake=not args.no_keep_awake,
+        )
+        return
+
+    with global_ingest_lock() as have_lock:
+        if not have_lock:
+            _log("[lock] Another content ingest is already running; skipping this run.")
+            return
+        run_ingest(
+            db_path=db_path,
+            limit=args.limit,
+            force=args.force,
+            vlm_model=args.vlm_model,
+            skip_vlm=args.skip_vlm,
+            progress_every=args.progress_every,
+            prefer=args.prefer,
+            commit_every=args.commit_every,
+            checkpoint_every=args.checkpoint_every,
+            db_retry_wait_seconds=args.db_retry_wait,
+            db_retry_max_attempts=args.db_retry_max,
+            keep_awake=not args.no_keep_awake,
+        )
 
 
 if __name__ == "__main__":
