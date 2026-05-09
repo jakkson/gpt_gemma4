@@ -28,7 +28,7 @@ from typing import Any
 import gradio as gr
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 from ollama import chat
 from PIL import Image
 
@@ -739,12 +739,20 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         # which is why direct file:// links did nothing).
         if image_path:
             encoded = urllib.parse.quote(image_path, safe="")
-            href = f"/open-local-file?path={encoded}"
-            esc = html.escape(image_path, quote=True)
-            # HTML anchor: Markdown `[text](url)` often opens in a way that
-            # replaces the tab with an empty 204 response; use a real HTML link
-            # plus the handler returning HTML that history.back()s.
-            link_md = f'<a href="{href}" target="_self" rel="noopener">Open local file</a>'
+            req_path = f"/open-local-file?path={encoded}"
+            data_attr = html.escape(req_path, quote=True)
+            # Use fetch() so the browser never navigates off the Gradio page.
+            # A normal <a href> load (even with history.back()) tears down the
+            # Gradio WebSocket and breaks embedded / tunnel / shared-screen UIs.
+            link_md = (
+                '<a href="#" class="pi-open-local-file" '
+                f'data-open-href="{data_attr}" '
+                "onclick=\"event.preventDefault(); var u=this.getAttribute('data-open-href'); "
+                "fetch(u,{credentials:'same-origin'}).then(function(r){"
+                "if(!r.ok){alert('Could not open file (HTTP '+r.status+'). "
+                "File missing or no permission.');}"
+                "}); return false;\">Open local file</a>"
+            )
             ref = f"`{image_path}`"
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
@@ -1455,14 +1463,12 @@ def build_app(
     return demo
 
 
-def _open_local_file_handler(path: str) -> HTMLResponse:
+def _open_local_file_handler(path: str) -> Response:
     """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
 
-    Hit summaries link here with ``GET /open-local-file?path=<url-encoded>``.
-    Returning **204 No Content** makes many browsers replace the Gradio tab with
-    an empty document when the user clicks a normal ``<a href>``, which feels
-    like a broken link. Instead we return a tiny HTML page that calls
-    ``history.back()`` after spawning ``open``.
+    Invoked via ``fetch()`` from the hit-summary links so the Gradio SPA never
+    navigates away (navigation was dropping WebSockets and breaking tunnel /
+    embedded browsers). ``204 No Content`` is ideal for XHR/fetch callers.
     """
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
@@ -1478,22 +1484,7 @@ def _open_local_file_handler(path: str) -> HTMLResponse:
             subprocess.Popen(["xdg-open", str(p)])
     except Exception as e:  # pragma: no cover - depends on host environment
         raise HTTPException(status_code=500, detail=f"open failed: {e}")
-
-    shown = html.escape(str(p), quote=False)
-    return HTMLResponse(
-        content=(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>"
-            "<title>Opened file</title></head><body>"
-            f"<p>Opened <code>{shown}</code>. Returning…</p>"
-            "<script>"
-            "setTimeout(function () {"
-            "  if (history.length > 1) { history.back(); }"
-            "  else { window.location.href = '/'; }"
-            "}, 120);"
-            "</script></body></html>"
-        ),
-        status_code=200,
-    )
+    return Response(status_code=204)
 
 
 def _find_free_port(host: str, start: int, attempts: int = 10) -> int:
