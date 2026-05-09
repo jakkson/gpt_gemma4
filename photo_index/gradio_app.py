@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import html
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from typing import Any
 import gradio as gr
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse
 from ollama import chat
 from PIL import Image
 
@@ -450,6 +451,56 @@ def _is_finance_query(question: str) -> bool:
     return bool(q) and any(t in q for t in _FINANCE_TRIGGER_TERMS)
 
 
+# Words stripped before FTS / substring retrieval. Natural questions like
+# "find photos of Paris" built an FTS AND over find + photos + Paris; captions
+# rarely contain the word "photos", so every real Paris hit was dropped.
+_FTS_RETRIEVAL_BOILERPLATE = frozenset({
+    "find", "show", "list", "display", "search", "look", "looking", "locate",
+    "get", "give", "want", "need", "please", "tell", "help", "me", "my",
+    "some", "any", "all", "also", "really", "actually", "just", "like",
+    "photo", "photos", "photograph", "photographs", "picture", "pictures",
+    "pic", "pics", "image", "images", "snapshot", "snapshots", "shot", "shots",
+    "gallery", "album", "camera", "jpeg", "jpg", "png", "heic",
+    # Glue words still picked up by our tokenizer:
+    "of", "to", "in", "at", "on", "for", "with", "from", "about", "near",
+    "around", "into", "that", "those", "these", "this",
+})
+
+
+def _slim_question_for_retrieval(question: str) -> str:
+    """Drop command/filler tokens so FTS/substring search targets entities."""
+    raw = re.findall(r"[\w'.-]+", (question or "").lower())
+    kept = [w for w in raw if w not in _FTS_RETRIEVAL_BOILERPLATE and len(w) >= 2]
+    if not kept:
+        return (question or "").strip()
+    return " ".join(kept)
+
+
+_IMAGE_PATH_SUFFIXES = (
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".webp",
+    ".ico", ".dng", ".cr2", ".nef", ".arw",
+)
+
+
+def _row_is_photo_library_or_image_file(r: sqlite3.Row) -> bool:
+    """True for Photos-ingest rows or other indexed rows backed by a raster path."""
+    uid = str(r["uuid"] or "")
+    if uid.startswith(("doc:", "imsg:")):
+        return False
+    path = (
+        (r["image_path_used"] or "")
+        + "\n"
+        + (r["filename"] or "")
+    ).lower()
+    return any(path.endswith(ext) for ext in _IMAGE_PATH_SUFFIXES)
+
+
+_VISUAL_QUERY_TERMS = (
+    "photo", "photos", "photograph", "picture", "pictures", "image", "images",
+    "snapshot", "snapshots", "shot", "shots", "gallery", "album",
+)
+
+
 def _retrieve_rows(
     db_path: Path,
     question: str,
@@ -462,9 +513,13 @@ def _retrieve_rows(
     conn = connect(db_path)
     init_schema(conn)
     try:
+        rq = _slim_question_for_retrieval(question)
+        if len(rq.strip()) < 2:
+            rq = question
+
         merged: dict[str, sqlite3.Row] = {}
         candidate_limit = max(top_k * 4, 40)
-        for expanded in expand_query_terms(question):
+        for expanded in expand_query_terms(rq):
             try:
                 hits = search_meta(conn, expanded, limit=candidate_limit)
             except sqlite3.OperationalError:
@@ -473,7 +528,7 @@ def _retrieve_rows(
                 merged[r["uuid"]] = r
         # Always merge fallback token-like matches too; FTS may return sparse/weak
         # results for natural-language questions.
-        for expanded in expand_query_terms(question):
+        for expanded in expand_query_terms(rq):
             hits = search_meta_fallback_substring(conn, expanded, limit=candidate_limit)
             for r in hits:
                 merged[r["uuid"]] = r
@@ -579,6 +634,8 @@ def _retrieve_rows(
             "any", "how", "much", "i'm", "i am", "now", "just",
         }
 
+        wants_visual = any(t in ql for t in _VISUAL_QUERY_TERMS)
+
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
             is_msg = 1 if str(r["uuid"]).startswith("imsg:") else 0
             # bm25 rank (lower is better); fallback rows use 0
@@ -597,6 +654,11 @@ def _retrieve_rows(
                 t in text for t in ("price", "chrge", "charge", "payment", "fee", "bill", "$")
             )
             is_billing_alert = is_msg and _is_bank_source(text)
+            if wants_visual and _row_is_photo_library_or_image_file(r):
+                entity_bonus += 14.0
+            # Down-rank generic documents when the user clearly asked for photos.
+            if wants_visual and str(r["uuid"]).startswith("doc:"):
+                entity_bonus -= 5.0
             if wants_nyt and has_nyt:
                 entity_bonus += 6.0
             if "subscription" in ql and "subscription" in text:
@@ -678,7 +740,11 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         if image_path:
             encoded = urllib.parse.quote(image_path, safe="")
             href = f"/open-local-file?path={encoded}"
-            link_md = f"[Open local file]({href})"
+            esc = html.escape(image_path, quote=True)
+            # HTML anchor: Markdown `[text](url)` often opens in a way that
+            # replaces the tab with an empty 204 response; use a real HTML link
+            # plus the handler returning HTML that history.back()s.
+            link_md = f'<a href="{href}" target="_self" rel="noopener">Open local file</a>'
             ref = f"`{image_path}`"
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
@@ -810,7 +876,7 @@ def answer_question(
             stats = (
                 f"Last search: cache hit ({age_s}s old), "
                 f"total retrieval time {elapsed:.2f}s, top-k={top_k}, model={used_model}, "
-                f"route={route}, sort={sort_by}, bank-only={int(restrict_finance)}"
+                f"route={route}, sort={sort_by}, finance_cb={int(restrict_finance)}"
             )
             hit_md = _rows_to_hit_summary(rows)
             gallery, gallery_paths = _rows_to_gallery(rows)
@@ -932,7 +998,7 @@ def answer_question(
     stats = (
         f"Last search: cache miss, total retrieval time {elapsed:.2f}s, "
         f"top-k={top_k}, model={used_model}, route={route}, sort={sort_by}, "
-        f"bank-only={int(restrict_finance)}"
+        f"finance_cb={int(restrict_finance)}"
     )
     hit_md = _rows_to_hit_summary(preview_rows)
     gallery, gallery_paths = _rows_to_gallery(preview_rows)
@@ -1262,8 +1328,12 @@ def build_app(
             info="When ON, each new search wipes the 24h cache before running so you always see fresh retrieval. Slower for repeat queries. Does NOT affect chat context (each search is independent). The manual 'Clear search cache' button is still available.",
         )
 
-        answer = gr.Markdown(label="Answer", elem_id="pi-answer")
-        hit_summary = gr.Markdown("No hits yet.", elem_id="pi-hits")
+        answer = gr.Markdown(
+            label="Answer", elem_id="pi-answer", sanitize_html=False
+        )
+        hit_summary = gr.Markdown(
+            "No hits yet.", elem_id="pi-hits", sanitize_html=False
+        )
         hits = gr.Dataframe(
             label="Retrieved index rows",
             headers=["uuid", "filename", "date_iso", "image_path_used", "rank", "ocr_excerpt", "vlm_excerpt"],
@@ -1385,14 +1455,14 @@ def build_app(
     return demo
 
 
-def _open_local_file_handler(path: str) -> Response:
+def _open_local_file_handler(path: str) -> HTMLResponse:
     """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
 
-    The hit summary in the UI links to ``/open-local-file?path=<encoded>``.
-    Browsers won't navigate from a localhost HTTP page directly to ``file://``
-    URIs, so we route the click through this server-side handler. Returns
-    HTTP 204 No Content on success so the browser stays on the current page
-    while the file pops open in its native app.
+    Hit summaries link here with ``GET /open-local-file?path=<url-encoded>``.
+    Returning **204 No Content** makes many browsers replace the Gradio tab with
+    an empty document when the user clicks a normal ``<a href>``, which feels
+    like a broken link. Instead we return a tiny HTML page that calls
+    ``history.back()`` after spawning ``open``.
     """
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
@@ -1408,7 +1478,22 @@ def _open_local_file_handler(path: str) -> Response:
             subprocess.Popen(["xdg-open", str(p)])
     except Exception as e:  # pragma: no cover - depends on host environment
         raise HTTPException(status_code=500, detail=f"open failed: {e}")
-    return Response(status_code=204)
+
+    shown = html.escape(str(p), quote=False)
+    return HTMLResponse(
+        content=(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>"
+            "<title>Opened file</title></head><body>"
+            f"<p>Opened <code>{shown}</code>. Returning…</p>"
+            "<script>"
+            "setTimeout(function () {"
+            "  if (history.length > 1) { history.back(); }"
+            "  else { window.location.href = '/'; }"
+            "}, 120);"
+            "</script></body></html>"
+        ),
+        status_code=200,
+    )
 
 
 def _find_free_port(host: str, start: int, attempts: int = 10) -> int:
