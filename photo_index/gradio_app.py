@@ -13,6 +13,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -49,26 +50,61 @@ _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.jso
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
-_KEYBOARD_JS = """
+_PAGE_LOAD_JS = """
 () => {
-  if (window.__photoSearchEnterBound) return;
-  window.__photoSearchEnterBound = true;
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      if (e.key !== "Enter" || e.shiftKey) return;
-      const active = document.activeElement;
-      const queryWrap = document.querySelector("#photo-query-input");
-      const searchBtn = document.querySelector("#photo-search-btn button");
-      if (!active || !queryWrap || !searchBtn) return;
-      if (active.tagName !== "TEXTAREA") return;
-      if (!queryWrap.contains(active)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      searchBtn.click();
-    },
-    true
-  );
+  if (!window.__photoSearchEnterBound) {
+    window.__photoSearchEnterBound = true;
+    document.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.key !== "Enter" || e.shiftKey) return;
+        const active = document.activeElement;
+        const queryWrap = document.querySelector("#photo-query-input");
+        const searchBtn = document.querySelector("#photo-search-btn button");
+        if (!active || !queryWrap || !searchBtn) return;
+        if (active.tagName !== "TEXTAREA") return;
+        if (!queryWrap.contains(active)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        searchBtn.click();
+      },
+      true
+    );
+  }
+  if (!window.__photoOpenLocalBound) {
+    window.__photoOpenLocalBound = true;
+    document.addEventListener(
+      "click",
+      (ev) => {
+        const t = ev.target && ev.target.closest && ev.target.closest(".pi-open-local-file");
+        if (!t) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        ev.stopImmediatePropagation();
+        const u = t.getAttribute("data-open-href");
+        if (!u) return;
+        fetch(u, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          priority: "low",
+        })
+          .then((r) => {
+            if (!r.ok) {
+              alert(
+                "Could not open file (HTTP " +
+                  r.status +
+                  "). File missing or no permission."
+              );
+            }
+          })
+          .catch(() => {
+            alert("Could not reach server to open file.");
+          });
+      },
+      true
+    );
+  }
 }
 """
 
@@ -733,25 +769,15 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         snippet = ocr_excerpt or vlm_excerpt or "(no snippet)"
         title = filename or uuid
         when = _format_local_dt(date_iso) or "n/a"
-        # "Reference attachment" link: route the click through our own
-        # /open-local-file endpoint so the OS default app actually opens
-        # (browsers silently block `file://` navigation from `http://` pages,
-        # which is why direct file:// links did nothing).
+        # "Reference attachment": route open via /open-local-file (fetch + capture-
+        # phase handler in _PAGE_LOAD_JS). Buttons avoid hash navigation from href="#".
         if image_path:
             encoded = urllib.parse.quote(image_path, safe="")
             req_path = f"/open-local-file?path={encoded}"
             data_attr = html.escape(req_path, quote=True)
-            # Use fetch() so the browser never navigates off the Gradio page.
-            # A normal <a href> load (even with history.back()) tears down the
-            # Gradio WebSocket and breaks embedded / tunnel / shared-screen UIs.
             link_md = (
-                '<a href="#" class="pi-open-local-file" '
-                f'data-open-href="{data_attr}" '
-                "onclick=\"event.preventDefault(); var u=this.getAttribute('data-open-href'); "
-                "fetch(u,{credentials:'same-origin'}).then(function(r){"
-                "if(!r.ok){alert('Could not open file (HTTP '+r.status+'). "
-                "File missing or no permission.');}"
-                "}); return false;\">Open local file</a>"
+                '<button type="button" class="pi-open-local-file" '
+                f'data-open-href="{data_attr}">Open local file</button>'
             )
             ref = f"`{image_path}`"
         elif is_msg:
@@ -1271,6 +1297,18 @@ def build_app(
     }
     #pi-answer code, #pi-hits code { font-size: 0.95rem; }
     #pi-stats { color: #555; font-size: 0.95rem; }
+    button.pi-open-local-file {
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      font: inherit;
+      color: #2563eb;
+      text-decoration: underline;
+      cursor: pointer;
+      display: inline;
+    }
+    button.pi-open-local-file:hover { color: #1d4ed8; }
     """
     with gr.Blocks(title="Personal Index Search", css=custom_css) as demo:
         gr.Markdown("## Personal Index Search (Gemma + SQLite FTS)")
@@ -1454,36 +1492,51 @@ def build_app(
         alias_load_btn.click(fn=load_alias_json, outputs=[alias_json, alias_status])
         alias_save_btn.click(fn=save_alias_json, inputs=[alias_json], outputs=[alias_status])
 
-        # Inject keyboard binding (Enter-to-search) on every page load. This used
-        # to live on `Blocks.launch(js=...)`, but we now bypass `launch()` to
-        # mount Gradio onto our own FastAPI app (so /open-local-file works), and
-        # `Blocks.__init__` doesn't take `js`. `load(js=...)` runs the same JS.
-        demo.load(fn=lambda: None, js=_KEYBOARD_JS)
+        # Inject Enter-to-search and delegated "open local file" clicks on load.
+        demo.load(fn=lambda: None, js=_PAGE_LOAD_JS)
 
     return demo
+
+
+def _spawn_open_default_app(path: Path) -> None:
+    """Background worker: spawn OS open after HTTP response (Friendlier to tunnels)."""
+
+    def _run() -> None:
+        try:
+            if sys.platform == "darwin":
+                # ``open -g`` avoids activating the app — foreground switches were
+                # disrupting screen sharing / remote browser tabs for several minutes.
+                fg = os.environ.get("PHOTO_INDEX_OPEN_FOREGROUND", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                cmd = ["open", str(path)] if fg else ["open", "-g", str(path)]
+                subprocess.Popen(cmd)
+            elif sys.platform == "win32":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as e:  # pragma: no cover
+            print(f"photo_index.gradio_app: open failed for {path}: {e}", file=sys.stderr)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _open_local_file_handler(path: str) -> Response:
     """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
 
-    Invoked via ``fetch()`` from the hit-summary links so the Gradio SPA never
-    navigates away (navigation was dropping WebSockets and breaking tunnel /
-    embedded browsers). ``204 No Content`` is ideal for XHR/fetch callers.
+    Invoked via ``fetch()`` from hit-summary controls (delegated click handler in
+    ``_PAGE_LOAD_JS``) so the Gradio SPA never navigates. The handler returns
+    immediately after scheduling ``open`` so proxies/tunnels finish the request
+    before any foreground UI churn.
     """
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail=f"not a regular file: {path}")
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", str(p)])
-        elif sys.platform == "win32":
-            os.startfile(str(p))  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
-    except Exception as e:  # pragma: no cover - depends on host environment
-        raise HTTPException(status_code=500, detail=f"open failed: {e}")
+    _spawn_open_default_app(p)
     return Response(status_code=204)
 
 
