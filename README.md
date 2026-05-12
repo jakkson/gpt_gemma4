@@ -84,6 +84,12 @@ Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS
 - Run Messages ingest now:
   - `python -m photo_index.messages_ingest`
 
+- Run Outlook / Microsoft 365 mail ingest (Microsoft Graph, delegated **Mail.Read**):
+  - Register an app in Entra ID, add redirect `http://localhost`, grant Graph delegated **Mail.Read** (and **offline_access**).
+  - `export GRAPH_CLIENT_ID='your-client-id'`
+  - `python -m photo_index.outlook_graph_ingest --auth interactive`
+  - First run opens a browser to sign in; later runs use `data/graph_mail_token_cache.json`. Incremental sync uses `data/graph_mail_delta.json`.
+
 - Install nightly 2:00 AM photo ingest (launchd):
   - `./install_photo_nightly_launchd.sh`
 
@@ -103,6 +109,9 @@ Ingest modules use a shared global lock (`data/content_ingest.lock`) so differen
 
 - Manually ingest new Messages:
   - `python -m photo_index.messages_ingest`
+
+- Manually ingest Outlook / Microsoft 365 (after `GRAPH_CLIENT_ID` is set):
+  - `python -m photo_index.outlook_graph_ingest --auth interactive`
 
 - Quick health checks:
   - Row count:

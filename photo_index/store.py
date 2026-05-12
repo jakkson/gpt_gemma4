@@ -141,6 +141,14 @@ def upsert_photo(
         conn.commit()
 
 
+def delete_index_row(conn: sqlite3.Connection, uuid: str, *, commit: bool = True) -> None:
+    """Remove one indexed row (used when Graph delta reports deletions)."""
+    conn.execute("DELETE FROM photo_meta WHERE uuid = ?", (uuid,))
+    conn.execute("DELETE FROM photo_lex WHERE uuid = ?", (uuid,))
+    if commit:
+        conn.commit()
+
+
 def commit_ingest(conn: sqlite3.Connection) -> None:
     """Flush a batched ingest (call at checkpoints and end of run)."""
     conn.commit()

@@ -338,7 +338,7 @@ def _policy_refusal_answer(answer: str) -> bool:
     t = (answer or "").strip().lower()
     if not t:
         return True
-    if "filename" in t or "imsg:" in t or "doc:" in t or "indexed" in t:
+    if "filename" in t or "imsg:" in t or "m365:" in t or "doc:" in t or "indexed" in t:
         return False
     return any(m in t for m in _POLICY_REFUSAL_MARKERS)
 
@@ -523,7 +523,7 @@ _IMAGE_PATH_SUFFIXES = (
 def _row_is_photo_library_or_image_file(r: sqlite3.Row) -> bool:
     """True for Photos-ingest rows or other indexed rows backed by a raster path."""
     uid = str(r["uuid"] or "")
-    if uid.startswith(("doc:", "imsg:")):
+    if uid.startswith(("doc:", "imsg:", "m365:")):
         return False
     path = (
         (r["image_path_used"] or "")
@@ -539,13 +539,14 @@ _VISUAL_QUERY_TERMS = (
 )
 
 _MESSAGE_DISCOVERY_RE = re.compile(
-    r"\b(?:sms|imessage)\b|\btext\s+messages?\b|\bmessages?\b|\btexts?\b",
+    r"\b(?:sms|imessage)\b|\btext\s+messages?\b|\bmessages?\b|\btexts?\b|"
+    r"\bemail\b|\boutlook\b|\bmailbox\b|\bexchange\b|\bm365\b",
     re.I,
 )
 
 
 def _message_discovery_query(question: str) -> bool:
-    """True when the user is asking about SMS/iMessage rows (indexed ``imsg:``)."""
+    """True for SMS/iMessage *or* Outlook-style mail discovery queries."""
     q = (question or "").strip()
     if not q:
         return False
@@ -558,7 +559,7 @@ def _merge_imessage_like_tokens(
     token_sources: list[str],
     candidate_limit: int,
 ) -> None:
-    """Broaden ``merged`` with ``imsg:`` rows matching individual query tokens."""
+    """Broaden ``merged`` with ``imsg:`` / ``m365:`` rows matching query tokens."""
     seen: set[str] = set()
     for src in token_sources:
         for tok in re.findall(r"[a-z0-9'.-]+", (src or "").lower()):
@@ -570,7 +571,7 @@ def _merge_imessage_like_tokens(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE uuid LIKE 'imsg:%'
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
                   AND (
                     lower(ocr_text) LIKE ?
                     OR lower(vlm_text) LIKE ?
@@ -611,6 +612,7 @@ def _retrieve_rows(
         )
         wants_messages = (
             "text", "message", "sms", "imessage", "capital one", "bank", "statement",
+            "email", "outlook", "mailbox",
         )
         boost_messages = any(t in ql for t in finance_terms + wants_messages)
         wants_money = any(t in ql for t in finance_terms)
@@ -649,7 +651,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE uuid LIKE 'imsg:%'
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
                   AND (
                     ocr_text LIKE '%$%'
                     OR ocr_text LIKE '% chrge %'
@@ -682,7 +684,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE uuid LIKE 'imsg:%'
+                WHERE uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%'
                 ORDER BY date_iso DESC, ingested_at DESC
                 LIMIT ?
                 """,
@@ -722,7 +724,10 @@ def _retrieve_rows(
         wants_visual = any(t in ql for t in _VISUAL_QUERY_TERMS)
 
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
-            is_msg = 1 if str(r["uuid"]).startswith("imsg:") else 0
+            uid = str(r["uuid"] or "")
+            is_imsg = uid.startswith("imsg:")
+            is_m365 = uid.startswith("m365:")
+            is_chat_mail = is_imsg or is_m365
             # bm25 rank (lower is better); fallback rows use 0
             rank = float(r["rank"]) if "rank" in r.keys() and r["rank"] is not None else 0.0
             text = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower()
@@ -738,7 +743,7 @@ def _retrieve_rows(
             has_currency = has_dollar_figure or any(
                 t in text for t in ("price", "chrge", "charge", "payment", "fee", "bill", "$")
             )
-            is_billing_alert = is_msg and _is_bank_source(text)
+            is_billing_alert = is_imsg and _is_bank_source(text)
             if wants_visual and _row_is_photo_library_or_image_file(r):
                 entity_bonus += 14.0
             # Down-rank generic documents when the user clearly asked for photos.
@@ -753,20 +758,20 @@ def _retrieve_rows(
             # Strong combo: query is finance-y AND record is a message that
             # mentions both the entity and an actual dollar figure. This is the
             # canonical "what am I paying for X?" hit.
-            if wants_money and is_msg and has_currency and (not wants_nyt or has_nyt):
+            if wants_money and is_chat_mail and has_currency and (not wants_nyt or has_nyt):
                 entity_bonus += 8.0
             # Billing alerts dominate when the question is about money. They
             # are the highest-quality evidence by a wide margin.
             if wants_money and is_billing_alert:
                 entity_bonus += 12.0
             if msg_disc:
-                if is_msg:
+                if is_chat_mail:
                     entity_bonus += 14.0
-                elif str(r["uuid"]).startswith("doc:"):
+                elif uid.startswith("doc:"):
                     entity_bonus -= 12.0
-            msg_pref = 1 if (boost_messages and is_msg) else 0
+            msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
-            # Tuple sorted desc: prefer messages, then higher overlap+bonus,
+            # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
             # then better (lower) bm25 rank, then most-recent date_iso lex sort.
             return (msg_pref, overlap + entity_bonus, -rank, date_key)
 
@@ -776,8 +781,19 @@ def _retrieve_rows(
                 return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
 
             if msg_disc:
-                msgs_only = [r for r in rows if str(r["uuid"]).startswith("imsg:")]
-                non_msg = [r for r in rows if not str(r["uuid"]).startswith("imsg:")]
+                msgs_only = [
+                    r
+                    for r in rows
+                    if str(r["uuid"]).startswith("imsg:") or str(r["uuid"]).startswith("m365:")
+                ]
+                non_msg = [
+                    r
+                    for r in rows
+                    if not (
+                        str(r["uuid"]).startswith("imsg:")
+                        or str(r["uuid"]).startswith("m365:")
+                    )
+                ]
                 msgs_only.sort(key=recency_tuple, reverse=True)
                 non_msg.sort(key=recency_tuple, reverse=True)
                 rows = msgs_only[:top_k]
@@ -823,10 +839,13 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         ocr_excerpt = r[5] if len(r) > 5 else ""
         vlm_excerpt = r[6] if len(r) > 6 else ""
         is_msg = str(uuid).startswith("imsg:")
+        is_m365 = str(uuid).startswith("m365:")
         is_doc = str(uuid).startswith("doc:")
         source = (
             "Messages"
             if is_msg
+            else "Outlook / Microsoft 365"
+            if is_m365
             else "Document"
             if is_doc
             else "Photos / Local file"
@@ -847,6 +866,9 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
             ref = f"`{image_path}`"
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
+            ref = f"`{uuid}`"
+        elif is_m365:
+            link_md = "Open in [**Outlook on the web**](https://outlook.office.com/mail/) (same Microsoft account)."
             ref = f"`{uuid}`"
         else:
             link_md = "(no local link)"
