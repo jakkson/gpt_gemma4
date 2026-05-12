@@ -500,6 +500,8 @@ _FTS_RETRIEVAL_BOILERPLATE = frozenset({
     # Glue words still picked up by our tokenizer:
     "of", "to", "in", "at", "on", "for", "with", "from", "about", "near",
     "around", "into", "that", "those", "these", "this",
+    # Temporal fillers that match OCR captions ("most recent update…") and bury SMS hits:
+    "most", "recent", "recently", "latest", "last", "newest",
 })
 
 
@@ -536,6 +538,52 @@ _VISUAL_QUERY_TERMS = (
     "snapshot", "snapshots", "shot", "shots", "gallery", "album",
 )
 
+_MESSAGE_DISCOVERY_RE = re.compile(
+    r"\b(?:sms|imessage)\b|\btext\s+messages?\b|\bmessages?\b|\btexts?\b",
+    re.I,
+)
+
+
+def _message_discovery_query(question: str) -> bool:
+    """True when the user is asking about SMS/iMessage rows (indexed ``imsg:``)."""
+    q = (question or "").strip()
+    if not q:
+        return False
+    return bool(_MESSAGE_DISCOVERY_RE.search(q.lower()))
+
+
+def _merge_imessage_like_tokens(
+    conn: sqlite3.Connection,
+    merged: dict[str, sqlite3.Row],
+    token_sources: list[str],
+    candidate_limit: int,
+) -> None:
+    """Broaden ``merged`` with ``imsg:`` rows matching individual query tokens."""
+    seen: set[str] = set()
+    for src in token_sources:
+        for tok in re.findall(r"[a-z0-9'.-]+", (src or "").lower()):
+            if len(tok) < 3 or tok in seen:
+                continue
+            seen.add(tok)
+            like = f"%{tok}%"
+            msg_hits = conn.execute(
+                """
+                SELECT *, 0 AS rank
+                FROM photo_meta
+                WHERE uuid LIKE 'imsg:%'
+                  AND (
+                    lower(ocr_text) LIKE ?
+                    OR lower(vlm_text) LIKE ?
+                    OR lower(filename) LIKE ?
+                  )
+                ORDER BY date_iso DESC, ingested_at DESC
+                LIMIT ?
+                """,
+                (like, like, like, candidate_limit),
+            ).fetchall()
+            for r in msg_hits:
+                merged[r["uuid"]] = r
+
 
 def _retrieve_rows(
     db_path: Path,
@@ -552,6 +600,20 @@ def _retrieve_rows(
         rq = _slim_question_for_retrieval(question)
         if len(rq.strip()) < 2:
             rq = question
+
+        ql = (question or "").lower()
+        msg_disc = _message_discovery_query(question)
+        finance_terms = (
+            "price", "charge", "charged", "payment", "bill", "billing",
+            "fee", "subscription", "cost",
+            "pay", "paying", "paid", "amount", "money", "spend", "spending",
+            "owe", "due", "rate", "monthly", "per month",
+        )
+        wants_messages = (
+            "text", "message", "sms", "imessage", "capital one", "bank", "statement",
+        )
+        boost_messages = any(t in ql for t in finance_terms + wants_messages)
+        wants_money = any(t in ql for t in finance_terms)
 
         merged: dict[str, sqlite3.Row] = {}
         candidate_limit = max(top_k * 4, 40)
@@ -570,38 +632,13 @@ def _retrieve_rows(
                 merged[r["uuid"]] = r
             if len(merged) >= max(top_k * 6, 80):
                 break
-            # Explicit message "ping": run a message-only pass on individual
-            # meaningful tokens so imsg rows are always considered for queries
-            # that mention texts/billing/subscriptions/etc.
-            for tok in re.findall(r"[a-z0-9'.-]+", expanded.lower()):
-                if len(tok) < 3:
-                    continue
-                like = f"%{tok}%"
-                msg_hits = conn.execute(
-                    """
-                    SELECT *, 0 AS rank
-                    FROM photo_meta
-                    WHERE uuid LIKE 'imsg:%'
-                      AND (
-                        lower(ocr_text) LIKE ?
-                        OR lower(vlm_text) LIKE ?
-                        OR lower(filename) LIKE ?
-                      )
-                    ORDER BY date_iso DESC, ingested_at DESC
-                    LIMIT ?
-                    """,
-                    (like, like, like, candidate_limit),
-                ).fetchall()
-                for r in msg_hits:
-                    merged[r["uuid"]] = r
 
-        ql_for_finance = (question or "").lower()
         _finance_trigger = (
             "price", "charge", "charged", "payment", "bill", "billing", "fee",
             "subscription", "cost", "pay", "paying", "paid", "amount", "money",
             "spend", "spending", "owe", "due", "rate", "monthly", "per month",
         )
-        if any(t in ql_for_finance for t in _finance_trigger):
+        if any(t in ql for t in _finance_trigger):
             # Currency-bearing message sweep: pull every message that contains
             # a real $X.XX or $X figure. This guarantees Capital One charge
             # alerts surface for aggregate finance questions even if the query
@@ -636,8 +673,29 @@ def _retrieve_rows(
                 if _money_re.search(blob):
                     merged[r["uuid"]] = r
 
+        # Message-discovery queries must always pull ``imsg:`` candidates: substring
+        # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
+        # ``Most Recent`` sorting used to float those above real texts.
+        if msg_disc:
+            seed_lim = max(candidate_limit, min(300, top_k * 25))
+            seed_rows = conn.execute(
+                """
+                SELECT *, 0 AS rank
+                FROM photo_meta
+                WHERE uuid LIKE 'imsg:%'
+                ORDER BY date_iso DESC, ingested_at DESC
+                LIMIT ?
+                """,
+                (seed_lim,),
+            ).fetchall()
+            for r in seed_rows:
+                merged[r["uuid"]] = r
+
+        if boost_messages or msg_disc:
+            src_order = list(dict.fromkeys([*(expand_query_terms(rq)), rq, question]))
+            _merge_imessage_like_tokens(conn, merged, src_order, candidate_limit)
+
         rows = list(merged.values())
-        ql = (question or "").lower()
 
         # Restrict finance/subscription queries to authoritative bank or credit-card
         # statement rows. This excludes casual chat like "he was paying $30 for X".
@@ -652,16 +710,7 @@ def _retrieve_rows(
             ]
             if bank_rows:
                 rows = bank_rows
-        finance_terms = (
-            "price", "charge", "charged", "payment", "bill", "billing",
-            "fee", "subscription", "cost",
-            "pay", "paying", "paid", "amount", "money", "spend", "spending",
-            "owe", "due", "rate",
-        )
-        wants_messages = ("text", "message", "sms", "imessage", "capital one", "bank", "statement")
-        boost_messages = any(t in ql for t in finance_terms + wants_messages)
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
-        wants_money = any(t in ql for t in finance_terms)
         # Stopwords filtered out of overlap so generic words ("the", "what")
         # don't inflate noisy hits over targeted ones.
         _OVERLAP_STOP = {
@@ -710,6 +759,11 @@ def _retrieve_rows(
             # are the highest-quality evidence by a wide margin.
             if wants_money and is_billing_alert:
                 entity_bonus += 12.0
+            if msg_disc:
+                if is_msg:
+                    entity_bonus += 14.0
+                elif str(r["uuid"]).startswith("doc:"):
+                    entity_bonus -= 12.0
             msg_pref = 1 if (boost_messages and is_msg) else 0
             date_key = str(r["date_iso"] or "")
             # Tuple sorted desc: prefer messages, then higher overlap+bonus,
@@ -717,9 +771,20 @@ def _retrieve_rows(
             return (msg_pref, overlap + entity_bonus, -rank, date_key)
 
         if sort_by == SORT_RECENT:
-            def recency_key(r: sqlite3.Row) -> tuple[str, str]:
+
+            def recency_tuple(r: sqlite3.Row) -> tuple[str, str]:
                 return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
-            rows.sort(key=recency_key, reverse=True)
+
+            if msg_disc:
+                msgs_only = [r for r in rows if str(r["uuid"]).startswith("imsg:")]
+                non_msg = [r for r in rows if not str(r["uuid"]).startswith("imsg:")]
+                msgs_only.sort(key=recency_tuple, reverse=True)
+                non_msg.sort(key=recency_tuple, reverse=True)
+                rows = msgs_only[:top_k]
+                if len(rows) < top_k:
+                    rows.extend(non_msg[: top_k - len(rows)])
+            else:
+                rows.sort(key=recency_tuple, reverse=True)
         else:
             rows.sort(key=score, reverse=True)
         return rows[:top_k]
