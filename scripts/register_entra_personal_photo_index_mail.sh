@@ -39,12 +39,26 @@ if ! command -v az >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! az ad signed-in-user show >/dev/null 2>&1; then
+_logged_into_az() {
+  if az ad signed-in-user show >/dev/null 2>&1; then
+    return 0
+  fi
+  # Tenant-only login (--allow-no-subscriptions) sometimes works for Entra but
+  # ``signed-in-user`` returns "User was not found" for certain account types.
+  if az account show >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+if ! _logged_into_az; then
   echo "Azure CLI has no active directory login."
   echo "Signing into portal.azure.com does not log in the CLI."
   echo ""
   echo "If you see \"No subscriptions\", you still need an Entra login without a subscription:"
-  echo "  az login --allow-no-subscriptions"
+  echo "  az login --allow-no-subscriptions [--tenant YOUR_TENANT_ID]"
+  echo ""
+  echo "At \"Select a subscription\", press Enter or type 1 (do not paste the tenant GUID)."
   echo ""
   echo "Otherwise:"
   echo "  az login"
