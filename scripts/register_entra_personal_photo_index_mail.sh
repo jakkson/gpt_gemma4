@@ -86,7 +86,8 @@ fi
 
 export GRAPH_TOKEN DISPLAY_NAME SIGN_IN_AUDIENCE GRAPH_API_ID GRAPH_MAIL_READ_DELEGATED GRAPH_OFFLINE_ACCESS_DELEGATED
 
-eval "$(
+set +e
+_PY_ASSIGN="$(
   python3 << 'PY'
 import json
 import os
@@ -133,7 +134,7 @@ def find_apps():
     return json.loads(raw).get("value") or []
 
 
-def perm_block() -> dict:
+def perm_block():
     return {
         "resourceAppId": GRAPH_API_ID,
         "resourceAccess": [
@@ -211,8 +212,33 @@ def main():
 main()
 PY
 )"
+_PY_RC=$?
+set -e
 
-echo "Mail.Read + offline_access applied on the app registration (Graph manifest)."
+if [[ "$_PY_RC" -ne 0 ]] || [[ -z "${_PY_ASSIGN:-}" ]]; then
+  echo ""
+  echo "=== Graph app registration failed ==="
+  echo "If you saw HTTP 403 / Authentication_Unauthorized / \"User was not found\":"
+  echo "Azure CLI issued a token, but Microsoft Graph does not associate it with a USER OBJECT"
+  echo "in this Entra tenant. Delegated calls to /applications are then rejected."
+  echo ""
+  echo "This often happens with Microsoft accounts / tenant-only \"N/A subscription\" CLI profiles."
+  echo "Reliable workaround — register once in the browser (same identity you use for mail):"
+  echo "  1) https://entra.microsoft.com  → App registrations → New registration"
+  echo "  2) Name: ${DISPLAY_NAME}"
+  echo "  3) Supported types: match how you sign into Outlook (work/school vs personal)"
+  echo "  4) Redirect URI: Mobile and desktop applications → http://localhost"
+  echo "  5) Register → API permissions → Microsoft Graph → Delegated → Mail.Read + offline_access"
+  echo "  6) Grant admin consent (or consent on first sign-in)"
+  echo "  7) Overview → copy Application (client) ID → export GRAPH_CLIENT_ID='…'"
+  exit 1
+fi
+
+eval "$_PY_ASSIGN"
+
+echo "Success: ${DISPLAY_NAME} — Mail.Read + offline_access + http://localhost redirect set via Graph API."
+
+echo "Attempting tenant admin consent (may fail without admin rights; optional) …"
 set +e
 az ad app permission admin-consent --id "$OBJ_ID"
 RC_AC=$?
