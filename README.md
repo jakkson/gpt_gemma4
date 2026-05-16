@@ -86,7 +86,7 @@ Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS
 
 - Run Outlook / Microsoft 365 mail ingest (Microsoft Graph, delegated **Mail.Read**):
   - Register an app in Entra ID, add redirect `http://localhost`, grant Graph delegated **Mail.Read** (and **offline_access**).
-  - Or run **`./scripts/register_entra_personal_photo_index_mail.sh`** after `az login` (Azure CLI) to create **`personal-photo-index-mail`** automatically.
+  - Or run **`./scripts/register_entra_personal_photo_index_mail.sh`** after **`az login --allow-no-subscriptions`** (no Azure subscription needed) or **`az login`**, to create **`personal-photo-index-mail`** automatically.
   - `export GRAPH_CLIENT_ID='your-client-id'`
   - `python -m photo_index.outlook_graph_ingest --auth interactive`
   - First run opens a browser to sign in; later runs use `data/graph_mail_token_cache.json`. Incremental sync uses `data/graph_mail_delta.json`.

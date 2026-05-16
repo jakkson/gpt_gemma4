@@ -4,7 +4,8 @@
 #
 # Prerequisites:
 #   brew install azure-cli   # or https://learn.microsoft.com/cli/azure/install-azure-cli
-#   az login
+#   az login --allow-no-subscriptions    # if you have no Azure subscription (Entra-only)
+#   az login                             # if you have subscriptions
 #
 # Usage:
 #   ./scripts/register_entra_personal_photo_index_mail.sh
@@ -36,8 +37,15 @@ if ! command -v az >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! az account show >/dev/null 2>&1; then
-  echo "Not logged in. Run: az login"
+if ! az ad signed-in-user show >/dev/null 2>&1; then
+  echo "Azure CLI has no active directory login."
+  echo "Signing into portal.azure.com does not log in the CLI."
+  echo ""
+  echo "If you see \"No subscriptions\", you still need an Entra login without a subscription:"
+  echo "  az login --allow-no-subscriptions"
+  echo ""
+  echo "Otherwise:"
+  echo "  az login"
   exit 1
 fi
 
