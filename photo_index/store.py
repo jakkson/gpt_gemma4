@@ -77,6 +77,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_meta)")}
+    if "open_url" not in cols:
+        conn.execute("ALTER TABLE photo_meta ADD COLUMN open_url TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -117,6 +120,7 @@ def upsert_photo(
     ocr_text: str,
     vlm_text: str,
     image_path_used: str,
+    open_url: str = "",
     commit: bool = True,
 ) -> None:
     now = time.time()
@@ -124,9 +128,9 @@ def upsert_photo(
     conn.execute("DELETE FROM photo_lex WHERE uuid = ?", (uuid,))
     conn.execute(
         """INSERT INTO photo_meta
-        (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, ingested_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, now),
+        (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, open_url, ingested_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, open_url or "", now),
     )
     doc = "\n".join(
         [

@@ -808,11 +808,28 @@ def _retrieve_rows(
         conn.close()
 
 
+def _safe_https_browser_url(url: str) -> str | None:
+    """Allow only https URLs for links embedded in hit summaries (e.g. Graph webLink)."""
+    u = (url or "").strip()
+    if not u.startswith("https://"):
+        return None
+    try:
+        parts = urllib.parse.urlparse(u)
+        if parts.scheme != "https" or not parts.netloc:
+            return None
+        return u
+    except Exception:
+        return None
+
+
 def _rows_preview(rows: list[sqlite3.Row]) -> list[list[str]]:
     preview: list[list[str]] = []
     for r in rows:
         ocr = (r["ocr_text"] or "").replace("\n", " ").strip()
         vlm = (r["vlm_text"] or "").replace("\n", " ").strip()
+        ou = ""
+        if "open_url" in r.keys():
+            ou = str(r["open_url"] or "").strip()
         preview.append(
             [
                 r["uuid"] or "",
@@ -822,6 +839,7 @@ def _rows_preview(rows: list[sqlite3.Row]) -> list[list[str]]:
                 f"{r['rank']:.3f}" if "rank" in r.keys() else "0.000",
                 ocr[:180] + ("..." if len(ocr) > 180 else ""),
                 vlm[:180] + ("..." if len(vlm) > 180 else ""),
+                ou,
             ]
         )
     return preview
@@ -838,6 +856,7 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         image_path = r[3] if len(r) > 3 else ""
         ocr_excerpt = r[5] if len(r) > 5 else ""
         vlm_excerpt = r[6] if len(r) > 6 else ""
+        open_url = r[7] if len(r) > 7 else ""
         is_msg = str(uuid).startswith("imsg:")
         is_m365 = str(uuid).startswith("m365:")
         is_doc = str(uuid).startswith("doc:")
@@ -855,7 +874,8 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         when = _format_local_dt(date_iso) or "n/a"
         # "Reference attachment": route open via /open-local-file (fetch + capture-
         # phase handler in _PAGE_LOAD_JS). Buttons avoid hash navigation from href="#".
-        if image_path:
+        web_open = _safe_https_browser_url(open_url)
+        if image_path and not image_path.startswith("https://"):
             encoded = urllib.parse.quote(image_path, safe="")
             req_path = f"/open-local-file?path={encoded}"
             data_attr = html.escape(req_path, quote=True)
@@ -867,8 +887,18 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
             ref = f"`{uuid}`"
+        elif is_m365 and web_open:
+            esc = html.escape(web_open, quote=True)
+            link_md = (
+                f'<a href="{esc}" target="_blank" rel="noopener noreferrer">'
+                "Open in Outlook (web)</a>"
+            )
+            ref = f"`{uuid}`"
         elif is_m365:
-            link_md = "Open in [**Outlook on the web**](https://outlook.office.com/mail/) (same Microsoft account)."
+            link_md = (
+                "No saved Outlook link for this row — run mail ingest again to refresh. "
+                "Meanwhile open [**Outlook on the web**](https://outlook.office.com/mail/)."
+            )
             ref = f"`{uuid}`"
         else:
             link_md = "(no local link)"
@@ -1182,7 +1212,25 @@ def preview_selected(rows, evt: gr.SelectData):
     if row_idx < 0 or row_idx >= len(rows):
         return None, "Selected row is out of range.", ""
     selected = _extract_row(rows, row_idx)
+    uuid = selected[0] if len(selected) > 0 else ""
     image_path = selected[3] if len(selected) > 3 else ""
+    open_url = selected[7] if len(selected) > 7 else ""
+    if str(uuid).startswith("m365:"):
+        ou = _safe_https_browser_url(open_url)
+        if ou:
+            esc = html.escape(ou, quote=True)
+            return (
+                None,
+                f"Outlook message — open in browser: <a href=\"{esc}\" "
+                'target="_blank" rel="noopener noreferrer">Open in Outlook (web)</a>',
+                "",
+            )
+        return (
+            None,
+            "Outlook message — no **webLink** stored yet; run `outlook_graph_ingest` again "
+            "or search hits above for the generic Outlook link.",
+            "",
+        )
     if not image_path:
         return None, "No image path stored for this row.", ""
     p = Path(image_path)
@@ -1469,14 +1517,25 @@ def build_app(
         )
         hits = gr.Dataframe(
             label="Retrieved index rows",
-            headers=["uuid", "filename", "date_iso", "image_path_used", "rank", "ocr_excerpt", "vlm_excerpt"],
-            datatype=["str", "str", "str", "str", "str", "str", "str"],
+            headers=[
+                "uuid",
+                "filename",
+                "date_iso",
+                "image_path_used",
+                "rank",
+                "ocr_excerpt",
+                "vlm_excerpt",
+                "open_url",
+            ],
+            datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
             wrap=True,
         )
         preview = gr.Image(label="Selected result preview")
         hit_gallery = gr.Gallery(label="Hit Thumbnails", columns=4, height=260, object_fit="contain")
         hit_gallery_paths = gr.State([])
-        preview_note = gr.Markdown("Select a result row to preview the image.")
+        preview_note = gr.Markdown(
+            "Select a result row to preview the image.", sanitize_html=False
+        )
         selected_path = gr.Textbox(label="Selected image path", interactive=False)
         with gr.Row():
             reveal_btn = gr.Button("Reveal in Finder")

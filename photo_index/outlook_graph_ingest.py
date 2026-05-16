@@ -24,21 +24,37 @@ Environment variables
     Optional default mailbox user principal name for ``--mailbox``. Overrides ``/me``
     when set.
 
+CLI scope (no Gradio involvement): ``--folder inbox`` (or other well-known folder name)
+limits sync to that folder; use a separate ``--delta-path`` per folder if you index several.
+``--since ISO8601`` skips older mail when indexing (Graph still enumerates the delta).
+``--max-messages N`` stops after N indexed messages and does not advance the delta checkpoint.
+
+``--sync-named-presets`` runs a built-in list of **custom** folders (matched by Outlook
+**display name**), each with its own delta file and **lookback window** (messages older
+than that are skipped when indexing). Folder names must match exactly (including spaces
+and spelling). Use ``--list-named-presets`` to print the table.
+
+``--test-connection`` acquires a token and performs one minimal Graph mail call (no ingest).
+
 Runs share ``data/content_ingest.lock`` with other ingest scripts unless you pass
 ``--no-global-ingest-lock``.
 
 Token cache path: ``data/graph_mail_token_cache.json`` (under repo ``data/``).
 Delta checkpoint path: ``data/graph_mail_delta.json``.
-Indexed UUID prefix: ``m365:{graph_message_id}``.
+Indexed UUID prefix: ``m365:{graph_message_id}``. Each row stores Graph ``webLink``
+in ``photo_meta.open_url`` so the Gradio UI can open the message in Outlook on the web.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import json
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 import time
 import urllib.parse
 from pathlib import Path
@@ -63,8 +79,36 @@ _TAG_HTML_RE = re.compile(r"<[^>]+>")
 _FILENAME_SAFE_RE = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 
 
+@dataclass(frozen=True)
+class NamedFolderPreset:
+    """Custom mailbox folder by exact Outlook display name + index lookback."""
+
+    display_name: str
+    lookback_days: int
+    delta_slug: str
+
+
+# Built-in named-folder syncs (display names must match Outlook exactly).
+NAMED_FOLDER_PRESETS_DEFAULT: tuple[NamedFolderPreset, ...] = (
+    NamedFolderPreset("002-Temp Save FOlder", 730, "named_002_temp_save"),  # ~2 years
+    NamedFolderPreset("0-Learning", 365, "named_0_learning"),  # ~1 year
+    NamedFolderPreset("0-Merch", 243, "named_0_merch"),  # ~8 months (243 ≈ 8×365/12)
+)
+
+
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _parse_iso_datetime(s: str) -> datetime:
+    """Parse Graph-style ISO-8601 datetimes (including trailing ``Z``)."""
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    dt = datetime.fromisoformat(t)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class _JsonTokenCache(msal.SerializableTokenCache):
@@ -95,17 +139,86 @@ def _mailbox_segment(mailbox_upn: str | None) -> str:
     return "/me"
 
 
-def _delta_entry_url(mailbox_segment: str, folder_well_known: str | None) -> str:
+def _delta_entry_url(
+    mailbox_segment: str,
+    folder_well_known: str | None,
+    folder_graph_id: str | None = None,
+) -> str:
+    if folder_graph_id and folder_graph_id.strip():
+        fid = urllib.parse.quote(folder_graph_id.strip(), safe="")
+        return f"{_GRAPH_ROOT}{mailbox_segment}/mailFolders/{fid}/messages/delta"
     if folder_well_known and folder_well_known.strip():
         fk = urllib.parse.quote(folder_well_known.strip(), safe="")
         return f"{_GRAPH_ROOT}{mailbox_segment}/mailFolders/{fk}/messages/delta"
     return f"{_GRAPH_ROOT}{mailbox_segment}/messages/delta"
 
 
-def _normalize_mail_scope(mailbox_upn: str | None, folder_well_known: str | None) -> str:
+def _normalize_mail_scope(
+    mailbox_upn: str | None,
+    folder_well_known: str | None,
+    folder_graph_id: str | None = None,
+) -> str:
     mb = (mailbox_upn or "").strip() or "me"
+    if folder_graph_id and folder_graph_id.strip():
+        return f"{mb}|id:{folder_graph_id.strip()}"
     fd = (folder_well_known or "").strip() or "all"
     return f"{mb}|{fd}"
+
+
+def _graph_collect_folder_pages(session: requests.Session, first_url: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    url: str | None = first_url
+    while url:
+        payload = _graph_get(session, url)
+        batch = payload.get("value")
+        if isinstance(batch, list):
+            for item in batch:
+                if isinstance(item, dict):
+                    out.append(item)
+        nl = payload.get("@odata.nextLink")
+        url = nl.strip() if isinstance(nl, str) and nl.strip() else None
+    return out
+
+
+def find_mail_folder_ids_by_display_name(
+    session: requests.Session,
+    mailbox_segment: str,
+    display_name: str,
+) -> list[str]:
+    """Resolve Graph mailFolder id(s) with exact ``displayName`` (searches nested folders)."""
+    target = (display_name or "").strip()
+    if not target:
+        return []
+    matches: list[str] = []
+    seen_enqueue: set[str] = set()
+
+    q: deque[str] = deque()
+    root_url = f"{_GRAPH_ROOT}{mailbox_segment}/mailFolders?$top=200"
+    for item in _graph_collect_folder_pages(session, root_url):
+        fid = str(item.get("id") or "").strip()
+        name = str(item.get("displayName") or "")
+        if name == target and fid:
+            matches.append(fid)
+        if fid and fid not in seen_enqueue:
+            seen_enqueue.add(fid)
+            q.append(fid)
+
+    while q:
+        parent_id = q.popleft()
+        parent_enc = urllib.parse.quote(parent_id, safe="")
+        child_url = (
+            f"{_GRAPH_ROOT}{mailbox_segment}/mailFolders/{parent_enc}/childFolders?$top=200"
+        )
+        for item in _graph_collect_folder_pages(session, child_url):
+            cid = str(item.get("id") or "").strip()
+            name = str(item.get("displayName") or "")
+            if name == target and cid:
+                matches.append(cid)
+            if cid and cid not in seen_enqueue:
+                seen_enqueue.add(cid)
+                q.append(cid)
+
+    return matches
 
 
 def _load_delta_state(path: Path) -> dict[str, Any]:
@@ -216,7 +329,12 @@ def _acquire_token(
 
 
 def _process_message_item(
-    conn: sqlite3.Connection, item: dict[str, Any], *, commit_every: int, counters: dict[str, int]
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    *,
+    commit_every: int,
+    counters: dict[str, int],
+    since_dt: datetime | None,
 ) -> None:
     if item.get("@removed"):
         mid = item.get("id")
@@ -245,6 +363,16 @@ def _process_message_item(
         return
 
     received = item.get("receivedDateTime") or item.get("sentDateTime") or ""
+    if since_dt:
+        raw_dt = str(received).strip()
+        if raw_dt:
+            try:
+                msg_dt = _parse_iso_datetime(raw_dt)
+                if msg_dt < since_dt:
+                    counters["skipped_since"] += 1
+                    return
+            except ValueError:
+                pass
     from_row = (item.get("from") or {}).get("emailAddress") or {}
     from_addr = (from_row.get("address") or "").strip()
     from_name = (from_row.get("name") or "").strip()
@@ -268,6 +396,7 @@ def _process_message_item(
         meta_bits.append(f"cc={cc_s}")
 
     filename = f"mail:{_safe_mail_filename(subject)}"
+    web_link = str(item.get("webLink") or "").strip()
 
     upsert_photo(
         conn,
@@ -277,6 +406,7 @@ def _process_message_item(
         ocr_text=plain,
         vlm_text=" ".join(meta_bits),
         image_path_used="",
+        open_url=web_link,
         commit=False,
     )
     counters["indexed"] += 1
@@ -293,12 +423,20 @@ def run_outlook_graph_ingest(
     delta_path: Path,
     mailbox_upn: str | None,
     folder_well_known: str | None,
+    folder_graph_id: str | None,
     auth_mode: str,
     reset_delta: bool,
     commit_every: int,
     page_hint: int,
+    since_dt: datetime | None,
+    max_messages: int | None,
 ) -> dict[str, int | float]:
-    mail_scope = _normalize_mail_scope(mailbox_upn, folder_well_known)
+    fw = (folder_well_known or "").strip() or None
+    fg = (folder_graph_id or "").strip() or None
+    if fw and fg:
+        raise ValueError("Pass only one of folder_well_known or folder_graph_id")
+
+    mail_scope = _normalize_mail_scope(mailbox_upn, folder_well_known, folder_graph_id)
     state = _load_delta_state(delta_path)
     stored_scope = str(state.get("mail_scope") or "")
     delta_link = None if reset_delta else state.get("delta_link")
@@ -327,16 +465,17 @@ def run_outlook_graph_ingest(
         url = delta_link
         _log("[graph] Continuing incremental sync from saved delta link.")
     else:
-        url = _delta_entry_url(mb_seg, folder_well_known)
+        url = _delta_entry_url(mb_seg, folder_well_known, folder_graph_id)
         params = {"$top": str(max(1, min(page_hint, 999)))}
         url = f"{url}?{urllib.parse.urlencode(params)}"
         _log(f"[graph] Starting full sync: {url.split('?')[0]}")
 
     conn = connect(index_db_path)
     init_schema(conn)
-    counters = {"indexed": 0, "deleted": 0, "skipped_empty": 0, "pages": 0}
+    counters = {"indexed": 0, "deleted": 0, "skipped_empty": 0, "skipped_since": 0, "pages": 0}
     t0 = time.perf_counter()
     new_delta: str | None = None
+    stopped_early = False
 
     try:
         while url:
@@ -347,7 +486,21 @@ def run_outlook_graph_ingest(
                 for item in batch:
                     if not isinstance(item, dict):
                         continue
-                    _process_message_item(conn, item, commit_every=commit_every, counters=counters)
+                    _process_message_item(
+                        conn,
+                        item,
+                        commit_every=commit_every,
+                        counters=counters,
+                        since_dt=since_dt,
+                    )
+                    cap = max_messages if max_messages is not None else 0
+                    if cap > 0 and counters["indexed"] >= cap:
+                        stopped_early = True
+                        url = None
+                        break
+
+            if stopped_early:
+                break
 
             url = payload.get("@odata.nextLink")
             if isinstance(url, str) and url.strip():
@@ -359,7 +512,13 @@ def run_outlook_graph_ingest(
             if isinstance(dl, str) and dl.strip():
                 new_delta = dl.strip()
 
-        if new_delta:
+        if stopped_early:
+            _log(
+                "[graph warn] Stopped early (--max-messages): delta checkpoint not updated; "
+                "run again with a higher limit or omit --max-messages to finish initial sync."
+            )
+            new_delta = None
+        elif new_delta:
             _save_delta_state(delta_path, delta_link=new_delta, mail_scope=mail_scope)
             _log("[graph] Saved delta link for next incremental run.")
         else:
@@ -372,11 +531,123 @@ def run_outlook_graph_ingest(
     elapsed = time.perf_counter() - t0
     _log(
         f"[graph done] indexed={counters['indexed']} deleted={counters['deleted']} "
-        f"skipped_empty={counters['skipped_empty']} pages={counters['pages']} "
-        f"time={elapsed:.1f}s db={index_db_path}"
+        f"skipped_empty={counters['skipped_empty']} skipped_since={counters['skipped_since']} "
+        f"pages={counters['pages']} time={elapsed:.1f}s db={index_db_path}"
     )
     counters["elapsed"] = elapsed
     return counters
+
+
+def run_named_folder_preset_batch(
+    *,
+    index_db_path: Path,
+    client_id: str,
+    tenant: str,
+    token_cache_path: Path,
+    mailbox_upn: str | None,
+    presets: tuple[NamedFolderPreset, ...] | list[NamedFolderPreset],
+    delta_dir: Path,
+    auth_mode: str,
+    reset_delta: bool,
+    commit_every: int,
+    page_hint: int,
+    max_messages: int | None,
+) -> dict[str, int | float]:
+    """Discover folders by display name and sync each with its own delta file and lookback."""
+    mb_seg = _mailbox_segment(mailbox_upn)
+    token = _acquire_token(
+        client_id=client_id,
+        tenant=tenant,
+        cache_path=token_cache_path,
+        auth_mode=auth_mode,
+    )
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Prefer": 'outlook.body-content-type="text"',
+        }
+    )
+    totals = {"indexed": 0, "deleted": 0, "skipped_empty": 0, "skipped_since": 0, "pages": 0}
+    elapsed_sum = 0.0
+    try:
+        for preset in presets:
+            ids = find_mail_folder_ids_by_display_name(session, mb_seg, preset.display_name)
+            if not ids:
+                _log(f"[graph warn] No folder with displayName={preset.display_name!r}; skipping preset.")
+                continue
+            if len(ids) > 1:
+                _log(
+                    f"[graph warn] {len(ids)} folders named {preset.display_name!r}; "
+                    "syncing each with its own delta file."
+                )
+            since_dt = datetime.now(timezone.utc) - timedelta(days=preset.lookback_days)
+            _log(
+                f"[graph] Preset folder {preset.display_name!r}: lookback={preset.lookback_days}d "
+                f"(index on/after {since_dt.date()} UTC)"
+            )
+            for idx, fid in enumerate(ids):
+                slug = preset.delta_slug if len(ids) == 1 else f"{preset.delta_slug}__{idx}"
+                delta_path = delta_dir / f"graph_mail_delta_{slug}.json"
+                ctr = run_outlook_graph_ingest(
+                    index_db_path=index_db_path,
+                    client_id=client_id,
+                    tenant=tenant,
+                    token_cache_path=token_cache_path,
+                    delta_path=delta_path,
+                    mailbox_upn=mailbox_upn,
+                    folder_well_known=None,
+                    folder_graph_id=fid,
+                    auth_mode=auth_mode,
+                    reset_delta=reset_delta,
+                    commit_every=commit_every,
+                    page_hint=page_hint,
+                    since_dt=since_dt,
+                    max_messages=max_messages,
+                )
+                for k in totals:
+                    totals[k] += int(ctr[k])
+                elapsed_sum += float(ctr["elapsed"])
+    finally:
+        session.close()
+
+    totals["elapsed"] = elapsed_sum
+    return totals
+
+
+def run_graph_connection_test(
+    *,
+    client_id: str,
+    tenant: str,
+    token_cache_path: Path,
+    mailbox_upn: str | None,
+    auth_mode: str,
+) -> None:
+    """Acquire token and GET mailFolders?$top=1 (validates Mail.Read; does not write SQLite)."""
+    _log("[graph test] Acquiring token …")
+    token = _acquire_token(
+        client_id=client_id,
+        tenant=tenant,
+        cache_path=token_cache_path,
+        auth_mode=auth_mode,
+    )
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {token}"})
+    mb_seg = _mailbox_segment(mailbox_upn)
+    probe_url = f"{_GRAPH_ROOT}{mb_seg}/mailFolders?$top=1"
+    _log(f"[graph test] GET {probe_url.split('?')[0]} …")
+    payload = _graph_get(session, probe_url)
+    folders = payload.get("value")
+    n = len(folders) if isinstance(folders, list) else 0
+    _log(f"[graph test] OK — Mail.Read works; mailFolders sample returned {n} row(s).")
+    if mailbox_upn:
+        _log(f"[graph test] Mailbox: delegated access to {mailbox_upn.strip()!r} (/users/{{upn}}/…).")
+    else:
+        _log("[graph test] Mailbox: signed-in user (/me/…).")
+    if isinstance(folders, list) and folders:
+        fd0 = folders[0]
+        if isinstance(fd0, dict):
+            _log(f"[graph test] First folder in response: {str(fd0.get('displayName') or '?')!r}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -440,14 +711,107 @@ def main(argv: list[str] | None = None) -> None:
         help="Graph $top hint per page during initial delta crawl (max 999).",
     )
     p.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        metavar="ISO8601",
+        help="Only index messages on or after this instant (UTC), e.g. 2024-01-01 or 2024-01-01T00:00:00Z. "
+        "Graph still paginates the folder; older mail is skipped locally.",
+    )
+    p.add_argument(
+        "--max-messages",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after indexing N non-empty messages (testing/partial pull). "
+        "Does not save a delta link; omit for a full sync.",
+    )
+    p.add_argument(
         "--no-global-ingest-lock",
         action="store_true",
         help="Disable shared content-ingest lock (not recommended).",
     )
+    p.add_argument(
+        "--sync-named-presets",
+        action="store_true",
+        help="Sync built-in custom folders (exact Outlook display names) with per-folder "
+        "lookback; does not run the default mailbox-wide /messages delta. See --list-named-presets.",
+    )
+    p.add_argument(
+        "--list-named-presets",
+        action="store_true",
+        help="Print built-in named-folder presets and exit.",
+    )
+    p.add_argument(
+        "--named-preset-delta-dir",
+        type=str,
+        default=str(_DEFAULT_DB.parent),
+        help="Directory for named-preset delta JSON files (default: same dir as default DB).",
+    )
+    p.add_argument(
+        "--test-connection",
+        action="store_true",
+        help="Acquire token and call Graph mailFolders?$top=1 only (no SQLite ingest). Exit 1 on failure.",
+    )
     args = p.parse_args(argv)
+
+    if args.list_named_presets:
+        _log("Built-in named-folder presets (exact Outlook displayName match):")
+        for pr in NAMED_FOLDER_PRESETS_DEFAULT:
+            _log(
+                f"  - {pr.display_name!r}: lookback {pr.lookback_days} days "
+                f"(delta files graph_mail_delta_{pr.delta_slug}.json)"
+            )
+        return
+
+    if args.test_connection:
+        ingest_flags = (
+            args.sync_named_presets,
+            bool(args.folder),
+            bool(args.since),
+            args.reset_delta,
+            args.max_messages is not None,
+        )
+        if any(ingest_flags):
+            p.error("--test-connection cannot be combined with ingest options (--folder, --since, …).")
+        cid = (args.client_id or "").strip()
+        if not cid:
+            p.error(
+                "Missing client id: pass --client-id or set GRAPH_CLIENT_ID "
+                "(Entra app registration → Application ID)."
+            )
+        token_cache_path = Path(os.path.abspath(args.token_cache))
+        try:
+            run_graph_connection_test(
+                client_id=cid,
+                tenant=str(args.tenant or "organizations"),
+                token_cache_path=token_cache_path,
+                mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
+                auth_mode=str(args.auth),
+            )
+        except Exception as e:
+            _log(f"[graph test] FAILED: {e}")
+            sys.exit(1)
+        return
 
     if args.commit_every < 1:
         p.error("--commit-every must be >= 1")
+
+    if args.sync_named_presets and args.folder:
+        p.error("Use either --sync-named-presets or --folder, not both.")
+    if args.sync_named_presets and args.since:
+        p.error("--since applies only to the standard sync; named presets use fixed lookbacks.")
+
+    since_dt: datetime | None = None
+    if args.since:
+        try:
+            since_dt = _parse_iso_datetime(args.since)
+        except ValueError:
+            p.error("--since must be ISO-8601 (e.g. 2024-06-01 or 2024-06-01T12:00:00Z)")
+
+    max_messages = args.max_messages
+    if max_messages is not None and max_messages < 1:
+        p.error("--max-messages must be >= 1")
 
     cid = (args.client_id or "").strip()
     if not cid:
@@ -460,6 +824,42 @@ def main(argv: list[str] | None = None) -> None:
     token_cache_path = Path(os.path.abspath(args.token_cache))
     delta_path = Path(os.path.abspath(args.delta_path))
 
+    if args.sync_named_presets:
+        preset_delta_dir = Path(os.path.abspath(args.named_preset_delta_dir))
+        preset_delta_dir.mkdir(parents=True, exist_ok=True)
+
+        def _run_presets() -> None:
+            agg = run_named_folder_preset_batch(
+                index_db_path=index_db_path,
+                client_id=cid,
+                tenant=str(args.tenant or "organizations"),
+                token_cache_path=token_cache_path,
+                mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
+                presets=NAMED_FOLDER_PRESETS_DEFAULT,
+                delta_dir=preset_delta_dir,
+                auth_mode=str(args.auth),
+                reset_delta=bool(args.reset_delta),
+                commit_every=int(args.commit_every),
+                page_hint=int(args.page_size),
+                max_messages=max_messages,
+            )
+            _log(
+                f"[graph presets done] indexed={agg['indexed']} deleted={agg['deleted']} "
+                f"skipped_empty={agg['skipped_empty']} skipped_since={agg['skipped_since']} "
+                f"pages={agg['pages']} time={agg['elapsed']:.1f}s db={index_db_path}"
+            )
+
+        if args.no_global_ingest_lock:
+            _run_presets()
+            return
+
+        with global_ingest_lock() as have_lock:
+            if not have_lock:
+                _log("[lock] Another content ingest is already running; skipping this run.")
+                return
+            _run_presets()
+        return
+
     def _run() -> None:
         run_outlook_graph_ingest(
             index_db_path=index_db_path,
@@ -469,10 +869,13 @@ def main(argv: list[str] | None = None) -> None:
             delta_path=delta_path,
             mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
             folder_well_known=args.folder,
+            folder_graph_id=None,
             auth_mode=str(args.auth),
             reset_delta=bool(args.reset_delta),
             commit_every=int(args.commit_every),
             page_hint=int(args.page_size),
+            since_dt=since_dt,
+            max_messages=max_messages,
         )
 
     if args.no_global_ingest_lock:
