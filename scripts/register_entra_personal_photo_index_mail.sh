@@ -20,7 +20,13 @@ set -euo pipefail
 
 DISPLAY_NAME="${DISPLAY_NAME:-personal-photo-index-mail}"
 SIGN_IN_AUDIENCE="${SIGN_IN_AUDIENCE:-AzureADMultipleOrgs}"
+# Microsoft Graph application ID (resource).
 GRAPH_API_ID="00000003-0000-0000-c000-000000000000"
+# Delegated permission IDs on that resource (stable; do not use ``az ad sp show``
+# here — tenant-only CLI logins often fail with "User was not found").
+# Source: https://learn.microsoft.com/en-us/graph/permissions-reference
+GRAPH_MAIL_READ_DELEGATED="570282fd-fa5c-430d-a7fd-fc8dc98a9dca"
+GRAPH_OFFLINE_ACCESS_DELEGATED="7427e0e9-2fba-42fe-b0c0-848c9e6a8182"
 
 if ! command -v az >/dev/null 2>&1; then
   for _brew_az in /opt/homebrew/bin/az /usr/local/bin/az; do
@@ -65,20 +71,9 @@ if ! _logged_into_az; then
   exit 1
 fi
 
-echo "Resolving Microsoft Graph delegated permission IDs …"
-MAIL_READ_SCOPE="$(
-  az ad sp show --id "$GRAPH_API_ID" \
-    --query "oauth2PermissionScopes[?value=='Mail.Read'].id | [0]" -o tsv
-)"
-if [[ -z "$MAIL_READ_SCOPE" || "$MAIL_READ_SCOPE" == "null" ]]; then
-  echo "Failed to resolve Mail.Read scope id for Graph. Try: az ad sp show --id $GRAPH_API_ID"
-  exit 1
-fi
-
-OFFLINE_SCOPE="$(
-  az ad sp show --id "$GRAPH_API_ID" \
-    --query "oauth2PermissionScopes[?value=='offline_access'].id | [0]" -o tsv 2>/dev/null || true
-)"
+echo "Using Microsoft Graph delegated permission IDs (Mail.Read, offline_access) …"
+MAIL_READ_SCOPE="$GRAPH_MAIL_READ_DELEGATED"
+OFFLINE_SCOPE="$GRAPH_OFFLINE_ACCESS_DELEGATED"
 
 EXISTING_OBJ="$(az ad app list --filter "displayName eq '${DISPLAY_NAME}'" --query "[0].id" -o tsv)"
 if [[ -n "${EXISTING_OBJ:-}" && "$EXISTING_OBJ" != "null" ]]; then
