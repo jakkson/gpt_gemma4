@@ -20,7 +20,19 @@ SIGN_IN_AUDIENCE="${SIGN_IN_AUDIENCE:-AzureADMultipleOrgs}"
 GRAPH_API_ID="00000003-0000-0000-c000-000000000000"
 
 if ! command -v az >/dev/null 2>&1; then
-  echo "Azure CLI not found. Install: brew install azure-cli"
+  for _brew_az in /opt/homebrew/bin/az /usr/local/bin/az; do
+    if [[ -x "$_brew_az" ]]; then
+      PATH="$(dirname "$_brew_az"):$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+
+if ! command -v az >/dev/null 2>&1; then
+  echo "Azure CLI not found."
+  echo "Install:  brew install azure-cli"
+  echo "Then open a new terminal tab or run:  eval \"\$(brew shellenv)\""
   exit 1
 fi
 
