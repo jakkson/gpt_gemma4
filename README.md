@@ -90,6 +90,7 @@ Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS
   - `export GRAPH_CLIENT_ID='your-client-id'`
   - `python -m photo_index.outlook_graph_ingest --auth interactive`
   - First run opens a browser to sign in; later runs use `data/graph_mail_token_cache.json`. Incremental sync uses `data/graph_mail_delta.json`.
+  - **Azure CLI login crashes** (no Azure subscription; error in **Tenant and subscription selection** such as `'NoneType' object has no attribute 'get'`): run **`brew upgrade azure-cli`**, then **`az login --allow-no-subscriptions --tenant YOUR_TENANT_ID`** (copy **Tenant ID** from **Microsoft Entra admin center → Overview**). Or **`az login --use-device-code --allow-no-subscriptions --tenant YOUR_TENANT_ID`**. If CLI keeps failing, create the app only in the portal (**App registrations → New registration**, name **`personal-photo-index-mail`**, **Mobile and desktop** redirect **`http://localhost`**, API permissions **Mail.Read** + **offline_access**, **Grant admin consent**), then **`export GRAPH_CLIENT_ID='…'`** from **Application (client) ID**.
 
 - Install nightly 2:00 AM photo ingest (launchd):
   - `./install_photo_nightly_launchd.sh`

@@ -4,7 +4,9 @@
 #
 # Prerequisites:
 #   brew install azure-cli   # or https://learn.microsoft.com/cli/azure/install-azure-cli
-#   az login --allow-no-subscriptions    # if you have no Azure subscription (Entra-only)
+#   az login --allow-no-subscriptions [--tenant TENANT_ID]
+#       Use explicit --tenant <Entra Tenant ID> if login crashes in "Tenant and subscription selection"
+#       (known azure-cli bug when there are zero subscriptions). Upgrade CLI: brew upgrade azure-cli
 #   az login                             # if you have subscriptions
 #
 # Usage:
