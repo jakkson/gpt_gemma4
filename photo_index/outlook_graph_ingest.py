@@ -36,6 +36,9 @@ limits sync to that folder; use a separate ``--delta-path`` per folder if you in
 ``sentitems`` only — not the whole mailbox) **plus** those custom folders—still **no**
 mailbox-wide ``/messages/delta``.
 
+``--progress-every-pages N`` prints a short progress line every N Graph delta pages
+(use ``0`` to disable).
+
 ``--test-connection`` acquires a token and performs one minimal Graph mail call (no ingest).
 
 Runs share ``data/content_ingest.lock`` with other ingest scripts unless you pass
@@ -439,6 +442,7 @@ def run_outlook_graph_ingest(
     page_hint: int,
     since_dt: datetime | None,
     max_messages: int | None,
+    progress_every_pages: int = 1,
 ) -> dict[str, int | float]:
     fw = (folder_well_known or "").strip() or None
     fg = (folder_graph_id or "").strip() or None
@@ -491,6 +495,7 @@ def run_outlook_graph_ingest(
             payload = _graph_get(session, url)
             counters["pages"] += 1
             batch = payload.get("value")
+            batch_n = len(batch) if isinstance(batch, list) else 0
             if isinstance(batch, list):
                 for item in batch:
                     if not isinstance(item, dict):
@@ -507,6 +512,15 @@ def run_outlook_graph_ingest(
                         stopped_early = True
                         url = None
                         break
+
+            if progress_every_pages > 0 and counters["pages"] % progress_every_pages == 0:
+                elapsed = time.perf_counter() - t0
+                _log(
+                    f"[graph {mail_scope}] page {counters['pages']} "
+                    f"batch_items={batch_n} | indexed={counters['indexed']} "
+                    f"deleted={counters['deleted']} skipped_empty={counters['skipped_empty']} "
+                    f"skipped_since={counters['skipped_since']} | {elapsed:.1f}s elapsed"
+                )
 
             if stopped_early:
                 break
@@ -561,6 +575,7 @@ def run_named_folder_preset_batch(
     commit_every: int,
     page_hint: int,
     max_messages: int | None,
+    progress_every_pages: int = 1,
 ) -> dict[str, int | float]:
     """Discover folders by display name and sync each with its own delta file and lookback."""
     mb_seg = _mailbox_segment(mailbox_upn)
@@ -613,6 +628,7 @@ def run_named_folder_preset_batch(
                     page_hint=page_hint,
                     since_dt=since_dt,
                     max_messages=max_messages,
+                    progress_every_pages=progress_every_pages,
                 )
                 for k in totals:
                     totals[k] += int(ctr[k])
@@ -736,6 +752,13 @@ def main(argv: list[str] | None = None) -> None:
         "Does not save a delta link; omit for a full sync.",
     )
     p.add_argument(
+        "--progress-every-pages",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Log a progress line every N Graph delta pages (default: 1). Use 0 to disable.",
+    )
+    p.add_argument(
         "--no-global-ingest-lock",
         action="store_true",
         help="Disable shared content-ingest lock (not recommended).",
@@ -839,6 +862,10 @@ def main(argv: list[str] | None = None) -> None:
     if max_messages is not None and max_messages < 1:
         p.error("--max-messages must be >= 1")
 
+    progress_every_pages = int(args.progress_every_pages)
+    if progress_every_pages < 0:
+        p.error("--progress-every-pages must be >= 0")
+
     cid = (args.client_id or "").strip()
     if not cid:
         p.error(
@@ -877,6 +904,7 @@ def main(argv: list[str] | None = None) -> None:
                     page_hint=int(args.page_size),
                     since_dt=None,
                     max_messages=max_messages,
+                    progress_every_pages=progress_every_pages,
                 )
                 _log(
                     f"[graph {wk} done] indexed={ctr['indexed']} deleted={ctr['deleted']} "
@@ -897,6 +925,7 @@ def main(argv: list[str] | None = None) -> None:
                 commit_every=int(args.commit_every),
                 page_hint=int(args.page_size),
                 max_messages=max_messages,
+                progress_every_pages=progress_every_pages,
             )
             _log(
                 f"[graph presets done] indexed={agg['indexed']} deleted={agg['deleted']} "
@@ -933,6 +962,7 @@ def main(argv: list[str] | None = None) -> None:
                 commit_every=int(args.commit_every),
                 page_hint=int(args.page_size),
                 max_messages=max_messages,
+                progress_every_pages=progress_every_pages,
             )
             _log(
                 f"[graph presets done] indexed={agg['indexed']} deleted={agg['deleted']} "
@@ -967,6 +997,7 @@ def main(argv: list[str] | None = None) -> None:
             page_hint=int(args.page_size),
             since_dt=since_dt,
             max_messages=max_messages,
+            progress_every_pages=progress_every_pages,
         )
 
     if args.no_global_ingest_lock:
