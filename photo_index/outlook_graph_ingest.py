@@ -32,9 +32,9 @@ limits sync to that folder; use a separate ``--delta-path`` per folder if you in
 
 ``--sync-named-presets`` runs the built-in **custom** folders only (no Inbox).
 
-``--sync-inbox-and-named-presets`` runs **Inbox** (well-known ``inbox`` only, not the
-whole mailbox) **plus** those same custom folders—still **no** mailbox-wide
-``/messages/delta``.
+``--sync-inbox-and-named-presets`` runs **Inbox** and **Sent** (well-known ``inbox`` and
+``sentitems`` only — not the whole mailbox) **plus** those custom folders—still **no**
+mailbox-wide ``/messages/delta``.
 
 ``--test-connection`` acquires a token and performs one minimal Graph mail call (no ingest).
 
@@ -72,7 +72,11 @@ from photo_index.store import commit_ingest, connect, delete_index_row, init_sch
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 _DEFAULT_TOKEN_CACHE = Path(__file__).resolve().parent.parent / "data" / "graph_mail_token_cache.json"
 _DEFAULT_DELTA_PATH = Path(__file__).resolve().parent.parent / "data" / "graph_mail_delta.json"
-_INBOX_WELL_KNOWN_DELTA_NAME = "graph_mail_delta_wk_inbox.json"
+# (well_known_segment, delta_filename) for --sync-inbox-and-named-presets (before named presets).
+_WELL_KNOWN_PRESET_BUNDLE: tuple[tuple[str, str], ...] = (
+    ("inbox", "graph_mail_delta_wk_inbox.json"),
+    ("sentitems", "graph_mail_delta_wk_sentitems.json"),
+)
 
 _GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 # MSAL 1.36+ rejects reserved OIDC scopes in this list; do not add offline_access/openid/profile here.
@@ -745,8 +749,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--sync-inbox-and-named-presets",
         action="store_true",
-        help="Sync well-known Inbox only, then built-in named-folder presets (no mailbox-wide "
-        "/messages delta). Same preset lookbacks as --list-named-presets.",
+        help="Sync well-known Inbox and Sent Items only, then built-in named-folder presets "
+        "(no mailbox-wide /messages delta). Same preset lookbacks as --list-named-presets.",
     )
     p.add_argument(
         "--list-named-presets",
@@ -773,8 +777,10 @@ def main(argv: list[str] | None = None) -> None:
                 f"  - {pr.display_name!r}: lookback {pr.lookback_days} days "
                 f"(delta files graph_mail_delta_{pr.delta_slug}.json)"
             )
-        _log(f"Inbox-only delta when bundled: {_INBOX_WELL_KNOWN_DELTA_NAME} (under --named-preset-delta-dir).")
-        _log("Sync Inbox + presets: --sync-inbox-and-named-presets")
+        _log("Well-known folder deltas when bundled (under --named-preset-delta-dir):")
+        for wk, fname in _WELL_KNOWN_PRESET_BUNDLE:
+            _log(f"  - {wk}: {fname}")
+        _log("Sync Inbox + Sent + presets: --sync-inbox-and-named-presets")
         return
 
     if args.test_connection:
@@ -814,7 +820,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.sync_named_presets and args.folder:
         p.error("Use either --sync-named-presets or --folder, not both.")
     if args.sync_inbox_and_named_presets and args.folder:
-        p.error("--sync-inbox-and-named-presets already includes Inbox; do not pass --folder.")
+        p.error("--sync-inbox-and-named-presets already includes Inbox and Sent; do not pass --folder.")
     if args.sync_inbox_and_named_presets and args.sync_named_presets:
         p.error("Use either --sync-named-presets or --sync-inbox-and-named-presets, not both.")
     if args.sync_named_presets and args.since:
@@ -847,32 +853,37 @@ def main(argv: list[str] | None = None) -> None:
     if args.sync_inbox_and_named_presets:
         preset_delta_dir = Path(os.path.abspath(args.named_preset_delta_dir))
         preset_delta_dir.mkdir(parents=True, exist_ok=True)
-        inbox_delta_path = preset_delta_dir / _INBOX_WELL_KNOWN_DELTA_NAME
 
-        def _run_inbox_plus_presets() -> None:
-            _log("[graph] Phase 1/2: Inbox (well-known folder only — not whole mailbox) …")
-            inbox_ctr = run_outlook_graph_ingest(
-                index_db_path=index_db_path,
-                client_id=cid,
-                tenant=str(args.tenant or "organizations"),
-                token_cache_path=token_cache_path,
-                delta_path=inbox_delta_path,
-                mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
-                folder_well_known="inbox",
-                folder_graph_id=None,
-                auth_mode=str(args.auth),
-                reset_delta=bool(args.reset_delta),
-                commit_every=int(args.commit_every),
-                page_hint=int(args.page_size),
-                since_dt=None,
-                max_messages=max_messages,
-            )
-            _log(
-                f"[graph inbox done] indexed={inbox_ctr['indexed']} deleted={inbox_ctr['deleted']} "
-                f"skipped_empty={inbox_ctr['skipped_empty']} skipped_since={inbox_ctr['skipped_since']} "
-                f"pages={inbox_ctr['pages']} time={inbox_ctr['elapsed']:.1f}s"
-            )
-            _log("[graph] Phase 2/2: Named-folder presets …")
+        def _run_well_known_bundle_then_presets() -> None:
+            n_wk = len(_WELL_KNOWN_PRESET_BUNDLE)
+            total_phases = n_wk + 1
+            for i, (wk, delta_fname) in enumerate(_WELL_KNOWN_PRESET_BUNDLE, start=1):
+                _log(
+                    f"[graph] Phase {i}/{total_phases}: Well-known folder {wk!r} "
+                    "(not whole mailbox) …"
+                )
+                ctr = run_outlook_graph_ingest(
+                    index_db_path=index_db_path,
+                    client_id=cid,
+                    tenant=str(args.tenant or "organizations"),
+                    token_cache_path=token_cache_path,
+                    delta_path=preset_delta_dir / delta_fname,
+                    mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
+                    folder_well_known=wk,
+                    folder_graph_id=None,
+                    auth_mode=str(args.auth),
+                    reset_delta=bool(args.reset_delta),
+                    commit_every=int(args.commit_every),
+                    page_hint=int(args.page_size),
+                    since_dt=None,
+                    max_messages=max_messages,
+                )
+                _log(
+                    f"[graph {wk} done] indexed={ctr['indexed']} deleted={ctr['deleted']} "
+                    f"skipped_empty={ctr['skipped_empty']} skipped_since={ctr['skipped_since']} "
+                    f"pages={ctr['pages']} time={ctr['elapsed']:.1f}s"
+                )
+            _log(f"[graph] Phase {total_phases}/{total_phases}: Named-folder presets …")
             agg = run_named_folder_preset_batch(
                 index_db_path=index_db_path,
                 client_id=cid,
@@ -894,14 +905,14 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         if args.no_global_ingest_lock:
-            _run_inbox_plus_presets()
+            _run_well_known_bundle_then_presets()
             return
 
         with global_ingest_lock() as have_lock:
             if not have_lock:
                 _log("[lock] Another content ingest is already running; skipping this run.")
                 return
-            _run_inbox_plus_presets()
+            _run_well_known_bundle_then_presets()
         return
 
     if args.sync_named_presets:
