@@ -71,57 +71,157 @@ if ! _logged_into_az; then
   exit 1
 fi
 
-echo "Using Microsoft Graph delegated permission IDs (Mail.Read, offline_access) …"
-MAIL_READ_SCOPE="$GRAPH_MAIL_READ_DELEGATED"
-OFFLINE_SCOPE="$GRAPH_OFFLINE_ACCESS_DELEGATED"
+echo "Registering application via Microsoft Graph REST (``az ad app list`` fails with tenant-only / no-subscription login)."
+command -v python3 >/dev/null 2>&1 || {
+  echo "python3 is required for Graph REST registration."
+  exit 1
+}
 
-EXISTING_OBJ="$(az ad app list --filter "displayName eq '${DISPLAY_NAME}'" --query "[0].id" -o tsv)"
-if [[ -n "${EXISTING_OBJ:-}" && "$EXISTING_OBJ" != "null" ]]; then
-  OBJ_ID="$EXISTING_OBJ"
-  APP_ID="$(az ad app show --id "$OBJ_ID" --query appId -o tsv)"
-  echo "Found existing app registration named '${DISPLAY_NAME}' (object ${OBJ_ID})."
-  echo "Updating public-client redirect URI http://localhost …"
-  az ad app update --id "$OBJ_ID" \
-    --public-client-redirect-uris "http://localhost"
-else
-  echo "Creating app registration '${DISPLAY_NAME}' …"
-  OBJ_ID="$(
-    az ad app create \
-      --display-name "$DISPLAY_NAME" \
-      --sign-in-audience "$SIGN_IN_AUDIENCE" \
-      --public-client-redirect-uris "http://localhost" \
-      --query id -o tsv
-  )"
-  APP_ID="$(az ad app show --id "$OBJ_ID" --query appId -o tsv)"
+GRAPH_TOKEN="$(az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv 2>/dev/null || true)"
+if [[ -z "${GRAPH_TOKEN:-}" ]]; then
+  echo "ERROR: Could not get a Microsoft Graph access token."
+  echo "Try:  az login --allow-no-subscriptions --tenant YOUR_TENANT_ID"
+  exit 1
 fi
 
-echo "Adding Graph delegated permissions …"
-set +e
-az ad app permission add --id "$OBJ_ID" --api "$GRAPH_API_ID" \
-  --api-permissions "${MAIL_READ_SCOPE}=Scope" 2>/dev/null
-RC_MAIL=$?
-set -e
-if [[ "$RC_MAIL" -ne 0 ]]; then
-  echo "(Mail.Read may already be registered on this app — continuing.)"
-fi
+export GRAPH_TOKEN DISPLAY_NAME SIGN_IN_AUDIENCE GRAPH_API_ID GRAPH_MAIL_READ_DELEGATED GRAPH_OFFLINE_ACCESS_DELEGATED
 
-if [[ -n "${OFFLINE_SCOPE:-}" && "$OFFLINE_SCOPE" != "null" ]]; then
-  set +e
-  az ad app permission add --id "$OBJ_ID" --api "$GRAPH_API_ID" \
-    --api-permissions "${OFFLINE_SCOPE}=Scope" 2>/dev/null
-  set -e
-fi
+eval "$(
+  python3 << 'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-echo "Attempting tenant admin consent (may fail without admin rights) …"
+TOKEN = os.environ["GRAPH_TOKEN"]
+DISPLAY_NAME = os.environ["DISPLAY_NAME"]
+SIGN_IN_AUDIENCE = os.environ["SIGN_IN_AUDIENCE"]
+GRAPH_API_ID = os.environ["GRAPH_API_ID"]
+MAIL_READ = os.environ["GRAPH_MAIL_READ_DELEGATED"]
+OFFLINE = os.environ["GRAPH_OFFLINE_ACCESS_DELEGATED"]
+
+
+def graph_req(method: str, url: str, body=None):
+    payload = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, raw if raw.strip() else "{}"
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")
+        print(f"HTTP {e.code} {method}\n{err}", file=sys.stderr)
+        sys.exit(1)
+
+
+def find_apps():
+    esc = DISPLAY_NAME.replace("'", "''")
+    filt = f"displayName eq '{esc}'"
+    qs = urllib.parse.urlencode({"$filter": filt, "$select": "id,appId,displayName"})
+    _, raw = graph_req("GET", f"https://graph.microsoft.com/v1.0/applications?{qs}")
+    return json.loads(raw).get("value") or []
+
+
+def perm_block() -> dict:
+    return {
+        "resourceAppId": GRAPH_API_ID,
+        "resourceAccess": [
+            {"id": MAIL_READ, "type": "Scope"},
+            {"id": OFFLINE, "type": "Scope"},
+        ],
+    }
+
+
+def merge_rra(existing):
+    blocks = list(existing or [])
+    want = perm_block()
+    idx = next((i for i, b in enumerate(blocks) if b.get("resourceAppId") == GRAPH_API_ID), None)
+    if idx is None:
+        blocks.append(want)
+        return blocks
+    ra_list = list(blocks[idx].get("resourceAccess") or [])
+    by_key = {(x.get("id"), x.get("type")): x for x in ra_list}
+    for w in want["resourceAccess"]:
+        by_key[(w["id"], w["type"])] = w
+    blocks[idx] = {**blocks[idx], "resourceAccess": list(by_key.values())}
+    return blocks
+
+
+def create_app():
+    body = {
+        "displayName": DISPLAY_NAME,
+        "signInAudience": SIGN_IN_AUDIENCE,
+        "isFallbackPublicClient": True,
+        "publicClient": {"redirectUris": ["http://localhost"]},
+        "requiredResourceAccess": [perm_block()],
+    }
+    _, raw = graph_req("POST", "https://graph.microsoft.com/v1.0/applications", body)
+    obj = json.loads(raw)
+    return obj["id"], obj["appId"]
+
+
+def patch_app(obj_id):
+    sel = urllib.parse.urlencode(
+        {"$select": "id,appId,requiredResourceAccess,publicClient,isFallbackPublicClient"}
+    )
+    url = f"https://graph.microsoft.com/v1.0/applications/{urllib.parse.quote(obj_id)}?{sel}"
+    _, raw = graph_req("GET", url)
+    cur = json.loads(raw)
+    pc = dict(cur.get("publicClient") or {})
+    uris = list(pc.get("redirectUris") or [])
+    if "http://localhost" not in uris:
+        uris.append("http://localhost")
+    pc["redirectUris"] = uris
+    patch = {
+        "isFallbackPublicClient": True,
+        "publicClient": pc,
+        "requiredResourceAccess": merge_rra(cur.get("requiredResourceAccess")),
+    }
+    graph_req(
+        "PATCH",
+        f"https://graph.microsoft.com/v1.0/applications/{urllib.parse.quote(obj_id)}",
+        patch,
+    )
+    return cur["id"], cur["appId"]
+
+
+def main():
+    apps = find_apps()
+    if apps:
+        print(f"Found existing app '{DISPLAY_NAME}' — updating redirects and API permissions.", file=sys.stderr)
+        oid, aid = patch_app(apps[0]["id"])
+    else:
+        print(f"Creating app '{DISPLAY_NAME}' …", file=sys.stderr)
+        oid, aid = create_app()
+    print(f"OBJ_ID={json.dumps(oid)}")
+    print(f"APP_ID={json.dumps(aid)}")
+
+
+main()
+PY
+)"
+
+echo "Mail.Read + offline_access applied on the app registration (Graph manifest)."
 set +e
 az ad app permission admin-consent --id "$OBJ_ID"
 RC_AC=$?
 set -e
 if [[ "$RC_AC" -ne 0 ]]; then
   echo ""
-  echo "Admin consent was not applied automatically. In Entra portal:"
+  echo "Automatic admin-consent did not succeed (common with tenant-only CLI). In Entra portal:"
   echo "  App registrations → ${DISPLAY_NAME} → API permissions → Grant admin consent"
-  echo "(Personal tenants: your account is usually enough after clicking Grant.)"
+  echo "Or ignore if you only need user consent on first Outlook ingest sign-in."
 fi
 
 echo ""
