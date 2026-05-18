@@ -7,6 +7,7 @@ Azure Entra ID setup (one-time)
    - Redirect URI: *Mobile and desktop applications* → add ``http://localhost``.
 2. **API permissions → Microsoft Graph → Delegated permissions:**
    - ``Mail.Read`` (required).
+   - ``User.Read`` (recommended; aligns with ``/me`` and typical consent screens).
    - ``offline_access`` (recommended so refresh tokens are issued; keep this in the portal —
      do **not** pass it in code scopes with MSAL 1.36+, MSAL adds OIDC scopes automatically).
    - Grant consent for your org / admin consent if policy requires it.
@@ -87,7 +88,10 @@ _WELL_KNOWN_PRESET_BUNDLE: tuple[tuple[str, str], ...] = (
 _GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 # MSAL 1.36+ rejects reserved OIDC scopes in this list; do not add offline_access/openid/profile here.
 # Still register delegated ``offline_access`` in Entra — MSAL adds it on the wire as needed.
-_SCOPES = ["https://graph.microsoft.com/Mail.Read"]
+_SCOPES = [
+    "https://graph.microsoft.com/Mail.Read",
+    "https://graph.microsoft.com/User.Read",
+]
 
 _BR_HTML_RE = re.compile(r"<\s*br\s*/?>", re.I)
 _TAG_HTML_RE = re.compile(r"<[^>]+>")
