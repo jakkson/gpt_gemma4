@@ -45,6 +45,9 @@ Runs share ``data/content_ingest.lock`` with other ingest scripts unless you pas
 ``--no-global-ingest-lock``.
 
 Token cache path: ``data/graph_mail_token_cache.json`` (under repo ``data/``).
+If Graph returns **401** after sign-in, delete this file and re-auth — stale tokens often
+lack **Mail.Read** after permission changes. Confirm Entra **Grant admin consent** for delegated Mail.Read.
+
 Delta checkpoint path: ``data/graph_mail_delta.json``.
 Indexed UUID prefix: ``m365:{graph_message_id}``. Each row stores Graph ``webLink``
 in ``photo_meta.open_url`` so the Gradio UI can open the message in Outlook on the web.
@@ -281,6 +284,14 @@ def _safe_mail_filename(subject: str) -> str:
     return raw[:200] if len(raw) > 200 else raw
 
 
+def _graph_log_http_error(resp: requests.Response) -> None:
+    snippet = (resp.text or "")[:4000].strip()
+    if snippet:
+        _log(f"[graph] HTTP {resp.status_code} response body:\n{snippet}")
+    else:
+        _log(f"[graph] HTTP {resp.status_code} (empty body)")
+
+
 def _graph_get(session: requests.Session, url: str, *, timeout: float = 120.0) -> dict[str, Any]:
     backoff = 3.0
     for attempt in range(8):
@@ -295,6 +306,8 @@ def _graph_get(session: requests.Session, url: str, *, timeout: float = 120.0) -
             time.sleep(sleep_s)
             backoff = min(backoff * 2, 120.0)
             continue
+        if resp.status_code >= 400:
+            _graph_log_http_error(resp)
         resp.raise_for_status()
         return resp.json()
     raise RuntimeError("Microsoft Graph: too many 429 retries")
@@ -318,6 +331,9 @@ def _acquire_token(
     if accounts:
         result = app.acquire_token_silent(_SCOPES, account=accounts[0])
     if result and result.get("access_token"):
+        scope_s = str(result.get("scope") or "").strip()
+        if scope_s:
+            _log(f"[graph] Token scopes (silent): {scope_s}")
         cache.flush()
         return str(result["access_token"])
 
@@ -337,6 +353,15 @@ def _acquire_token(
     if not result or not result.get("access_token"):
         err = (result or {}).get("error_description") or (result or {}).get("error") or "unknown"
         raise RuntimeError(f"Authentication failed: {err}")
+    scope_s = str((result or {}).get("scope") or "").strip()
+    if scope_s:
+        _log(f"[graph] Token scopes from identity platform: {scope_s}")
+        if "mail.read" not in scope_s.lower():
+            _log(
+                "[graph warn] Mail.Read not listed in granted scopes — Graph mail calls may "
+                "401/403. In Entra: API permissions → delegated Mail.Read → Grant admin consent; "
+                "then delete the token cache file and sign in again."
+            )
     return str(result["access_token"])
 
 
