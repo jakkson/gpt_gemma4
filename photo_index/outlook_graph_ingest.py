@@ -48,6 +48,11 @@ Runs share ``data/content_ingest.lock`` with other ingest scripts unless you pas
 Token cache path: ``data/graph_mail_token_cache.json`` (under repo ``data/``).
 If Graph returns **401** after sign-in, delete this file and re-auth — stale tokens often
 lack **Mail.Read** after permission changes. Confirm Entra **Grant admin consent** for delegated Mail.Read.
+Try ``--force-token-refresh`` once after changing permissions.
+If **401** persists while the logged JWT already lists ``Mail.Read`` (and ``--test-connection``
+shows whether ``/me`` works but ``mailFolders`` does not), the signed-in identity may have no
+**Exchange Online mailbox** or tenant policy blocks mail APIs — verify mail in **Outlook on the web**.
+Logs include Graph ``request-id`` headers when present for support tickets.
 
 Delta checkpoint path: ``data/graph_mail_delta.json``.
 Indexed UUID prefix: ``m365:{graph_message_id}``. Each row stores Graph ``webLink``
@@ -57,6 +62,7 @@ in ``photo_meta.open_url`` so the Gradio UI can open the message in Outlook on t
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 from dataclasses import dataclass
 import json
@@ -288,7 +294,23 @@ def _safe_mail_filename(subject: str) -> str:
     return raw[:200] if len(raw) > 200 else raw
 
 
+_GRAPH_GRAPH_AUDIENCES = frozenset(
+    {
+        "https://graph.microsoft.com",
+        "https://graph.microsoft.com/",
+        "00000003-0000-0000-c000-000000000000",
+    }
+)
+
+
 def _graph_log_http_error(resp: requests.Response) -> None:
+    www = (resp.headers.get("WWW-Authenticate") or "").strip()
+    if www:
+        _log(f"[graph] HTTP {resp.status_code} WWW-Authenticate: {www[:2000]}")
+    for hn in ("request-id", "client-request-id", "x-ms-ags-diagnostic", "Date"):
+        hv = (resp.headers.get(hn) or "").strip()
+        if hv:
+            _log(f"[graph] HTTP {resp.status_code} {hn}: {hv[:500]}")
     snippet = (resp.text or "")[:4000].strip()
     if snippet:
         _log(f"[graph] HTTP {resp.status_code} response body:\n{snippet}")
@@ -296,10 +318,46 @@ def _graph_log_http_error(resp: requests.Response) -> None:
         _log(f"[graph] HTTP {resp.status_code} (empty body)")
 
 
+def _log_access_token_jwt_claims(access_token: str) -> None:
+    """Log aud/scp from JWT payload without cryptographic verification (debug only)."""
+    parts = access_token.split(".")
+    if len(parts) < 2:
+        _log("[graph warn] Access token is not a JWT; skipping claim decode.")
+        return
+    try:
+        payload_b64 = parts[1]
+        pad = "=" * (-len(payload_b64) % 4)
+        raw = base64.urlsafe_b64decode(payload_b64 + pad)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        _log(f"[graph warn] Could not decode JWT payload: {e}")
+        return
+    aud = payload.get("aud")
+    scp = payload.get("scp")
+    roles = payload.get("roles")
+    exp = payload.get("exp")
+    app_id = payload.get("appid") or payload.get("azp")
+    tid = payload.get("tid")
+    _log(
+        f"[graph] JWT (unverified): aud={aud!r} tid={tid!r} azp/appid={app_id!r} "
+        f"scp={scp!r} roles={roles!r} exp_unix={exp}"
+    )
+    aud_ok = aud in _GRAPH_GRAPH_AUDIENCES
+    if isinstance(aud, list):
+        aud_ok = bool(set(aud) & _GRAPH_GRAPH_AUDIENCES)
+    if not aud_ok:
+        _log(
+            "[graph warn] Token audience is not Microsoft Graph — mail APIs typically return 401. "
+            "Delete the token cache and sign in again, or fix app registration / tenant."
+        )
+
+
 def _graph_get(session: requests.Session, url: str, *, timeout: float = 120.0) -> dict[str, Any]:
     backoff = 3.0
     for attempt in range(8):
         resp = session.get(url, timeout=timeout)
+        if resp.url != url:
+            _log(f"[graph warn] GET redirected {url!r} → final URL {resp.url!r} (Authorization may be dropped on cross-host redirects)")
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
             try:
@@ -323,6 +381,7 @@ def _acquire_token(
     tenant: str,
     cache_path: Path,
     auth_mode: str,
+    force_refresh: bool = False,
 ) -> str:
     cache = _JsonTokenCache(cache_path)
     app = msal.PublicClientApplication(
@@ -333,13 +392,33 @@ def _acquire_token(
     accounts = app.get_accounts()
     result = None
     if accounts:
-        result = app.acquire_token_silent(_SCOPES, account=accounts[0])
-    if result and result.get("access_token"):
-        scope_s = str(result.get("scope") or "").strip()
-        if scope_s:
-            _log(f"[graph] Token scopes (silent): {scope_s}")
-        cache.flush()
-        return str(result["access_token"])
+        _log(
+            f"[graph] Trying MSAL silent token ({len(accounts)} account(s) in cache); "
+            f"force_refresh={force_refresh}"
+        )
+        result = app.acquire_token_silent(
+            _SCOPES,
+            account=accounts[0],
+            force_refresh=force_refresh,
+        )
+        if result and result.get("access_token"):
+            _log("[graph] Token source: silent cache (or refreshed)")
+            scope_s = str(result.get("scope") or "").strip()
+            if scope_s:
+                _log(f"[graph] Token scopes (silent): {scope_s}")
+            _log_access_token_jwt_claims(str(result["access_token"]))
+            if "mail.read" not in scope_s.lower():
+                _log(
+                    "[graph warn] Mail.Read may be missing from scope string — if Graph returns 401, "
+                    "use --force-token-refresh or delete the token cache and sign in again."
+                )
+            cache.flush()
+            return str(result["access_token"]).strip()
+        if result:
+            err = result.get("error") or result.get("error_description") or result
+            _log(f"[graph warn] Silent token not obtained: {err!r}; falling back to {auth_mode!r}")
+    else:
+        _log("[graph] No MSAL accounts in cache; interactive/device sign-in required")
 
     auth_mode = auth_mode.strip().lower()
     if auth_mode == "device":
@@ -347,8 +426,10 @@ def _acquire_token(
         if "user_code" not in flow:
             raise RuntimeError(f"Device flow failed: {flow}")
         _log(flow["message"])
+        _log("[graph] Token source: device flow")
         result = app.acquire_token_by_device_flow(flow)
     elif auth_mode == "interactive":
+        _log("[graph] Token source: interactive browser")
         result = app.acquire_token_interactive(scopes=_SCOPES)
     else:
         raise ValueError(f"Unknown --auth mode: {auth_mode}")
@@ -366,7 +447,8 @@ def _acquire_token(
                 "401/403. In Entra: API permissions → delegated Mail.Read → Grant admin consent; "
                 "then delete the token cache file and sign in again."
             )
-    return str(result["access_token"])
+    _log_access_token_jwt_claims(str(result["access_token"]))
+    return str(result["access_token"]).strip()
 
 
 def _process_message_item(
@@ -472,6 +554,7 @@ def run_outlook_graph_ingest(
     since_dt: datetime | None,
     max_messages: int | None,
     progress_every_pages: int = 1,
+    force_token_refresh: bool = False,
 ) -> dict[str, int | float]:
     fw = (folder_well_known or "").strip() or None
     fg = (folder_graph_id or "").strip() or None
@@ -493,6 +576,7 @@ def run_outlook_graph_ingest(
         tenant=tenant,
         cache_path=token_cache_path,
         auth_mode=auth_mode,
+        force_refresh=force_token_refresh,
     )
     session = requests.Session()
     session.headers.update(
@@ -605,6 +689,7 @@ def run_named_folder_preset_batch(
     page_hint: int,
     max_messages: int | None,
     progress_every_pages: int = 1,
+    force_token_refresh: bool = False,
 ) -> dict[str, int | float]:
     """Discover folders by display name and sync each with its own delta file and lookback."""
     mb_seg = _mailbox_segment(mailbox_upn)
@@ -613,6 +698,7 @@ def run_named_folder_preset_batch(
         tenant=tenant,
         cache_path=token_cache_path,
         auth_mode=auth_mode,
+        force_refresh=force_token_refresh,
     )
     session = requests.Session()
     session.headers.update(
@@ -658,6 +744,7 @@ def run_named_folder_preset_batch(
                     since_dt=since_dt,
                     max_messages=max_messages,
                     progress_every_pages=progress_every_pages,
+                    force_token_refresh=force_token_refresh,
                 )
                 for k in totals:
                     totals[k] += int(ctr[k])
@@ -676,6 +763,7 @@ def run_graph_connection_test(
     token_cache_path: Path,
     mailbox_upn: str | None,
     auth_mode: str,
+    force_token_refresh: bool = False,
 ) -> None:
     """Acquire token and GET mailFolders?$top=1 (validates Mail.Read; does not write SQLite)."""
     _log("[graph test] Acquiring token …")
@@ -684,10 +772,23 @@ def run_graph_connection_test(
         tenant=tenant,
         cache_path=token_cache_path,
         auth_mode=auth_mode,
+        force_refresh=force_token_refresh,
     )
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     mb_seg = _mailbox_segment(mailbox_upn)
+    me_url = f"{_GRAPH_ROOT}{mb_seg}?$select=id,userPrincipalName,mail"
+    _log(f"[graph test] GET {me_url.split('?')[0]} …")
+    me_resp = session.get(me_url, timeout=60.0)
+    if me_resp.url != me_url:
+        _log(f"[graph warn] GET redirected {me_url!r} → final URL {me_resp.url!r}")
+    if me_resp.status_code >= 400:
+        _graph_log_http_error(me_resp)
+        me_resp.raise_for_status()
+    me_payload = me_resp.json()
+    upn = me_payload.get("userPrincipalName")
+    mail = me_payload.get("mail")
+    _log(f"[graph test] /me OK — userPrincipalName={upn!r} mail={mail!r}")
     probe_url = f"{_GRAPH_ROOT}{mb_seg}/mailFolders?$top=1"
     _log(f"[graph test] GET {probe_url.split('?')[0]} …")
     payload = _graph_get(session, probe_url)
@@ -788,6 +889,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Log a progress line every N Graph delta pages (default: 1). Use 0 to disable.",
     )
     p.add_argument(
+        "--force-token-refresh",
+        action="store_true",
+        help="Ask MSAL to refresh cached tokens (helps after consent changes). "
+        "Or delete data/graph_mail_token_cache.json and sign in again.",
+    )
+    p.add_argument(
         "--no-global-ingest-lock",
         action="store_true",
         help="Disable shared content-ingest lock (not recommended).",
@@ -860,6 +967,7 @@ def main(argv: list[str] | None = None) -> None:
                 token_cache_path=token_cache_path,
                 mailbox_upn=(args.mailbox.strip() if args.mailbox else None),
                 auth_mode=str(args.auth),
+                force_token_refresh=bool(args.force_token_refresh),
             )
         except Exception as e:
             _log(f"[graph test] FAILED: {e}")
@@ -894,6 +1002,8 @@ def main(argv: list[str] | None = None) -> None:
     progress_every_pages = int(args.progress_every_pages)
     if progress_every_pages < 0:
         p.error("--progress-every-pages must be >= 0")
+
+    force_token_refresh = bool(args.force_token_refresh)
 
     cid = (args.client_id or "").strip()
     if not cid:
@@ -934,6 +1044,7 @@ def main(argv: list[str] | None = None) -> None:
                     since_dt=None,
                     max_messages=max_messages,
                     progress_every_pages=progress_every_pages,
+                    force_token_refresh=force_token_refresh,
                 )
                 _log(
                     f"[graph {wk} done] indexed={ctr['indexed']} deleted={ctr['deleted']} "
@@ -955,6 +1066,7 @@ def main(argv: list[str] | None = None) -> None:
                 page_hint=int(args.page_size),
                 max_messages=max_messages,
                 progress_every_pages=progress_every_pages,
+                force_token_refresh=force_token_refresh,
             )
             _log(
                 f"[graph presets done] indexed={agg['indexed']} deleted={agg['deleted']} "
@@ -992,6 +1104,7 @@ def main(argv: list[str] | None = None) -> None:
                 page_hint=int(args.page_size),
                 max_messages=max_messages,
                 progress_every_pages=progress_every_pages,
+                force_token_refresh=force_token_refresh,
             )
             _log(
                 f"[graph presets done] indexed={agg['indexed']} deleted={agg['deleted']} "
@@ -1027,6 +1140,7 @@ def main(argv: list[str] | None = None) -> None:
             since_dt=since_dt,
             max_messages=max_messages,
             progress_every_pages=progress_every_pages,
+            force_token_refresh=force_token_refresh,
         )
 
     if args.no_global_ingest_lock:
