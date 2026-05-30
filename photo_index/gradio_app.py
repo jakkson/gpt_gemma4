@@ -462,6 +462,69 @@ def _is_finance_query(question: str) -> bool:
     return bool(q) and any(t in q for t in _FINANCE_TRIGGER_TERMS)
 
 
+_SUBSCRIPTION_WORDS = (
+    "subscription", "subscriptions", "recurring", "/month", "per month",
+    "monthly", "renew", "renews", "renewal", "renewed", "annual", "annually",
+    "yearly", "membership", "invoice", "receipt", "billed",
+)
+
+
+def _is_finance_record(text: str) -> bool:
+    """Broader than ``_is_bank_source``: any transaction/subscription record that
+    carries a real currency figure — bank alerts, merchant receipts (Apple,
+    Netflix, Spotify…), and billing notices that lack a recognized bank name."""
+    t = (text or "").lower()
+    if not _CURRENCY_RE.search(t):
+        return False
+    if any(w in t for w in _BANK_ISSUERS):
+        return True
+    if any(w in t for w in _TRANSACTION_WORDS):
+        return True
+    return any(w in t for w in _SUBSCRIPTION_WORDS)
+
+
+# Stopwords filtered out of token overlap so generic words ("the", "what")
+# don't inflate noisy hits over targeted ones.
+_OVERLAP_STOP = frozenset({
+    "the", "and", "for", "you", "what", "this", "that", "with", "your",
+    "are", "was", "were", "from", "have", "has", "not", "but", "all",
+    "any", "how", "much", "i'm", "i am", "now", "just", "did", "spend",
+    "spent", "tally", "total", "many",
+})
+
+
+def _query_token_overlap(text: str, ql: str) -> int:
+    t = (text or "").lower()
+    n = 0
+    for tok in re.findall(r"[a-z0-9'.-]+", ql or ""):
+        if len(tok) < 3 or tok in _OVERLAP_STOP:
+            continue
+        if tok in t:
+            n += 1
+    return n
+
+
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _query_month_year(question: str) -> tuple[int, int] | None:
+    """Extract an explicit (year, month) like 'april 2026' for date-scoped sort."""
+    ql = (question or "").lower()
+    ym = re.search(r"\b(20\d{2})\b", ql)
+    if not ym:
+        return None
+    year = int(ym.group(1))
+    for name, num in _MONTHS.items():
+        if re.search(rf"\b{name}\b", ql):
+            return (year, num)
+    return None
+
+
 # Words stripped before FTS / substring retrieval. Natural questions like
 # "find photos of Paris" built an FTS AND over find + photos + Paris; captions
 # rarely contain the word "photos", so every real Paris hit was dropped.
@@ -700,27 +763,20 @@ def _retrieve_rows(
 
         rows = list(merged.values())
 
-        # Restrict finance/subscription queries to authoritative bank or credit-card
-        # statement rows. This excludes casual chat like "he was paying $30 for X".
-        # If no bank rows exist in the candidate set, fall back to the unrestricted
-        # set so the user still sees something.
+        # Restrict finance/subscription queries to real transaction/billing rows
+        # (bank alerts, merchant receipts, subscription notices with a $ figure).
+        # This excludes casual chat and unrelated recent docs. If nothing matches,
+        # fall back to the unrestricted set so the user still sees something.
         if restrict_finance and _is_finance_query(question):
-            bank_rows = [
+            finance_rows = [
                 r for r in rows
-                if _is_bank_source(
+                if _is_finance_record(
                     f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
                 )
             ]
-            if bank_rows:
-                rows = bank_rows
+            if finance_rows:
+                rows = finance_rows
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
-        # Stopwords filtered out of overlap so generic words ("the", "what")
-        # don't inflate noisy hits over targeted ones.
-        _OVERLAP_STOP = {
-            "the", "and", "for", "you", "what", "this", "that", "with", "your",
-            "are", "was", "were", "from", "have", "has", "not", "but", "all",
-            "any", "how", "much", "i'm", "i am", "now", "just",
-        }
 
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
             uid = str(r["uuid"] or "")
@@ -775,9 +831,21 @@ def _retrieve_rows(
             return (msg_pref, overlap + entity_bonus, -rank, date_key)
 
         if sort_by == SORT_RECENT:
+            month_year = _query_month_year(question)
+            month_prefix = (
+                f"{month_year[0]:04d}-{month_year[1]:02d}" if month_year else None
+            )
 
             def recency_tuple(r: sqlite3.Row) -> tuple[str, str]:
                 return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
+
+            def month_recency_key(r: sqlite3.Row) -> tuple[int, str, str]:
+                in_month = (
+                    1
+                    if month_prefix and str(r["date_iso"] or "").startswith(month_prefix)
+                    else 0
+                )
+                return (in_month, str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
 
             if msg_disc:
                 msgs_only = [
@@ -806,8 +874,37 @@ def _retrieve_rows(
                 rows = photos_only[:top_k]
                 if len(rows) < top_k:
                     rows.extend(non_photo[: top_k - len(rows)])
+            elif _is_finance_query(question):
+                # Finance queries: surface real transaction/billing rows first,
+                # date-sorted (and within the asked-for month, if any), so a tally
+                # doesn't get buried by an unrelated recent document.
+                fin = [
+                    r
+                    for r in rows
+                    if _is_finance_record(
+                        f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
+                    )
+                ]
+                fin_ids = {str(r["uuid"]) for r in fin}
+                other = [r for r in rows if str(r["uuid"]) not in fin_ids]
+                fin.sort(key=month_recency_key, reverse=True)
+                other.sort(key=recency_tuple, reverse=True)
+                rows = fin[:top_k]
+                if len(rows) < top_k:
+                    rows.extend(other[: top_k - len(rows)])
             else:
-                rows.sort(key=recency_tuple, reverse=True)
+                # Keep rows that actually match the query ahead of unrelated recent
+                # rows, so a recent-but-irrelevant document can't top the list.
+                matched = [r for r in rows if _query_token_overlap(
+                    f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}", ql
+                ) > 0]
+                matched_ids = {str(r["uuid"]) for r in matched}
+                unmatched = [r for r in rows if str(r["uuid"]) not in matched_ids]
+                matched.sort(key=month_recency_key, reverse=True)
+                unmatched.sort(key=recency_tuple, reverse=True)
+                rows = matched[:top_k]
+                if len(rows) < top_k:
+                    rows.extend(unmatched[: top_k - len(rows)])
         else:
             rows.sort(key=score, reverse=True)
         return rows[:top_k]
@@ -1076,7 +1173,7 @@ def answer_question(
         )
 
     prompt = _build_prompt(effective_query, rows, aggregate=aggregate_mode)
-    route = "large_direct"
+    route = "direct"
     first_model = qa_model
     if aggregate_mode:
         first_model = qa_model
