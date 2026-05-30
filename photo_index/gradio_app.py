@@ -462,25 +462,62 @@ def _is_finance_query(question: str) -> bool:
     return bool(q) and any(t in q for t in _FINANCE_TRIGGER_TERMS)
 
 
-_SUBSCRIPTION_WORDS = (
-    "subscription", "subscriptions", "recurring", "/month", "per month",
-    "monthly", "renew", "renews", "renewal", "renewed", "annual", "annually",
-    "yearly", "membership", "invoice", "receipt", "billed",
+# Real money amount: must carry a '$' sign (or explicit USD). A bare "3.14" or
+# version string must NOT count, or long documents match as "charges".
+_MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{1,2})?|\busd\s?\d", re.I)
+
+# Phrases that mark an actual transaction/billing event (not just any text that
+# happens to mention money).
+_TXN_PHRASES = (
+    "charged", "charge of", "was charged", "transaction", "withdrawn",
+    "debited", "auto-pay", "autopay", "payment of", "amount due", "amount of",
+    "balance is", "new statement", "statement for", "posted", "purchase of",
+    "you paid", "was placed on", "placed on your", "pay $", "due $",
+    "charge on", "charged to", "bill of", "billed",
+)
+
+_SUBSCRIPTION_PHRASES = (
+    "subscription", "recurring charge", "recurring payment", "/month",
+    "per month", "monthly charge", "auto-renew", "auto renew", "renews on",
+    "renewal of", "membership to", "membership for", "invoice", "receipt for",
 )
 
 
-def _is_finance_record(text: str) -> bool:
-    """Broader than ``_is_bank_source``: any transaction/subscription record that
-    carries a real currency figure — bank alerts, merchant receipts (Apple,
-    Netflix, Spotify…), and billing notices that lack a recognized bank name."""
+def _is_transaction_text(text: str) -> bool:
+    """Strict: text contains a real $ amount AND a transaction/subscription/issuer
+    signal. Tight enough that ordinary documents do not register as charges."""
     t = (text or "").lower()
-    if not _CURRENCY_RE.search(t):
+    if not _MONEY_RE.search(t):
         return False
     if any(w in t for w in _BANK_ISSUERS):
         return True
-    if any(w in t for w in _TRANSACTION_WORDS):
+    if any(w in t for w in _TXN_PHRASES):
         return True
-    return any(w in t for w in _SUBSCRIPTION_WORDS)
+    return any(w in t for w in _SUBSCRIPTION_PHRASES)
+
+
+# Filename hints that a document really is a statement/receipt (not just a long
+# document that happens to mention a bank or a dollar figure).
+_DOC_STATEMENT_HINTS = (
+    "statement", "invoice", "receipt", "1099", "remittance", "e-statement",
+    "estatement", "billing", "transactions", "account summary", "paystub",
+    "pay stub", "payslip",
+)
+
+
+def _is_transaction_row(r: sqlite3.Row) -> bool:
+    """Authoritative charge/payment record. Messages/mail qualify on a strict
+    transaction-text match. Documents/photos must both look like a bank source
+    (issuer + transaction word + currency) AND carry a statement-like filename,
+    so articles, summaries, and tax worksheets don't leak into a spending tally."""
+    uid = str(r["uuid"] or "")
+    blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
+    if uid.startswith(("imsg:", "m365:")):
+        return _is_transaction_text(blob)
+    if not _is_bank_source(blob):
+        return False
+    fn = (r["filename"] or "").lower()
+    return any(h in fn for h in _DOC_STATEMENT_HINTS)
 
 
 # Stopwords filtered out of token overlap so generic words ("the", "what")
@@ -763,18 +800,22 @@ def _retrieve_rows(
 
         rows = list(merged.values())
 
-        # Restrict finance/subscription queries to real transaction/billing rows
-        # (bank alerts, merchant receipts, subscription notices with a $ figure).
-        # This excludes casual chat and unrelated recent docs. If nothing matches,
-        # fall back to the unrestricted set so the user still sees something.
+        # Restrict finance/subscription queries to authoritative charge/payment
+        # rows (bank alerts, merchant receipts) and exclude casual chat and
+        # unrelated documents. When the question names a month/year, hard-scope to
+        # it so out-of-range charges (e.g. February for a May query) don't leak in.
+        query_my = _query_month_year(question)
+        query_month_prefix = f"{query_my[0]:04d}-{query_my[1]:02d}" if query_my else None
         if restrict_finance and _is_finance_query(question):
-            finance_rows = [
-                r for r in rows
-                if _is_finance_record(
-                    f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-                )
-            ]
-            if finance_rows:
+            finance_rows = [r for r in rows if _is_transaction_row(r)]
+            if query_month_prefix:
+                # Scope strictly to the asked-for month; empty is a valid answer
+                # (better than showing out-of-scope or non-financial rows).
+                rows = [
+                    r for r in finance_rows
+                    if str(r["date_iso"] or "").startswith(query_month_prefix)
+                ]
+            elif finance_rows:
                 rows = finance_rows
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
 
@@ -877,20 +918,15 @@ def _retrieve_rows(
             elif _is_finance_query(question):
                 # Finance queries: surface real transaction/billing rows first,
                 # date-sorted (and within the asked-for month, if any), so a tally
-                # doesn't get buried by an unrelated recent document.
-                fin = [
-                    r
-                    for r in rows
-                    if _is_finance_record(
-                        f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-                    )
-                ]
+                # doesn't get buried by an unrelated recent document. When a month
+                # was named, the restrict block already scoped rows to it.
+                fin = [r for r in rows if _is_transaction_row(r)]
                 fin_ids = {str(r["uuid"]) for r in fin}
                 other = [r for r in rows if str(r["uuid"]) not in fin_ids]
                 fin.sort(key=month_recency_key, reverse=True)
                 other.sort(key=recency_tuple, reverse=True)
                 rows = fin[:top_k]
-                if len(rows) < top_k:
+                if len(rows) < top_k and not month_prefix:
                     rows.extend(other[: top_k - len(rows)])
             else:
                 # Keep rows that actually match the query ahead of unrelated recent
@@ -1163,10 +1199,30 @@ def answer_question(
                 )
     if not rows:
         elapsed = time.perf_counter() - t0
+        scoped_my = _query_month_year(q)
+        if restrict_finance and _is_finance_query(q) and scoped_my:
+            month_name = (
+                f"{('', 'January','February','March','April','May','June','July','August','September','October','November','December')[scoped_my[1]]} {scoped_my[0]}"
+            )
+            no_match_msg = (
+                f"No bank or credit-card charges/payments dated {month_name} are in your "
+                f"index. (The finance filter is ON, so only transaction records count — "
+                f"casual mentions and documents are excluded.) Try another month, turn off "
+                f"\u201cRestrict finance answers to bank/credit-card statements\u201d, or run a "
+                f"fresh messages ingest if you expect a charge that isn't indexed yet."
+            )
+        elif restrict_finance and _is_finance_query(q):
+            no_match_msg = (
+                "No bank or credit-card transaction records matched. The finance filter is "
+                "ON, so casual mentions and documents are excluded \u2014 turn it off to "
+                "search more broadly, or run a fresh messages ingest."
+            )
+        else:
+            no_match_msg = "No matches in index yet. Keep ingest running, then try again."
         return (
-            "No matches in index yet. Keep ingest running, then try again.",
+            no_match_msg,
             [],
-            f"Last search: no matches, total retrieval time {elapsed:.2f}s, top-k={top_k}, sort={sort_by}",
+            f"Last search: no matches, total retrieval time {elapsed:.2f}s, top-k={top_k}, sort={sort_by}, finance_cb={int(restrict_finance)}",
             "No hits yet.",
             [],
             [],
