@@ -1271,7 +1271,7 @@ def recheck_with_large_only(
 ) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
     q = (question or "").strip()
     if not q:
-        return "Enter a query first, then use Re-check with large model only.", [], "Last search: n/a", "No hits yet.", [], []
+        return "Enter a query first, then use the Re-check with big model button.", [], "Last search: n/a", "No hits yet.", [], []
     answer, rows, stats, hit_md, gallery, gallery_paths = answer_question(
         question=q,
         db_path=db_path,
@@ -1283,7 +1283,7 @@ def recheck_with_large_only(
         sort_by=sort_by,
         restrict_finance=restrict_finance,
     )
-    return answer, rows, f"{stats} [double-check: large model only]", hit_md, gallery, gallery_paths
+    return answer, rows, f"{stats} [double-check: big model `{qa_model}` only]", hit_md, gallery, gallery_paths
 
 
 def _extract_row(rows, row_idx: int) -> list[str]:
@@ -1514,6 +1514,7 @@ def build_app(
     top_k: int,
     qa_model: str,
     qa_model_small: str,
+    qa_model_big: str,
     auto_route: bool,
     auto_correct: bool,
     installed_models: list[str],
@@ -1554,7 +1555,7 @@ def build_app(
         gr.Markdown(f"UI version: `{version}`")
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
-                f"Using DB: `{db_path}`  \nLarge model: `{qa_model}`  \nSmall model: `{qa_model_small}`  \nTop-K retrieval: `{top_k}`  \nAuto-route: `{auto_route}`  \nAuto-correct: `{auto_correct}`"
+                f"Using DB: `{db_path}`  \nLaunch model: `{qa_model}`  \nSmall model: `{qa_model_small}`  \nBig model (Re-check button): `{qa_model_big}`  \nTop-K retrieval: `{top_k}`  \nAuto-route: `{auto_route}`  \nAuto-correct: `{auto_correct}`"
             )
             gr.Markdown(
                 "Routing reference: short/factual queries -> small model, broad/ambiguous queries -> large model, "
@@ -1587,7 +1588,7 @@ def build_app(
             with gr.Row():
                 alias_load_btn = gr.Button("Load aliases")
                 alias_save_btn = gr.Button("Save aliases")
-        recheck_btn = gr.Button("Re-check with large model only")
+        recheck_btn = gr.Button(f"Re-check with big model ({qa_model_big})")
         stats = gr.Markdown("Last search: n/a", elem_id="pi-stats")
 
         question = gr.Textbox(
@@ -1734,7 +1735,7 @@ def build_app(
                 q,
                 db_path=db_path,
                 top_k=top_k,
-                qa_model=qa_model,
+                qa_model=qa_model_big,
                 qa_model_small=qa_model_small,
                 sort_by=s,
                 restrict_finance=bool(rf),
@@ -1838,6 +1839,17 @@ def main(argv: list[str] | None = None) -> None:
         default=os.environ.get("PHOTO_INDEX_QA_MODEL_SMALL", "gemma4:latest"),
         help="Smaller/faster model for auto-routing.",
     )
+    p.add_argument(
+        "--qa-model-big",
+        default=os.environ.get(
+            "PHOTO_INDEX_QA_MODEL_BIG",
+            os.environ.get("PHOTO_INDEX_QA_MODEL", "qwen2.5-vl-32b-instruct"),
+        ),
+        help=(
+            "Heaviest model used by the 'Re-check with big model' button, regardless "
+            "of the launch model. LM Studio loads it on demand (JIT)."
+        ),
+    )
     p.add_argument("--top-k", type=int, default=15, help="How many retrieved rows to send to Gemma.")
     p.add_argument("--host", default="127.0.0.1", help="Host to bind (default localhost).")
     p.add_argument("--port", type=int, default=7860, help="Port to bind.")
@@ -1860,6 +1872,7 @@ def main(argv: list[str] | None = None) -> None:
         top_k=args.top_k,
         qa_model=args.qa_model,
         qa_model_small=args.qa_model_small,
+        qa_model_big=args.qa_model_big,
         auto_route=not args.no_auto_route,
         auto_correct=not args.no_auto_correct,
         installed_models=installed_models,

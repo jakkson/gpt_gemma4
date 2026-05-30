@@ -100,7 +100,10 @@ Open `http://127.0.0.1:7860`
     - typo autocorrect fallback
     - synonym expansion
     - Alias Manager UI for editing `data/synonyms.json`
-    - "Re-check with 26b only" button
+    - "Re-check with big model" button — re-runs the current query on
+      `--qa-model-big` (env `PHOTO_INDEX_QA_MODEL_BIG`, default
+      `qwen2.5-vl-32b-instruct`) regardless of the launch model. With LM Studio,
+      enable Just-In-Time model loading so the big model loads on demand.
 
 - `python -m photo_index.nightly`
   - One-pass runner for launchd: incremental **new photos**, **new messages**, then
