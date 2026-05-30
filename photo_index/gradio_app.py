@@ -591,6 +591,12 @@ def _retrieve_rows(
         )
         boost_messages = any(t in ql for t in finance_terms + wants_messages)
         wants_money = any(t in ql for t in finance_terms)
+        wants_visual = any(t in ql for t in _VISUAL_QUERY_TERMS)
+        # Photo-discovery: user asked for photos/images and it isn't a
+        # message/mail or finance lookup. Seed recent photo-library rows
+        # directly (FTS can't find them: "photo"/"recent" are stripped as
+        # boilerplate and Photos rows store captions, not the word "photo").
+        photo_disc = wants_visual and not msg_disc and not wants_money
 
         merged: dict[str, sqlite3.Row] = {}
         candidate_limit = max(top_k * 4, 40)
@@ -668,6 +674,26 @@ def _retrieve_rows(
             for r in seed_rows:
                 merged[r["uuid"]] = r
 
+        # Photo-discovery seeding: pull recent Photos-library / image-file rows
+        # directly by date so visual queries have real photo candidates to rank
+        # (mirrors the message-discovery seed above).
+        if photo_disc:
+            seed_lim = max(candidate_limit, min(300, top_k * 25))
+            photo_seed = conn.execute(
+                """
+                SELECT *, 0 AS rank
+                FROM photo_meta
+                WHERE uuid NOT LIKE 'doc:%'
+                  AND uuid NOT LIKE 'imsg:%'
+                  AND uuid NOT LIKE 'm365:%'
+                ORDER BY date_iso DESC, ingested_at DESC
+                LIMIT ?
+                """,
+                (seed_lim,),
+            ).fetchall()
+            for r in photo_seed:
+                merged[r["uuid"]] = r
+
         if boost_messages or msg_disc:
             src_order = list(dict.fromkeys([*(expand_query_terms(rq)), rq, question]))
             _merge_imessage_like_tokens(conn, merged, src_order, candidate_limit)
@@ -695,8 +721,6 @@ def _retrieve_rows(
             "are", "was", "were", "from", "have", "has", "not", "but", "all",
             "any", "how", "much", "i'm", "i am", "now", "just",
         }
-
-        wants_visual = any(t in ql for t in _VISUAL_QUERY_TERMS)
 
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
             uid = str(r["uuid"] or "")
@@ -774,6 +798,14 @@ def _retrieve_rows(
                 rows = msgs_only[:top_k]
                 if len(rows) < top_k:
                     rows.extend(non_msg[: top_k - len(rows)])
+            elif photo_disc:
+                photos_only = [r for r in rows if _row_is_photo_library_or_image_file(r)]
+                non_photo = [r for r in rows if not _row_is_photo_library_or_image_file(r)]
+                photos_only.sort(key=recency_tuple, reverse=True)
+                non_photo.sort(key=recency_tuple, reverse=True)
+                rows = photos_only[:top_k]
+                if len(rows) < top_k:
+                    rows.extend(non_photo[: top_k - len(rows)])
             else:
                 rows.sort(key=recency_tuple, reverse=True)
         else:
