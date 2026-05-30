@@ -1474,7 +1474,14 @@ def build_app(
                 label="Sort hits by",
                 info="Most Relevant uses entity/keyword scoring. Most Recent ignores ranking and sorts by date.",
             )
-            ask = gr.Button("Search", elem_id="photo-search-btn")
+            with gr.Column(scale=0, min_width=140):
+                ask = gr.Button("Search", elem_id="photo-search-btn")
+                stop_search = gr.Button(
+                    "Stop Search",
+                    elem_id="photo-stop-search-btn",
+                    variant="stop",
+                    size="md",
+                )
         restrict_finance_cb = gr.Checkbox(
             value=True,
             label="Restrict finance answers to bank/credit-card statements",
@@ -1542,8 +1549,9 @@ def build_app(
             ),
             inputs=[question, sort_choice, restrict_finance_cb],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
+            queue=True,
         )
-        question.submit(
+        submit_event = question.submit(
             fn=_maybe_wipe_cache,
             inputs=[always_fresh_cb],
             outputs=[],
@@ -1566,6 +1574,14 @@ def build_app(
             ),
             inputs=[question, sort_choice, restrict_finance_cb],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
+            queue=True,
+        )
+        stop_search.click(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            cancels=[search_event, submit_event],
+            queue=False,
         )
         hits.select(
             fn=preview_selected,
