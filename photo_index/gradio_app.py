@@ -30,9 +30,9 @@ import gradio as gr
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from ollama import chat
 from PIL import Image
 
+from photo_index.llm_client import chat_user_prompt, list_llm_models, llm_backend
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.query_expand import expand_query_terms, reset_synonym_cache
 
@@ -355,11 +355,7 @@ User question: {question}
 
 def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
     try:
-        response = chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return (response.message.content or "").strip(), None
+        return chat_user_prompt(model=model, prompt=prompt), None
     except Exception as e:
         return "", str(e)
 
@@ -424,27 +420,6 @@ def _suggest_query(original: str, db_path: Path) -> str:
         else:
             fixed.append(w)
     return " ".join(fixed) if changed else original
-
-
-def _installed_ollama_models() -> list[str]:
-    try:
-        out = subprocess.run(
-            ["ollama", "list"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except Exception:
-        return []
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if len(lines) <= 1:
-        return []
-    models: list[str] = []
-    for ln in lines[1:]:
-        parts = ln.split()
-        if parts:
-            models.append(parts[0])
-    return models
 
 
 SORT_RELEVANT = "Most Relevant"
@@ -1457,8 +1432,10 @@ def build_app(
                 "and low-confidence small-model responses auto-retry on large model."
             )
             gr.Markdown(
-                f"Installed Ollama models detected: `{installed}`  \n"
-                "Recommended small-model candidates: `gemma4:latest`, `qwen2.5:3b` (if installed)."
+                f"LLM backend: `{llm_backend()}`  \n"
+                f"Models detected on backend: `{installed}`  \n"
+                "Vision ingest still uses Ollama. Answers use PHOTO_INDEX_LLM_BACKEND "
+                "(ollama or openai for LM Studio)."
             )
         with gr.Accordion("Alias Manager (synonyms.json)", open=False):
             canonical = gr.Textbox(
@@ -1709,12 +1686,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--qa-model",
         default=os.environ.get("PHOTO_INDEX_QA_MODEL", "gemma4:26b"),
-        help="Primary/large Ollama model used for answer generation.",
+        help="Primary/large model for answers (Ollama tag or LM Studio model id).",
     )
     p.add_argument(
         "--qa-model-small",
         default=os.environ.get("PHOTO_INDEX_QA_MODEL_SMALL", "gemma4:latest"),
-        help="Smaller/faster Ollama model used by auto-routing.",
+        help="Smaller/faster model for auto-routing.",
     )
     p.add_argument("--top-k", type=int, default=15, help="How many retrieved rows to send to Gemma.")
     p.add_argument("--host", default="127.0.0.1", help="Host to bind (default localhost).")
@@ -1732,7 +1709,7 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     db_path = Path(os.path.abspath(args.db))
-    installed_models = _installed_ollama_models()
+    installed_models = list_llm_models()
     blocks = build_app(
         db_path=db_path,
         top_k=args.top_k,

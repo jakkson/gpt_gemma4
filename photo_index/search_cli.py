@@ -10,8 +10,7 @@ from pathlib import Path
 
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 
-from ollama import chat
-
+from photo_index.llm_client import chat_user_prompt
 from photo_index.query_expand import expand_query_terms, reset_synonym_cache
 from photo_index.store import (
     connect,
@@ -71,11 +70,7 @@ Indexed records:
 User question: {question}
 """
 
-    response = chat(
-        model=qa_model,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    print(response.message.content or "")
+    print(chat_user_prompt(model=qa_model, prompt=prompt))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -91,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--qa-model",
         default=os.environ.get("PHOTO_INDEX_QA_MODEL", "gemma4:26b"),
-        help="Ollama model for answering (default: gemma4:26b or PHOTO_INDEX_QA_MODEL).",
+        help="Answer model (Ollama tag or LM Studio id; PHOTO_INDEX_QA_MODEL).",
     )
     args = p.parse_args(argv)
 

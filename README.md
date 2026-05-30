@@ -13,12 +13,30 @@ Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS
 
 - `pip install -r requirements.txt`
 
-3) Make sure Ollama is running and models are available:
+3) LLM for **answers** (pick one):
+
+**Option A — LM Studio (recommended for faster Q&A):**
+
+- Install [LM Studio](https://lmstudio.ai/), download **Qwen2.5-3B-Instruct** (GGUF).
+- In LM Studio: load the model → **Local Server** tab → Start server (default `http://127.0.0.1:1234`).
+- Set env (add to your shell profile or run before Gradio):
+
+```bash
+export PHOTO_INDEX_LLM_BACKEND=openai
+export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
+export PHOTO_INDEX_QA_MODEL=qwen2.5-3b-instruct
+export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-3b-instruct
+```
+
+Use the exact model id shown in LM Studio’s server UI if the name differs. With one model loaded, any id often works.
+
+**Option B — Ollama only (legacy):**
 
 - `ollama list`
-- Example pulls:
-  - `ollama pull gemma4:26b`
-  - `ollama pull qwen2.5:3b`
+- Example pulls: `ollama pull gemma4:26b`, `ollama pull qwen2.5:3b`
+- Leave `PHOTO_INDEX_LLM_BACKEND` unset (defaults to `ollama`).
+
+**Vision captioning during ingest always uses Ollama** (`gemma4` etc.) unless you change ingest separately. A **VL** model in LM Studio (e.g. Qwen2.5-VL) is not used by this repo yet.
 
 4) macOS privacy permissions (required):
 
@@ -29,8 +47,23 @@ Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS
 
 5) Start Gradio UI:
 
+**With LM Studio (answers):**
+
+```bash
+export PHOTO_INDEX_LLM_BACKEND=openai
+export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
+export PHOTO_INDEX_QA_MODEL=qwen2.5-3b-instruct
+export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-3b-instruct
+python -m photo_index.gradio_app --no-auto-route --top-k 15
+```
+
+(`--no-auto-route` is fine when large and small are the same 3B model.)
+
+**With Ollama (answers):**
+
 - `python -m photo_index.gradio_app --qa-model gemma4:26b --qa-model-small qwen2.5:3b --top-k 15`
-- Open `http://127.0.0.1:7860`
+
+Open `http://127.0.0.1:7860`
 
 ## What Each Python App Does
 

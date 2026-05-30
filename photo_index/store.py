@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -214,6 +215,20 @@ def search_meta_fallback_substring(
     return list(conn.execute(sql, params))
 
 
-def row_to_prompt_block(row: sqlite3.Row) -> str:
+# Per-field character cap for prompt blocks. Document/PDF rows can store an
+# entire file's OCR/VLM text; sending all of it for many rows can blow past the
+# model context window. Long fields are truncated for the prompt only (the full
+# text stays in the DB and FTS index).
+_PROMPT_FIELD_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_PROMPT_FIELD_CHARS", "2000"))
+_PROMPT_LONG_TEXT_FIELDS = ("ocr_text", "vlm_text")
+
+
+def row_to_prompt_block(row: sqlite3.Row, *, field_char_cap: int | None = None) -> str:
+    cap = _PROMPT_FIELD_CHAR_CAP if field_char_cap is None else field_char_cap
     d = {k: row[k] for k in row.keys() if k != "rank"}
+    if cap and cap > 0:
+        for f in _PROMPT_LONG_TEXT_FIELDS:
+            v = d.get(f)
+            if isinstance(v, str) and len(v) > cap:
+                d[f] = v[:cap] + f"\n…[truncated {len(v) - cap} chars for prompt]"
     return json.dumps(d, ensure_ascii=False, indent=2)
