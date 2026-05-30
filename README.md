@@ -47,17 +47,27 @@ Use the exact model id shown in LM Studio’s server UI if the name differs. Wit
 
 5) Start Gradio UI:
 
-**With LM Studio (answers):**
+**Quickest (LM Studio):** start LM Studio's Developer-tab server, then:
+
+```bash
+./start_search.sh          # fast 3B for everything
+./start_search.sh --big    # 3B default, escalate to 32B on broad queries
+```
+
+Override model ids with env vars if your LM Studio shows different names
+(e.g. `PHOTO_INDEX_QA_MODEL`, `PHOTO_INDEX_QA_MODEL_SMALL`).
+
+**Manual equivalent:**
 
 ```bash
 export PHOTO_INDEX_LLM_BACKEND=openai
 export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
-export PHOTO_INDEX_QA_MODEL=qwen2.5-3b-instruct
-export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-3b-instruct
+export PHOTO_INDEX_QA_MODEL=qwen2.5-vl-3b-instruct
+export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-vl-3b-instruct
 python -m photo_index.gradio_app --no-auto-route --top-k 15
 ```
 
-(`--no-auto-route` is fine when large and small are the same 3B model.)
+(`--no-auto-route` is fine when large and small are the same model.)
 
 **With Ollama (answers):**
 
