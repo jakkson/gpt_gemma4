@@ -55,7 +55,7 @@ EOF
 launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
 launchctl load "$PLIST_PATH"
 
-echo "Installed nightly 2:00 AM job:"
+echo "Installed nightly 2:00 AM photo + messages ingest job:"
 echo "  $PLIST_PATH"
 echo "Logs:"
 echo "  $OUT_LOG"
