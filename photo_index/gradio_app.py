@@ -1142,7 +1142,7 @@ def recheck_with_large_only(
 ) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
     q = (question or "").strip()
     if not q:
-        return "Enter a query first, then use Re-check with 26b only.", [], "Last search: n/a", "No hits yet.", [], []
+        return "Enter a query first, then use Re-check with large model only.", [], "Last search: n/a", "No hits yet.", [], []
     answer, rows, stats, hit_md, gallery, gallery_paths = answer_question(
         question=q,
         db_path=db_path,
@@ -1421,7 +1421,7 @@ def build_app(
     button.pi-open-local-file:hover { color: #1d4ed8; }
     """
     with gr.Blocks(title="Personal Index Search", css=custom_css) as demo:
-        gr.Markdown("## Personal Index Search (Gemma + SQLite FTS)")
+        gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
@@ -1458,7 +1458,7 @@ def build_app(
             with gr.Row():
                 alias_load_btn = gr.Button("Load aliases")
                 alias_save_btn = gr.Button("Save aliases")
-        recheck_btn = gr.Button("Re-check with 26b only")
+        recheck_btn = gr.Button("Re-check with large model only")
         stats = gr.Markdown("Last search: n/a", elem_id="pi-stats")
 
         question = gr.Textbox(
