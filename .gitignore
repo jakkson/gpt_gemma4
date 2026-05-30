@@ -8,3 +8,7 @@ data/
 
 # macOS Finder metadata
 .DS_Store
+
+# Compiled Swift OCR helper (architecture-specific binary; rebuild from
+# photo_index/_vision_ocr_swift.swift via `swiftc -O -parse-as-library …`)
+photo_index/_vision_ocr_swift

@@ -130,7 +130,13 @@ NOISE_DIR_NAMES = frozenset({
     "vendor",
 })
 
-NOISE_DIR_SUFFIXES = (".egg-info", ".dist-info")
+# Suffix-matched noise:
+#   .egg-info, .dist-info: Python package metadata
+#   .dcmd: Carbon Copy Cloner backup bundles (whole-Mac clones — not user
+#          documents; one such bundle in this user's tree had >1.2M cached
+#          icons inside it, which is the kind of pollution we never want
+#          fed into FTS or VLM).
+NOISE_DIR_SUFFIXES = (".egg-info", ".dist-info", ".dcmd")
 
 
 def is_noise_path(rel_parts: tuple[str, ...]) -> bool:
