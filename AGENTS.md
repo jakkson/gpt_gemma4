@@ -25,6 +25,10 @@ indexed into SQLite/FTS, searched via a Gradio UI and CLI. Python in `photo_inde
     `PHOTO_INDEX_QA_MODEL`, `PHOTO_INDEX_QA_MODEL_SMALL`.
 - **Vision captioning during ingest** (`ingest.py`, `documents_vlm_ingest.py`,
   `osxphotos_script.py`) still uses **Ollama** directly. Do not assume LM Studio handles images.
+- **Nightly** (`nightly.py`): photos → messages → documents text → documents OCR/VLM
+  (PDF/PNG/JPG). `--skip-documents-vlm` to skip the heavy pass; needs Ollama running.
+- **Nightly wake** (`nightly_wake.py` + root LaunchDaemon from `install_photo_nightly_launchd.sh`):
+  schedules `pmset wake` at 1:55 AM; ingest wrapper uses `caffeinate -s`.
 
 ## Conventions
 - Don't add narration comments; explain only non-obvious intent.

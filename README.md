@@ -103,8 +103,20 @@ Open `http://127.0.0.1:7860`
     - "Re-check with 26b only" button
 
 - `python -m photo_index.nightly`
-  - One-pass runner for launchd: incremental **new photos** then **new messages**
-    (skips already-indexed UUIDs unless child ingests are run with `--force`).
+  - One-pass runner for launchd: incremental **new photos**, **new messages**, then
+    **new/changed documents** under `~/Dropbox/Documents` (text extract, then Apple
+    Vision OCR + Ollama VLM on PDF/PNG/JPG). Skips unchanged files by mtime+size; no
+    `--force`. Requires **Ollama** for photo and document VLM. Opt out of heavy OCR:
+    `--skip-documents-vlm`.
+
+- `python -m photo_index.documents_ingest`
+  - Index PDF / Office / text files under a folder (default: `~/Dropbox/Documents`).
+  - Skips unchanged files already in the DB (same path + mtime + size). Use `--force`
+    to re-read everything.
+
+- `python -m photo_index.documents_vlm_ingest`
+  - Apple Vision OCR + Ollama VLM for **images and PDFs** in a folder (slow). Nightly
+    runs this after `documents_ingest` unless `--skip-documents-vlm`.
 
 - `python osxphotos_script.py`
   - Small demo script (first 10 photos) for quick vision checks.
@@ -128,6 +140,17 @@ Open `http://127.0.0.1:7860`
 - Run Messages ingest now:
   - `python -m photo_index.messages_ingest`
 
+- Run Documents ingest now (incremental — new/changed files only):
+  - `./update_documents.sh` (text only)
+  - `./update_documents.sh --ocr-vlm` (text + OCR/VLM on PDF/PNG/JPG; matches nightly)
+  - Or: `python -m photo_index.documents_ingest`
+  - Override folder: `python -m photo_index.documents_ingest --root ~/Dropbox/Documents`
+
+- Run all incremental ingests (photos + messages + documents + document OCR/VLM):
+  - `python -m photo_index.nightly`
+  - Documents only: `python -m photo_index.nightly --skip-photos --skip-messages`
+  - Documents text only (no OCR/VLM): add `--skip-documents-vlm`
+
 - Run Outlook / Microsoft 365 mail ingest (Microsoft Graph, delegated **Mail.Read**):
   - Register an app in Entra ID, add redirect `http://localhost`, grant Graph delegated **Mail.Read** (and **offline_access**).
   - Or run **`./scripts/register_entra_personal_photo_index_mail.sh`** after **`az login --allow-no-subscriptions`** (no Azure subscription needed) or **`az login`**, to create **`personal-photo-index-mail`** automatically.
@@ -136,8 +159,14 @@ Open `http://127.0.0.1:7860`
   - First run opens a browser to sign in; later runs use `data/graph_mail_token_cache.json`. Incremental sync uses `data/graph_mail_delta.json`.
   - **Azure CLI login crashes** (no Azure subscription; error in **Tenant and subscription selection** such as `'NoneType' object has no attribute 'get'`): run **`brew upgrade azure-cli`**, then **`az login --allow-no-subscriptions --tenant YOUR_TENANT_ID`** (copy **Tenant ID** from **Microsoft Entra admin center → Overview**). Or **`az login --use-device-code --allow-no-subscriptions --tenant YOUR_TENANT_ID`**. If CLI keeps failing, create the app only in the portal (**App registrations → New registration**, name **`personal-photo-index-mail`**, **Mobile and desktop** redirect **`http://localhost`**, API permissions **Mail.Read** + **offline_access**, **Grant admin consent**), then **`export GRAPH_CLIENT_ID='…'`** from **Application (client) ID**.
 
-- Install nightly 2:00 AM photo + messages ingest (launchd):
+- Install nightly 2:00 AM photo + messages + documents ingest (text + OCR/VLM; launchd):
   - `./install_photo_nightly_launchd.sh`
+  - Also installs a **wake scheduler** (root LaunchDaemon): wakes the Mac at **1:55 AM**
+    daily so ingest starts at 2:00 AM. Requires your admin password once.
+  - Check wake status: `.venv/bin/python -m photo_index.nightly_wake status`
+  - Uninstall: `./uninstall_photo_nightly_launchd.sh`
+  - **Laptop:** plug in overnight; closed lid on battery may block wake. **Desktop:** leave
+    “Prevent computer from sleeping” or rely on the scheduled wake + `caffeinate` during ingest.
 
 ## Concurrency Safety
 
