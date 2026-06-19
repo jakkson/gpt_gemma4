@@ -1707,6 +1707,58 @@ def remove_alias_entry(raw_json: str, canonical: str) -> tuple[str, str]:
     return new_text, f"Removed alias entry `{key}`. Click Save aliases to persist."
 
 
+# Ad-hoc document analysis (upload box), independent of the indexed corpus.
+_UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "32000"))
+
+
+def analyze_uploaded_file(file_path: str | None, question: str, qa_model: str) -> str:
+    """Extract text from an uploaded document and answer/summarize it with the LLM.
+
+    Separate from index search: this works only on the one uploaded file, not the
+    SQLite corpus. Text documents only (the answer model has no vision/OCR).
+    """
+    if not file_path:
+        return "Drop or browse a document first (PDF, Word, PowerPoint, Excel, text…)."
+    from photo_index.documents_ingest import extract_auto
+
+    path = Path(file_path)
+    ext = path.suffix.lower()
+    try:
+        text, method, err = extract_auto(path, ext)
+    except Exception as e:  # noqa: BLE001
+        return f"Could not read **{path.name}**: {e}"
+    if err or not text or not text.strip():
+        return (
+            f"No extractable text in **{path.name}** ({err or 'empty'}). "
+            "Scanned / image-only PDFs need OCR, which this text model can't do."
+        )
+    text = text.strip()
+    truncated = len(text) > _UPLOAD_TEXT_CHAR_CAP
+    if truncated:
+        text = text[:_UPLOAD_TEXT_CHAR_CAP]
+    task = (question or "").strip() or "Summarize this document concisely, capturing the key points."
+    prompt = f"""You are analyzing a single document the user uploaded.
+Use ONLY the document text below. Do not use outside knowledge.
+
+Document: {path.name}
+
+--- DOCUMENT START ---
+{text}
+--- DOCUMENT END ---
+
+Task: {task}
+"""
+    answer, chat_err = _safe_chat(model=qa_model, prompt=prompt)
+    if chat_err:
+        return f"Model error analyzing **{path.name}**: {chat_err}"
+    note = (
+        f"\n\n*(Document truncated to {_UPLOAD_TEXT_CHAR_CAP:,} chars to fit the model context.)*"
+        if truncated
+        else ""
+    )
+    return f"**{path.name}** · extracted via `{method}`\n\n{answer}{note}"
+
+
 def build_app(
     *,
     db_path: Path,
@@ -1751,6 +1803,24 @@ def build_app(
     with gr.Blocks(title="Personal Index Search", css=custom_css) as demo:
         gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
+        with gr.Accordion("📄 Summarize / query an uploaded document", open=False):
+            gr.Markdown(
+                "Drop a file (PDF, Word, PowerPoint, Excel, text) to summarize or ask "
+                "about it directly — this is separate from your index. Text documents "
+                "only (no scanned/image OCR)."
+            )
+            upload_file = gr.File(
+                label="Drop a document here or browse",
+                file_types=[".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".rtf", ".csv"],
+                type="filepath",
+            )
+            upload_question = gr.Textbox(
+                label="What should I do with it?",
+                placeholder="Leave blank to summarize, or ask e.g. 'What are the payment terms?'",
+                lines=2,
+            )
+            upload_btn = gr.Button("Analyze document", variant="primary")
+            upload_answer = gr.Markdown("No document analyzed yet.", elem_id="pi-answer", sanitize_html=False)
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
                 f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`"
@@ -1920,6 +1990,12 @@ def build_app(
         reveal_btn.click(fn=reveal_in_finder, inputs=[selected_path], outputs=[preview_note])
         open_messages_btn.click(fn=open_messages_app, outputs=[preview_note])
         clear_cache_btn.click(fn=clear_search_cache, outputs=[stats])
+        upload_btn.click(
+            fn=lambda f, q: analyze_uploaded_file(f, q, qa_model),
+            inputs=[upload_file, upload_question],
+            outputs=[upload_answer],
+            queue=True,
+        )
         hit_gallery.select(
             fn=on_gallery_select,
             inputs=[hit_gallery_paths],
