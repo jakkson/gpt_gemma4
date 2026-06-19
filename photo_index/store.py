@@ -81,6 +81,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_meta)")}
     if "open_url" not in cols:
         conn.execute("ALTER TABLE photo_meta ADD COLUMN open_url TEXT NOT NULL DEFAULT ''")
+    if "embedding" not in cols:
+        # float32 vector as raw bytes; NULL until the embed backfill runs.
+        conn.execute("ALTER TABLE photo_meta ADD COLUMN embedding BLOB")
     conn.commit()
 
 
@@ -223,12 +226,79 @@ _PROMPT_FIELD_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_PROMPT_FIELD_CHARS", "2
 _PROMPT_LONG_TEXT_FIELDS = ("ocr_text", "vlm_text")
 
 
+_PROMPT_SKIP_FIELDS = ("rank", "embedding", "score")
+
+
 def row_to_prompt_block(row: sqlite3.Row, *, field_char_cap: int | None = None) -> str:
     cap = _PROMPT_FIELD_CHAR_CAP if field_char_cap is None else field_char_cap
-    d = {k: row[k] for k in row.keys() if k != "rank"}
+    d = {k: row[k] for k in row.keys() if k not in _PROMPT_SKIP_FIELDS}
     if cap and cap > 0:
         for f in _PROMPT_LONG_TEXT_FIELDS:
             v = d.get(f)
             if isinstance(v, str) and len(v) > cap:
                 d[f] = v[:cap] + f"\n…[truncated {len(v) - cap} chars for prompt]"
     return json.dumps(d, ensure_ascii=False, indent=2)
+
+
+# --- Semantic search (embeddings) ---------------------------------------------
+
+def row_embed_text(row: sqlite3.Row) -> str:
+    """The text used to represent a row for embedding (filename + OCR + caption)."""
+    parts = [
+        str(row["filename"] or ""),
+        str(row["ocr_text"] or ""),
+        str(row["vlm_text"] or ""),
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def store_embedding(conn: sqlite3.Connection, uuid: str, vec: "list[float]", *, commit: bool = True) -> None:
+    import numpy as np
+
+    blob = np.asarray(vec, dtype=np.float32).tobytes()
+    conn.execute("UPDATE photo_meta SET embedding = ? WHERE uuid = ?", (blob, uuid))
+    if commit:
+        conn.commit()
+
+
+def count_rows_needing_embedding(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM photo_meta WHERE embedding IS NULL"
+    ).fetchone()[0]
+
+
+def iter_rows_needing_embedding(conn: sqlite3.Connection, batch: int = 256):
+    """Yield batches of (uuid, embed_text) for rows lacking an embedding."""
+    cur = conn.execute(
+        "SELECT uuid, filename, ocr_text, vlm_text FROM photo_meta WHERE embedding IS NULL"
+    )
+    while True:
+        rows = cur.fetchmany(batch)
+        if not rows:
+            break
+        yield [(r["uuid"], row_embed_text(r)) for r in rows]
+
+
+def load_embedding_matrix(conn: sqlite3.Connection):
+    """Return (uuids: list[str], matrix: np.ndarray L2-normalized float32 [N, D]).
+
+    Rows without an embedding are skipped. Returns ([], None) if none exist.
+    """
+    import numpy as np
+
+    uuids: list[str] = []
+    vecs: list[np.ndarray] = []
+    for uuid, blob in conn.execute(
+        "SELECT uuid, embedding FROM photo_meta WHERE embedding IS NOT NULL"
+    ):
+        if not blob:
+            continue
+        uuids.append(uuid)
+        vecs.append(np.frombuffer(blob, dtype=np.float32))
+    if not vecs:
+        return [], None
+    mat = np.vstack(vecs).astype(np.float32)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat = mat / norms
+    return uuids, mat

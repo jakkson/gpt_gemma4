@@ -32,13 +32,21 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
-from photo_index.llm_client import chat_user_prompt, list_llm_models, llm_backend
+from photo_index.llm_client import (
+    chat_user_prompt,
+    embed_query,
+    inference_opts_for_model,
+    is_big_qa_model,
+    list_llm_models,
+    llm_backend,
+)
 from photo_index.ollama_image import image_path_for_ollama
 from photo_index.query_expand import expand_query_terms, reset_synonym_cache
 
 from photo_index.store import (
     connect,
     init_schema,
+    load_embedding_matrix,
     row_to_prompt_block,
     search_meta,
     search_meta_fallback_substring,
@@ -50,6 +58,13 @@ _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.jso
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
+# In-process cache of the embedding matrix (loaded from SQLite). Reloaded on a TTL
+# so a running backfill / new ingest is picked up without restarting the server.
+_EMB_CACHE: dict[str, Any] = {"uuids": None, "mat": None, "loaded_at": 0.0}
+_EMB_CACHE_TTL = float(os.environ.get("PHOTO_INDEX_EMB_CACHE_TTL", "180"))
+_SEMANTIC_ENABLED = os.environ.get("PHOTO_INDEX_SEMANTIC", "1").strip().lower() not in ("0", "false", "no")
+# Weight applied to cosine similarity (~0.3-0.8) when blending into the rank score.
+_SEMANTIC_WEIGHT = float(os.environ.get("PHOTO_INDEX_SEMANTIC_WEIGHT", "25"))
 _PAGE_LOAD_JS = """
 () => {
   if (!window.__photoSearchEnterBound) {
@@ -157,9 +172,27 @@ _LOCAL_INDEX_POLICY = """LOCAL PRIVATE INDEX (READ FIRST)
 """
 
 
-def _build_prompt(question: str, rows: list[sqlite3.Row], *, aggregate: bool = False) -> str:
-    blocks = [row_to_prompt_block(r) for r in rows]
+def _build_prompt(
+    question: str,
+    rows: list[sqlite3.Row],
+    *,
+    aggregate: bool = False,
+    scope_month: tuple[int, int] | None = None,
+    field_char_cap: int | None = None,
+) -> str:
+    blocks = [row_to_prompt_block(r, field_char_cap=field_char_cap) for r in rows]
     context = "\n\n---\n\n".join(blocks)
+    month_scope = ""
+    if scope_month:
+        label = _month_label(scope_month)
+        month_scope = f"""
+DATE SCOPE (critical — read before answering)
+- The user asked specifically about **{label}**.
+- Include ONLY records whose date falls in that calendar month ({label}).
+- If none of the records below are dated {label}, reply: "No charges or payments
+  dated {label} are in your indexed data yet." Do NOT list or summarize
+  transactions from any other month or year.
+"""
     if aggregate:
         return f"""You are answering questions about a single user's personal on-device index
 (their own photos, OCR, VLM captions, and SMS/iMessage text).
@@ -169,7 +202,7 @@ GROUND RULES
 - Use ONLY the indexed records below. Do NOT use outside / general knowledge.
 - Quote exact dollar amounts and dates from the records when relevant.
 - Cite each record you use inline by its filename or imsg uuid.
-
+{month_scope}
 REASONING ALLOWED (this is an aggregate / "how much per month" question)
 1. Scan the records and list EVERY recurring/subscription/monthly charge you can find:
    merchant, amount, date, and the imsg uuid of the message.
@@ -205,7 +238,7 @@ STRICT RULES
 - You MAY add up, count, or compare amounts that are visible in the records.
 - Prefer the most recent matching record when the user asks about "latest",
   "currently", or "right now".
-
+{month_scope}
 REFUSAL
 - Only say "I don't see that in your indexed data yet." if there are NO
   records at all that touch the topic. If there are partial matches, list what
@@ -250,6 +283,14 @@ def _is_short_factual_query(question: str) -> bool:
     return q.startswith(factual_starts)
 
 
+def _query_contains_term(q: str, term: str) -> bool:
+    """Match multi-word phrases as substrings; single words use word boundaries
+    so e.g. ``sum`` does not match ``summary``."""
+    if " " in term:
+        return term in q
+    return bool(re.search(rf"\b{re.escape(term)}\b", q))
+
+
 def _is_aggregate_finance_query(question: str) -> bool:
     """True for questions that need synthesis across many finance records,
     e.g. "how much am I paying in subscriptions per month?"."""
@@ -265,8 +306,11 @@ def _is_aggregate_finance_query(question: str) -> bool:
     aggregate = (
         "how much", "how many", "total", "sum", "altogether", "combined",
         "across", "average", "list all", "all my", "all of my", "everything",
+        "summary of all", "all charges", "all payments", "tally",
     )
-    return any(t in q for t in finance) and any(t in q for t in aggregate)
+    return any(_query_contains_term(q, t) for t in finance) and any(
+        _query_contains_term(q, t) for t in aggregate
+    )
 
 
 def _is_broad_or_ambiguous_query(question: str) -> bool:
@@ -353,9 +397,25 @@ User question: {question}
 """
 
 
+def _prompt_field_cap_for_model(model: str) -> int | None:
+    if is_big_qa_model(model):
+        return int(os.environ.get("PHOTO_INDEX_PROMPT_FIELD_CHARS_BIG", "900"))
+    return None
+
+
 def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
+    opts = inference_opts_for_model(model)
     try:
-        return chat_user_prompt(model=model, prompt=prompt), None
+        return (
+            chat_user_prompt(
+                model=model,
+                prompt=prompt,
+                timeout=float(opts["timeout"]),
+                max_tokens=int(opts["max_tokens"]),
+                stream=bool(opts["stream"]),
+            ),
+            None,
+        )
     except Exception as e:
         return "", str(e)
 
@@ -439,7 +499,8 @@ _TRANSACTION_WORDS = (
 )
 _CURRENCY_RE = re.compile(r"\$\s?\d|\d+\.\d{2}")
 _FINANCE_TRIGGER_TERMS = (
-    "price", "charge", "charged", "payment", "bill", "billing", "fee",
+    "price", "charge", "charged", "charges", "payment", "payments",
+    "bill", "billing", "bills", "fee", "fees",
     "subscription", "subscriptions", "cost", "pay", "paying", "paid",
     "amount", "money", "spend", "spending", "owe", "due", "rate",
     "monthly", "per month", "annual", "yearly",
@@ -459,7 +520,20 @@ def _is_bank_source(text: str) -> bool:
 
 def _is_finance_query(question: str) -> bool:
     q = " ".join((question or "").strip().lower().split())
-    return bool(q) and any(t in q for t in _FINANCE_TRIGGER_TERMS)
+    return bool(q) and any(_query_contains_term(q, t) for t in _FINANCE_TRIGGER_TERMS)
+
+
+def _is_finance_hit_row(r: sqlite3.Row, *, restrict_finance: bool) -> bool:
+    """Whether a row belongs in a finance/charge/payment query result set."""
+    if restrict_finance:
+        return _is_transaction_row(r)
+    uid = str(r["uuid"] or "")
+    blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
+    if uid.startswith(("imsg:", "m365:")):
+        return _is_transaction_text(blob)
+    # Documents/photos stay strict even when the checkbox is off — a colonoscopy
+    # prep PDF or ticket image is not a charge.
+    return _is_transaction_row(r)
 
 
 # Real money amount: must carry a '$' sign (or explicit USD). A bare "3.14" or
@@ -562,6 +636,42 @@ def _query_month_year(question: str) -> tuple[int, int] | None:
     return None
 
 
+_MONTH_NAMES = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _month_label(year_month: tuple[int, int]) -> str:
+    year, month = year_month
+    return f"{_MONTH_NAMES[month]} {year}"
+
+
+def _finance_empty_message(question: str, *, restrict_finance: bool) -> str:
+    scoped_my = _query_month_year(question)
+    if scoped_my:
+        label = _month_label(scoped_my)
+        if restrict_finance:
+            return (
+                f"No bank or credit-card charges/payments dated {label} are in your "
+                f"index. (Finance filter is ON — only transaction records count.) "
+                f"Try another month or run a fresh messages ingest if you expect a "
+                f"charge that isn't indexed yet."
+            )
+        return (
+            f"No charges or payments dated {label} are in your index. "
+            f"Try another month or run a fresh messages ingest if you expect "
+            f"records that aren't indexed yet."
+        )
+    if restrict_finance:
+        return (
+            "No bank or credit-card transaction records matched. The finance filter is "
+            "ON, so casual mentions and documents are excluded — turn it off to "
+            "search more broadly, or run a fresh messages ingest."
+        )
+    return "No matches in index yet. Keep ingest running, then try again."
+
+
 # Words stripped before FTS / substring retrieval. Natural questions like
 # "find photos of Paris" built an FTS AND over find + photos + Paris; captions
 # rarely contain the word "photos", so every real Paris hit was dropped.
@@ -659,6 +769,54 @@ def _merge_imessage_like_tokens(
             ).fetchall()
             for r in msg_hits:
                 merged[r["uuid"]] = r
+
+
+def _get_embedding_matrix(conn: sqlite3.Connection):
+    """Return cached (uuids, normalized matrix), reloading on a TTL. (None, None) if empty."""
+    now = time.time()
+    if (
+        _EMB_CACHE["mat"] is not None
+        and (now - _EMB_CACHE["loaded_at"]) < _EMB_CACHE_TTL
+    ):
+        return _EMB_CACHE["uuids"], _EMB_CACHE["mat"]
+    try:
+        uuids, mat = load_embedding_matrix(conn)
+    except Exception:
+        uuids, mat = [], None
+    _EMB_CACHE["uuids"] = uuids
+    _EMB_CACHE["mat"] = mat
+    _EMB_CACHE["loaded_at"] = now
+    return uuids, mat
+
+
+def _semantic_scores(conn: sqlite3.Connection, question: str, k: int) -> dict[str, float]:
+    """Cosine-similarity scores for the top-``k`` rows nearest the query embedding.
+
+    Returns {} when semantic search is disabled, no embeddings exist yet, or the
+    embedder is unreachable — callers then fall back to keyword retrieval only.
+    """
+    if not _SEMANTIC_ENABLED or k <= 0:
+        return {}
+    uuids, mat = _get_embedding_matrix(conn)
+    if mat is None or not uuids:
+        return {}
+    try:
+        import numpy as np
+
+        qv = embed_query(question)
+        if not qv:
+            return {}
+        q = np.asarray(qv, dtype=np.float32)
+        n = np.linalg.norm(q)
+        if n == 0:
+            return {}
+        q = q / n
+        sims = mat @ q  # matrix is pre-normalized → cosine similarity
+        k = min(k, sims.shape[0])
+        top_idx = np.argpartition(-sims, k - 1)[:k]
+        return {uuids[i]: float(sims[i]) for i in top_idx}
+    except Exception:
+        return {}
 
 
 def _retrieve_rows(
@@ -798,25 +956,36 @@ def _retrieve_rows(
             src_order = list(dict.fromkeys([*(expand_query_terms(rq)), rq, question]))
             _merge_imessage_like_tokens(conn, merged, src_order, candidate_limit)
 
+        # Semantic (embedding) candidates: meaning-based matches keyword FTS misses
+        # (e.g. "Paris" finding a caption that only says "Eiffel Tower"). Uses the
+        # full question for richer embedding. Empty {} if embeddings/embedder absent.
+        sem_scores = _semantic_scores(conn, question, max(top_k * 4, 40))
+        missing = [u for u in sem_scores if u not in merged]
+        for i in range(0, len(missing), 400):
+            chunk = missing[i : i + 400]
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                f"SELECT *, 0 AS rank FROM photo_meta WHERE uuid IN ({ph})", chunk
+            ):
+                merged[r["uuid"]] = r
+
         rows = list(merged.values())
 
-        # Restrict finance/subscription queries to authoritative charge/payment
-        # rows (bank alerts, merchant receipts) and exclude casual chat and
-        # unrelated documents. When the question names a month/year, hard-scope to
-        # it so out-of-range charges (e.g. February for a May query) don't leak in.
         query_my = _query_month_year(question)
         query_month_prefix = f"{query_my[0]:04d}-{query_my[1]:02d}" if query_my else None
-        if restrict_finance and _is_finance_query(question):
-            finance_rows = [r for r in rows if _is_transaction_row(r)]
+        is_fin = _is_finance_query(question)
+
+        # Finance restrict checkbox: filter to transaction/bank rows only.
+        # Explicit month/year in the question ALWAYS hard-scopes results, even
+        # when the checkbox is off — otherwise "May 2026" queries leak Jan/Feb.
+        if is_fin:
+            rows = [r for r in rows if _is_finance_hit_row(r, restrict_finance=restrict_finance)]
             if query_month_prefix:
-                # Scope strictly to the asked-for month; empty is a valid answer
-                # (better than showing out-of-scope or non-financial rows).
                 rows = [
-                    r for r in finance_rows
+                    r for r in rows
                     if str(r["date_iso"] or "").startswith(query_month_prefix)
                 ]
-            elif finance_rows:
-                rows = finance_rows
+
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
 
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
@@ -840,6 +1009,11 @@ def _retrieve_rows(
                 t in text for t in ("price", "chrge", "charge", "payment", "fee", "bill", "$")
             )
             is_billing_alert = is_imsg and _is_bank_source(text)
+            if query_month_prefix and is_fin:
+                if str(r["date_iso"] or "").startswith(query_month_prefix):
+                    entity_bonus += 25.0
+                else:
+                    entity_bonus -= 60.0
             if wants_visual and _row_is_photo_library_or_image_file(r):
                 entity_bonus += 14.0
             # Down-rank generic documents when the user clearly asked for photos.
@@ -865,6 +1039,8 @@ def _retrieve_rows(
                     entity_bonus += 14.0
                 elif uid.startswith("doc:"):
                     entity_bonus -= 12.0
+            # Semantic similarity: strong signal for meaning-based relevance.
+            entity_bonus += sem_scores.get(uid, 0.0) * _SEMANTIC_WEIGHT
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
             # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
@@ -920,7 +1096,7 @@ def _retrieve_rows(
                 # date-sorted (and within the asked-for month, if any), so a tally
                 # doesn't get buried by an unrelated recent document. When a month
                 # was named, the restrict block already scoped rows to it.
-                fin = [r for r in rows if _is_transaction_row(r)]
+                fin = [r for r in rows if _is_finance_hit_row(r, restrict_finance=restrict_finance)]
                 fin_ids = {str(r["uuid"]) for r in fin}
                 other = [r for r in rows if str(r["uuid"]) not in fin_ids]
                 fin.sort(key=month_recency_key, reverse=True)
@@ -931,9 +1107,13 @@ def _retrieve_rows(
             else:
                 # Keep rows that actually match the query ahead of unrelated recent
                 # rows, so a recent-but-irrelevant document can't top the list.
-                matched = [r for r in rows if _query_token_overlap(
-                    f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}", ql
-                ) > 0]
+                # A strong semantic match counts as "matched" even with no keyword overlap.
+                matched = [r for r in rows if (
+                    _query_token_overlap(
+                        f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}", ql
+                    ) > 0
+                    or sem_scores.get(str(r["uuid"]), 0.0) >= 0.5
+                )]
                 matched_ids = {str(r["uuid"]) for r in matched}
                 unmatched = [r for r in rows if str(r["uuid"]) not in matched_ids]
                 matched.sort(key=month_recency_key, reverse=True)
@@ -1174,8 +1354,10 @@ def answer_question(
             return answer, rows, stats, hit_md, gallery, gallery_paths
 
     aggregate_mode = _is_aggregate_finance_query(q)
-    # Aggregate questions need to see ALL recurring charges, not just top_k=15.
-    effective_top_k = max(top_k, 40) if aggregate_mode else top_k
+    scoped_my = _query_month_year(q)
+    # Broad aggregate pulls need more rows; month-scoped queries stay at top_k
+    # (often zero hits — skip sending 40 rows to a slow 32B model).
+    effective_top_k = max(top_k, 40) if aggregate_mode and not scoped_my else top_k
 
     rows = _retrieve_rows(
         db_path=db_path, question=q, top_k=effective_top_k,
@@ -1199,24 +1381,8 @@ def answer_question(
                 )
     if not rows:
         elapsed = time.perf_counter() - t0
-        scoped_my = _query_month_year(q)
-        if restrict_finance and _is_finance_query(q) and scoped_my:
-            month_name = (
-                f"{('', 'January','February','March','April','May','June','July','August','September','October','November','December')[scoped_my[1]]} {scoped_my[0]}"
-            )
-            no_match_msg = (
-                f"No bank or credit-card charges/payments dated {month_name} are in your "
-                f"index. (The finance filter is ON, so only transaction records count — "
-                f"casual mentions and documents are excluded.) Try another month, turn off "
-                f"\u201cRestrict finance answers to bank/credit-card statements\u201d, or run a "
-                f"fresh messages ingest if you expect a charge that isn't indexed yet."
-            )
-        elif restrict_finance and _is_finance_query(q):
-            no_match_msg = (
-                "No bank or credit-card transaction records matched. The finance filter is "
-                "ON, so casual mentions and documents are excluded \u2014 turn it off to "
-                "search more broadly, or run a fresh messages ingest."
-            )
+        if _is_finance_query(q):
+            no_match_msg = _finance_empty_message(q, restrict_finance=restrict_finance)
         else:
             no_match_msg = "No matches in index yet. Keep ingest running, then try again."
         return (
@@ -1228,7 +1394,6 @@ def answer_question(
             [],
         )
 
-    prompt = _build_prompt(effective_query, rows, aggregate=aggregate_mode)
     route = "direct"
     first_model = qa_model
     if aggregate_mode:
@@ -1242,12 +1407,16 @@ def answer_question(
             first_model = qa_model
             route = "large_first_broad"
         else:
-            # Default to the LARGE model. The small Gemma was prone to topical
-            # drift on mixed-context retrieval (e.g. answering a Valkyries query
-            # as if it were about Vegas because the index also contained heavy
-            # WNBA / Aces transcripts). Better slow + correct than fast + wrong.
             first_model = qa_model
             route = "large_default"
+
+    prompt = _build_prompt(
+        effective_query,
+        rows,
+        aggregate=aggregate_mode,
+        scope_month=scoped_my,
+        field_char_cap=_prompt_field_cap_for_model(first_model),
+    )
 
     answer, err = _safe_chat(model=first_model, prompt=prompt)
     used_model = first_model
@@ -1314,32 +1483,6 @@ def answer_question(
     hit_md = _rows_to_hit_summary(preview_rows)
     gallery, gallery_paths = _rows_to_gallery(preview_rows)
     return answer, preview_rows, stats, hit_md, gallery, gallery_paths
-
-
-def recheck_with_large_only(
-    question: str,
-    db_path: Path,
-    top_k: int,
-    qa_model: str,
-    qa_model_small: str,
-    sort_by: str = SORT_RELEVANT,
-    restrict_finance: bool = True,
-) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
-    q = (question or "").strip()
-    if not q:
-        return "Enter a query first, then use the Re-check with big model button.", [], "Last search: n/a", "No hits yet.", [], []
-    answer, rows, stats, hit_md, gallery, gallery_paths = answer_question(
-        question=q,
-        db_path=db_path,
-        top_k=top_k,
-        qa_model=qa_model,
-        qa_model_small=qa_model_small,
-        auto_route=False,
-        auto_correct=False,
-        sort_by=sort_by,
-        restrict_finance=restrict_finance,
-    )
-    return answer, rows, f"{stats} [double-check: big model `{qa_model}` only]", hit_md, gallery, gallery_paths
 
 
 def _extract_row(rows, row_idx: int) -> list[str]:
@@ -1570,7 +1713,6 @@ def build_app(
     top_k: int,
     qa_model: str,
     qa_model_small: str,
-    qa_model_big: str,
     auto_route: bool,
     auto_correct: bool,
     installed_models: list[str],
@@ -1611,15 +1753,12 @@ def build_app(
         gr.Markdown(f"UI version: `{version}`")
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
-                f"Using DB: `{db_path}`  \nLaunch model: `{qa_model}`  \nSmall model: `{qa_model_small}`  \nBig model (Re-check button): `{qa_model_big}`  \nTop-K retrieval: `{top_k}`  \nAuto-route: `{auto_route}`  \nAuto-correct: `{auto_correct}`"
-            )
-            gr.Markdown(
-                "Routing reference: short/factual queries -> small model, broad/ambiguous queries -> large model, "
-                "and low-confidence small-model responses auto-retry on large model."
+                f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`"
             )
             gr.Markdown(
                 f"LLM backend: `{llm_backend()}`  \n"
                 f"Models detected on backend: `{installed}`  \n"
+                "Retrieval: hybrid semantic (embeddings) + keyword (SQLite FTS). "
                 "Vision ingest still uses Ollama. Answers use PHOTO_INDEX_LLM_BACKEND "
                 "(ollama or openai for LM Studio)."
             )
@@ -1644,7 +1783,6 @@ def build_app(
             with gr.Row():
                 alias_load_btn = gr.Button("Load aliases")
                 alias_save_btn = gr.Button("Save aliases")
-        recheck_btn = gr.Button(f"Re-check with big model ({qa_model_big})")
         stats = gr.Markdown("Last search: n/a", elem_id="pi-stats")
 
         question = gr.Textbox(
@@ -1671,7 +1809,12 @@ def build_app(
         restrict_finance_cb = gr.Checkbox(
             value=True,
             label="Restrict finance answers to bank/credit-card statements",
-            info="When ON, money/subscription queries ignore casual chat and only use bank or credit-card transaction messages (Capital One, Chase, Apple Cash, etc.).",
+            info=(
+                "When ON, money/subscription queries ignore casual chat and only use "
+                "bank or credit-card transaction messages. When you name a month "
+                "(e.g. May 2026), results are always scoped to that month regardless "
+                "of this setting."
+            ),
         )
         always_fresh_cb = gr.Checkbox(
             value=False,
@@ -1777,28 +1920,6 @@ def build_app(
         reveal_btn.click(fn=reveal_in_finder, inputs=[selected_path], outputs=[preview_note])
         open_messages_btn.click(fn=open_messages_app, outputs=[preview_note])
         clear_cache_btn.click(fn=clear_search_cache, outputs=[stats])
-        recheck_btn.click(
-            fn=_maybe_wipe_cache,
-            inputs=[always_fresh_cb],
-            outputs=[],
-            queue=False,
-        ).then(
-            fn=clear_search_outputs,
-            outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
-            queue=False,
-        ).then(
-            fn=lambda q, s, rf: recheck_with_large_only(
-                q,
-                db_path=db_path,
-                top_k=top_k,
-                qa_model=qa_model_big,
-                qa_model_small=qa_model_small,
-                sort_by=s,
-                restrict_finance=bool(rf),
-            ),
-            inputs=[question, sort_choice, restrict_finance_cb],
-            outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
-        )
         hit_gallery.select(
             fn=on_gallery_select,
             inputs=[hit_gallery_paths],
@@ -1893,20 +2014,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--qa-model-small",
         default=os.environ.get("PHOTO_INDEX_QA_MODEL_SMALL", "gemma4:latest"),
-        help="Smaller/faster model for auto-routing.",
+        help="Smaller/faster model for auto-routing (only used when auto-route is on).",
     )
-    p.add_argument(
-        "--qa-model-big",
-        default=os.environ.get(
-            "PHOTO_INDEX_QA_MODEL_BIG",
-            os.environ.get("PHOTO_INDEX_QA_MODEL", "qwen2.5-vl-32b-instruct"),
-        ),
-        help=(
-            "Heaviest model used by the 'Re-check with big model' button, regardless "
-            "of the launch model. LM Studio loads it on demand (JIT)."
-        ),
-    )
-    p.add_argument("--top-k", type=int, default=15, help="How many retrieved rows to send to Gemma.")
+    p.add_argument("--top-k", type=int, default=15, help="How many retrieved rows to send to the model.")
     p.add_argument("--host", default="127.0.0.1", help="Host to bind (default localhost).")
     p.add_argument("--port", type=int, default=7860, help="Port to bind.")
     p.add_argument(
@@ -1928,7 +2038,6 @@ def main(argv: list[str] | None = None) -> None:
         top_k=args.top_k,
         qa_model=args.qa_model,
         qa_model_small=args.qa_model_small,
-        qa_model_big=args.qa_model_big,
         auto_route=not args.no_auto_route,
         auto_correct=not args.no_auto_correct,
         installed_models=installed_models,
