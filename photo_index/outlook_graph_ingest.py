@@ -51,7 +51,12 @@ lack **Mail.Read** after permission changes. Confirm Entra **Grant admin consent
 Try ``--force-token-refresh`` once after changing permissions.
 If **401** persists while the logged JWT already lists ``Mail.Read`` (and ``--test-connection``
 shows whether ``/me`` works but ``mailFolders`` does not), the signed-in identity may have no
-**Exchange Online mailbox** or tenant policy blocks mail APIs — verify mail in **Outlook on the web**.
+**Exchange Online mailbox** or tenant policy blocks mail APIs — verify mail in **Outlook on the web``.
+If ``/me`` shows a UPN containing ``#EXT#``, that is an **invited / external Azure AD identity**
+in this tenant; Graph may still show ``userType=Member``, but **Exchange often does not expose
+a mailbox** for Graph mail APIs — sign in with the **native mailbox account** for that org
+(or set ``GRAPH_TENANT_ID`` / ``--tenant`` to the tenant where your mailbox lives).
+If ``userType=Guest``, the same mailbox limitation usually applies.
 Logs include Graph ``request-id`` headers when present for support tickets.
 
 Delta checkpoint path: ``data/graph_mail_delta.json``.
@@ -375,6 +380,130 @@ def _graph_get(session: requests.Session, url: str, *, timeout: float = 120.0) -
     raise RuntimeError("Microsoft Graph: too many 429 retries")
 
 
+def _graph_identity_profile(session: requests.Session, mb_seg: str) -> dict[str, Any]:
+    url = f"{_GRAPH_ROOT}{mb_seg}?$select=id,userPrincipalName,mail,userType"
+    resp = session.get(url, timeout=60.0)
+    if resp.url != url:
+        _log(f"[graph warn] GET redirected {url!r} → final URL {resp.url!r}")
+    if resp.status_code >= 400:
+        _graph_log_http_error(resp)
+        resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def _invite_email_hint_from_ext_upn(upn: str) -> str | None:
+    """Best-effort decode of Microsoft's B2B ``{email_with_@→_}#EXT#@host`` UPN prefix.
+
+    Example: ``jack_jackpoorman.com#EXT#@...`` → ``jack@jackpoorman.com``.
+    Fails for addresses whose local-part contains ``_`` before the ``@`` (ambiguous).
+    """
+    u = (upn or "").strip()
+    el = u.lower()
+    idx = el.find("#ext#")
+    if idx < 0:
+        return None
+    prefix = u[:idx].strip()
+    if "_" not in prefix:
+        return None
+    local, _, rest = prefix.partition("_")
+    if not local or not rest or "." not in rest:
+        return None
+    return f"{local}@{rest}"
+
+
+def _is_external_invited_upn(me: dict[str, Any]) -> bool:
+    """True if UPN uses Microsoft's #EXT# pattern (invited / external identity in directory)."""
+    upn = str(me.get("userPrincipalName") or "")
+    return "#EXT#" in upn.upper()
+
+
+def _is_graph_guest_user(me: dict[str, Any]) -> bool:
+    return str(me.get("userType") or "").strip().lower() == "guest"
+
+
+def _mailbox_401_ext_identity_message(me: dict[str, Any]) -> str:
+    upn = me.get("userPrincipalName")
+    ut = me.get("userType")
+    ext = _is_external_invited_upn(me)
+    guest = _is_graph_guest_user(me)
+    lines = [
+        "Microsoft Graph returned 401 on mailFolders for this signed-in user.",
+        f"  userPrincipalName={upn!r}",
+        f"  userType={ut!r}",
+        "",
+    ]
+    if ext:
+        hint = _invite_email_hint_from_ext_upn(str(upn or ""))
+        hint_line = ""
+        if hint:
+            hint_line = (
+                f"This is still **you**: Azure encodes invited users as a technical UPN "
+                f"(often matching ~**{hint}**). It is **not** the same as a native \"work\" user "
+                f"object that hosts Exchange mail in this tenant.\n\n"
+            )
+        lines.extend(
+            [
+                hint_line
+                + "Your UPN contains **#EXT#** — an **invited / external Azure AD identity** "
+                "in this tenant. Graph may still show **userType Member**; regardless, "
+                "**Exchange often does not expose a mailbox** for this identity here, so Mail.Read "
+                "gets **401** on mailFolders while **/me** works.",
+                "",
+            ]
+        )
+    elif guest:
+        lines.extend(
+            [
+                "Microsoft Graph reports **userType Guest**. Guests typically do **not** have an "
+                "Exchange Online mailbox in the inviting tenant for Graph mail APIs.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "**Fix:** If this **is** your real email but Azure shows a **#EXT#** UPN, your object is "
+            "**invited/external** in this tenant; Graph mail APIs need a **mailbox-homed** identity "
+            "(often a native member user with an Exchange license) **or** the **tenant ID** where "
+            "your mailbox actually lives (try **GRAPH_TENANT_ID** / **--tenant**). Ask your admin if "
+            "unsure. Delete **data/graph_mail_token_cache.json** after any change, then "
+            "**--auth device**.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _ensure_graph_mail_access(session: requests.Session, mb_seg: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """GET profile + mailFolders?$top=1; raises RuntimeError with guidance for common #EXT#/guest 401."""
+    me = _graph_identity_profile(session, mb_seg)
+    upn_log = str(me.get("userPrincipalName") or "")
+    hint = _invite_email_hint_from_ext_upn(upn_log)
+    _log(
+        f"[graph] Graph identity: userPrincipalName={me.get('userPrincipalName')!r} "
+        f"userType={me.get('userType')!r} mail={me.get('mail')!r}"
+    )
+    if hint:
+        _log(
+            f"[graph] Note: #EXT# UPN above usually corresponds to invited identity ~{hint!r} "
+            "(your email), not a native mailbox principal in this tenant."
+        )
+    probe = f"{_GRAPH_ROOT}{mb_seg}/mailFolders?$top=1"
+    resp = session.get(probe, timeout=60.0)
+    if resp.url != probe:
+        _log(f"[graph warn] GET redirected {probe!r} → final URL {resp.url!r}")
+    if resp.status_code == 401 and (_is_external_invited_upn(me) or _is_graph_guest_user(me)):
+        _graph_log_http_error(resp)
+        raise RuntimeError(_mailbox_401_ext_identity_message(me))
+    if resp.status_code >= 400:
+        _graph_log_http_error(resp)
+        resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Microsoft Graph mailFolders: unexpected JSON payload")
+    return me, payload
+
+
 def _acquire_token(
     *,
     client_id: str,
@@ -555,6 +684,7 @@ def run_outlook_graph_ingest(
     max_messages: int | None,
     progress_every_pages: int = 1,
     force_token_refresh: bool = False,
+    skip_mail_access_probe: bool = False,
 ) -> dict[str, int | float]:
     fw = (folder_well_known or "").strip() or None
     fg = (folder_graph_id or "").strip() or None
@@ -587,6 +717,9 @@ def run_outlook_graph_ingest(
     )
 
     mb_seg = _mailbox_segment(mailbox_upn)
+    if not skip_mail_access_probe:
+        _ensure_graph_mail_access(session, mb_seg)
+
     if delta_link:
         url = delta_link
         _log("[graph] Continuing incremental sync from saved delta link.")
@@ -707,6 +840,7 @@ def run_named_folder_preset_batch(
             "Prefer": 'outlook.body-content-type="text"',
         }
     )
+    _ensure_graph_mail_access(session, mb_seg)
     totals = {"indexed": 0, "deleted": 0, "skipped_empty": 0, "skipped_since": 0, "pages": 0}
     elapsed_sum = 0.0
     try:
@@ -745,6 +879,7 @@ def run_named_folder_preset_batch(
                     max_messages=max_messages,
                     progress_every_pages=progress_every_pages,
                     force_token_refresh=force_token_refresh,
+                    skip_mail_access_probe=True,
                 )
                 for k in totals:
                     totals[k] += int(ctr[k])
@@ -777,21 +912,11 @@ def run_graph_connection_test(
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     mb_seg = _mailbox_segment(mailbox_upn)
-    me_url = f"{_GRAPH_ROOT}{mb_seg}?$select=id,userPrincipalName,mail"
-    _log(f"[graph test] GET {me_url.split('?')[0]} …")
-    me_resp = session.get(me_url, timeout=60.0)
-    if me_resp.url != me_url:
-        _log(f"[graph warn] GET redirected {me_url!r} → final URL {me_resp.url!r}")
-    if me_resp.status_code >= 400:
-        _graph_log_http_error(me_resp)
-        me_resp.raise_for_status()
-    me_payload = me_resp.json()
+    _log("[graph test] GET /me (profile) and mailFolders?$top=1 …")
+    me_payload, payload = _ensure_graph_mail_access(session, mb_seg)
     upn = me_payload.get("userPrincipalName")
     mail = me_payload.get("mail")
     _log(f"[graph test] /me OK — userPrincipalName={upn!r} mail={mail!r}")
-    probe_url = f"{_GRAPH_ROOT}{mb_seg}/mailFolders?$top=1"
-    _log(f"[graph test] GET {probe_url.split('?')[0]} …")
-    payload = _graph_get(session, probe_url)
     folders = payload.get("value")
     n = len(folders) if isinstance(folders, list) else 0
     _log(f"[graph test] OK — Mail.Read works; mailFolders sample returned {n} row(s).")
@@ -1045,6 +1170,7 @@ def main(argv: list[str] | None = None) -> None:
                     max_messages=max_messages,
                     progress_every_pages=progress_every_pages,
                     force_token_refresh=force_token_refresh,
+                    skip_mail_access_probe=i != 1,
                 )
                 _log(
                     f"[graph {wk} done] indexed={ctr['indexed']} deleted={ctr['deleted']} "
