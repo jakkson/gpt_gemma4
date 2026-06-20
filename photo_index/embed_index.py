@@ -24,6 +24,7 @@ from .store import (
     connect,
     count_rows_needing_embedding,
     init_schema,
+    invalidate_embedding_sidecar,
     iter_rows_needing_embedding,
     store_embedding,
 )
@@ -77,6 +78,9 @@ def run(db_path: Path, *, batch: int, limit: int | None) -> None:
             f"wall={time.time()-t0:.0f}s",
             flush=True,
         )
+        if done:
+            # Force the search side to rebuild its on-disk matrix from the new vectors.
+            invalidate_embedding_sidecar(db_path)
     finally:
         conn.close()
 

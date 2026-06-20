@@ -45,8 +45,9 @@ from photo_index.query_expand import expand_query_terms, reset_synonym_cache
 
 from photo_index.store import (
     connect,
+    count_embedded_rows,
     init_schema,
-    load_embedding_matrix,
+    load_embedding_matrix_cached,
     row_to_prompt_block,
     search_meta,
     search_meta_fallback_substring,
@@ -58,9 +59,11 @@ _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.jso
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
-# In-process cache of the embedding matrix (loaded from SQLite). Reloaded on a TTL
-# so a running backfill / new ingest is picked up without restarting the server.
-_EMB_CACHE: dict[str, Any] = {"uuids": None, "mat": None, "loaded_at": 0.0}
+# In-process cache of the embedding matrix (loaded from the .npy sidecar). On TTL
+# expiry we re-check the embedded-row count (a cheap COUNT) and only rebuild when
+# it changed, so a running backfill / new ingest is picked up without the old
+# multi-second full-table rescan on every refresh.
+_EMB_CACHE: dict[str, Any] = {"uuids": None, "mat": None, "loaded_at": 0.0, "count": -1}
 _EMB_CACHE_TTL = float(os.environ.get("PHOTO_INDEX_EMB_CACHE_TTL", "180"))
 _SEMANTIC_ENABLED = os.environ.get("PHOTO_INDEX_SEMANTIC", "1").strip().lower() not in ("0", "false", "no")
 # Weight applied to cosine similarity (~0.3-0.8) when blending into the rank score.
@@ -771,8 +774,12 @@ def _merge_imessage_like_tokens(
                 merged[r["uuid"]] = r
 
 
-def _get_embedding_matrix(conn: sqlite3.Connection):
-    """Return cached (uuids, normalized matrix), reloading on a TTL. (None, None) if empty."""
+def _get_embedding_matrix(conn: sqlite3.Connection, db_path: Path):
+    """Return cached (uuids, normalized matrix). (None, None) if no embeddings.
+
+    Within the TTL the in-process matrix is returned directly. After the TTL we do
+    a cheap COUNT to detect new vectors; only a changed count triggers a reload
+    (from the .npy sidecar — no full-table scan unless the sidecar is stale)."""
     now = time.time()
     if (
         _EMB_CACHE["mat"] is not None
@@ -780,24 +787,35 @@ def _get_embedding_matrix(conn: sqlite3.Connection):
     ):
         return _EMB_CACHE["uuids"], _EMB_CACHE["mat"]
     try:
-        uuids, mat = load_embedding_matrix(conn)
+        uuids, mat = load_embedding_matrix_cached(conn, db_path)
     except Exception:
         uuids, mat = [], None
     _EMB_CACHE["uuids"] = uuids
     _EMB_CACHE["mat"] = mat
     _EMB_CACHE["loaded_at"] = now
+
+    try:
+        count = count_embedded_rows(conn)
+    except Exception:
+        count = -1
+    if _EMB_CACHE["mat"] is not None and count == _EMB_CACHE["count"]:
+        # Nothing new since last load; keep the matrix, reset the TTL clock.
+        _EMB_CACHE["loaded_at"] = now
+        return _EMB_CACHE["uuids"], _EMB_CACHE["mat"]
+
     return uuids, mat
 
 
-def _semantic_scores(conn: sqlite3.Connection, question: str, k: int) -> dict[str, float]:
+def _semantic_scores(conn: sqlite3.Connection, question: str, k: int, db_path: Path) -> dict[str, float]:
     """Cosine-similarity scores for the top-``k`` rows nearest the query embedding.
 
     Returns {} when semantic search is disabled, no embeddings exist yet, or the
+    _EMB_CACHE["count"] = count
     embedder is unreachable — callers then fall back to keyword retrieval only.
     """
     if not _SEMANTIC_ENABLED or k <= 0:
         return {}
-    uuids, mat = _get_embedding_matrix(conn)
+    uuids, mat = _get_embedding_matrix(conn, db_path)
     if mat is None or not uuids:
         return {}
     try:
@@ -959,7 +977,7 @@ def _retrieve_rows(
         # Semantic (embedding) candidates: meaning-based matches keyword FTS misses
         # (e.g. "Paris" finding a caption that only says "Eiffel Tower"). Uses the
         # full question for richer embedding. Empty {} if embeddings/embedder absent.
-        sem_scores = _semantic_scores(conn, question, max(top_k * 4, 40))
+        sem_scores = _semantic_scores(conn, question, max(top_k * 4, 40), db_path)
         missing = [u for u in sem_scores if u not in merged]
         for i in range(0, len(missing), 400):
             chunk = missing[i : i + 400]

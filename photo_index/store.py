@@ -361,3 +361,64 @@ def load_embedding_matrix(conn: sqlite3.Connection):
     norms[norms == 0] = 1.0
     mat = mat / norms
     return uuids, mat
+
+
+def count_embedded_rows(conn: sqlite3.Connection) -> int:
+    """Cheap freshness signal for the embedding sidecar (rows with a vector)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM photo_meta WHERE embedding IS NOT NULL"
+    ).fetchone()[0]
+
+
+def _embedding_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    base = Path(db_path)
+    return (
+        base.with_name(base.name + ".emb_mat.npy"),
+        base.with_name(base.name + ".emb_uuids.npy"),
+    )
+
+
+def invalidate_embedding_sidecar(db_path: Path) -> None:
+    """Drop the on-disk embedding cache so it rebuilds on next load.
+
+    Call after an embed backfill so searches pick up the new vectors immediately.
+    """
+    for p in _embedding_sidecar_paths(db_path):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_embedding_matrix_cached(conn: sqlite3.Connection, db_path: Path):
+    """Like ``load_embedding_matrix`` but backed by an on-disk ``.npy`` sidecar.
+
+    Scanning the embedding column out of the multi-GB ``photo_meta`` table costs
+    several seconds; the normalized matrix is the same until the next ingest. We
+    persist it next to the DB and rebuild only when the embedded-row count changes
+    (or the sidecar is missing/corrupt). Returns ([], None) when no embeddings.
+    """
+    import numpy as np
+
+    mat_path, uuid_path = _embedding_sidecar_paths(db_path)
+    count = count_embedded_rows(conn)
+    if count == 0:
+        return [], None
+
+    if mat_path.exists() and uuid_path.exists():
+        try:
+            uuids = list(np.load(uuid_path, allow_pickle=True))
+            mat = np.load(mat_path)
+            if mat.shape[0] == count == len(uuids):
+                return uuids, mat
+        except Exception:
+            pass  # fall through to rebuild
+
+    uuids, mat = load_embedding_matrix(conn)
+    if mat is not None:
+        try:
+            np.save(mat_path, mat)
+            np.save(uuid_path, np.asarray(uuids, dtype=object))
+        except Exception:
+            pass  # sidecar is an optimization; tolerate a read-only FS
+    return uuids, mat
