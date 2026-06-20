@@ -59,12 +59,11 @@ def find_noise_uuids(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def delete_uuids(conn: sqlite3.Connection, uuids: list[str], chunk: int = 500) -> None:
-    """Delete from photo_meta + photo_lex in batches to keep statements bounded."""
+    """Delete from photo_meta in batches (photo_lex is kept in sync by triggers)."""
     for i in range(0, len(uuids), chunk):
         batch = uuids[i : i + chunk]
         placeholders = ",".join(["?"] * len(batch))
         conn.execute(f"DELETE FROM photo_meta WHERE uuid IN ({placeholders})", batch)
-        conn.execute(f"DELETE FROM photo_lex  WHERE uuid IN ({placeholders})", batch)
     conn.commit()
 
 
@@ -119,7 +118,12 @@ def main(argv: list[str] | None = None) -> int:
             # plus isolation_level=None ensures we're outside any txn.
             conn.isolation_level = None
             conn.execute("VACUUM")
-            print("[prune] VACUUM complete.")
+            # VACUUM can renumber photo_meta rowids, which the external-content FTS
+            # references — rebuild the index so search stays correct.
+            from photo_index.store import rebuild_fts
+
+            rebuild_fts(conn)
+            print("[prune] VACUUM complete (FTS rebuilt).")
     finally:
         conn.close()
 

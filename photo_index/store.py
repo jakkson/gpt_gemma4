@@ -58,6 +58,63 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+# photo_lex is an FTS5 *external-content* table: its rows are tokenized from
+# photo_meta and referenced by rowid, so the source text is NOT duplicated into
+# the FTS table (saves ~1.8 GB vs the old contentless 'doc' copy). The triggers
+# below keep the index in sync on every insert/update/delete of photo_meta.
+_FTS_CREATE_SQL = """
+CREATE VIRTUAL TABLE photo_lex USING fts5(
+    filename, date_iso, ocr_text, vlm_text,
+    content='photo_meta',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+"""
+
+_FTS_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS photo_meta_ai AFTER INSERT ON photo_meta BEGIN
+    INSERT INTO photo_lex(rowid, filename, date_iso, ocr_text, vlm_text)
+    VALUES (new.rowid, new.filename, new.date_iso, new.ocr_text, new.vlm_text);
+END;
+CREATE TRIGGER IF NOT EXISTS photo_meta_ad AFTER DELETE ON photo_meta BEGIN
+    INSERT INTO photo_lex(photo_lex, rowid, filename, date_iso, ocr_text, vlm_text)
+    VALUES ('delete', old.rowid, old.filename, old.date_iso, old.ocr_text, old.vlm_text);
+END;
+CREATE TRIGGER IF NOT EXISTS photo_meta_au AFTER UPDATE ON photo_meta BEGIN
+    INSERT INTO photo_lex(photo_lex, rowid, filename, date_iso, ocr_text, vlm_text)
+    VALUES ('delete', old.rowid, old.filename, old.date_iso, old.ocr_text, old.vlm_text);
+    INSERT INTO photo_lex(rowid, filename, date_iso, ocr_text, vlm_text)
+    VALUES (new.rowid, new.filename, new.date_iso, new.ocr_text, new.vlm_text);
+END;
+"""
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> None:
+    """Repopulate the FTS index from photo_meta (the source of truth).
+
+    Required after any operation that can renumber photo_meta rowids (e.g. VACUUM),
+    since the external-content index references rows by rowid.
+    """
+    conn.execute("INSERT INTO photo_lex(photo_lex) VALUES('rebuild')")
+    conn.commit()
+
+
+def _migrate_fts_external(conn: sqlite3.Connection) -> None:
+    """Replace a legacy (contentless 'doc') photo_lex with the external-content
+    form. Safe to drop: photo_lex is fully derived from photo_meta."""
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS photo_meta_ai;
+        DROP TRIGGER IF EXISTS photo_meta_ad;
+        DROP TRIGGER IF EXISTS photo_meta_au;
+        DROP TABLE IF EXISTS photo_lex;
+        """
+    )
+    conn.executescript(_FTS_CREATE_SQL)
+    conn.executescript(_FTS_TRIGGERS_SQL)
+    rebuild_fts(conn)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -70,12 +127,6 @@ def init_schema(conn: sqlite3.Connection) -> None:
             image_path_used TEXT,
             ingested_at REAL NOT NULL
         );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS photo_lex USING fts5(
-            uuid UNINDEXED,
-            doc,
-            tokenize='porter unicode61'
-        );
         """
     )
     cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_meta)")}
@@ -84,6 +135,21 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if "embedding" not in cols:
         # float32 vector as raw bytes; NULL until the embed backfill runs.
         conn.execute("ALTER TABLE photo_meta ADD COLUMN embedding BLOB")
+
+    # FTS5: create fresh, or migrate a legacy contentless table to external content.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='photo_lex'"
+    ).fetchone()
+    existing_sql = (row[0] if row else "") or ""
+    if row is None:
+        conn.executescript(_FTS_CREATE_SQL)
+        conn.executescript(_FTS_TRIGGERS_SQL)
+        rebuild_fts(conn)  # no-op when photo_meta is empty
+    elif "content=" not in existing_sql:
+        _migrate_fts_external(conn)
+    else:
+        # Already external-content; just make sure the sync triggers exist.
+        conn.executescript(_FTS_TRIGGERS_SQL)
     conn.commit()
 
 
@@ -128,31 +194,24 @@ def upsert_photo(
     commit: bool = True,
 ) -> None:
     now = time.time()
+    # FTS (photo_lex) is kept in sync automatically by triggers on photo_meta.
     conn.execute("DELETE FROM photo_meta WHERE uuid = ?", (uuid,))
-    conn.execute("DELETE FROM photo_lex WHERE uuid = ?", (uuid,))
     conn.execute(
         """INSERT INTO photo_meta
         (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, open_url, ingested_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (uuid, filename, date_iso, ocr_text, vlm_text, image_path_used, open_url or "", now),
     )
-    doc = "\n".join(
-        [
-            filename or "",
-            date_iso or "",
-            ocr_text or "",
-            vlm_text or "",
-        ]
-    )
-    conn.execute("INSERT INTO photo_lex (uuid, doc) VALUES (?, ?)", (uuid, doc))
     if commit:
         conn.commit()
 
 
 def delete_index_row(conn: sqlite3.Connection, uuid: str, *, commit: bool = True) -> None:
-    """Remove one indexed row (used when Graph delta reports deletions)."""
+    """Remove one indexed row (used when Graph delta reports deletions).
+
+    The photo_lex FTS row is removed automatically by the AFTER DELETE trigger.
+    """
     conn.execute("DELETE FROM photo_meta WHERE uuid = ?", (uuid,))
-    conn.execute("DELETE FROM photo_lex WHERE uuid = ?", (uuid,))
     if commit:
         conn.commit()
 
@@ -170,7 +229,7 @@ def search_meta(conn: sqlite3.Connection, fts_query: str, limit: int = 25) -> li
     sql = """
     SELECT m.*, bm25(photo_lex) AS rank
     FROM photo_lex
-    JOIN photo_meta m ON m.uuid = photo_lex.uuid
+    JOIN photo_meta m ON m.rowid = photo_lex.rowid
     WHERE photo_lex MATCH ?
     ORDER BY rank
     LIMIT ?
