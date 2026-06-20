@@ -68,6 +68,13 @@ _EMB_CACHE_TTL = float(os.environ.get("PHOTO_INDEX_EMB_CACHE_TTL", "180"))
 _SEMANTIC_ENABLED = os.environ.get("PHOTO_INDEX_SEMANTIC", "1").strip().lower() not in ("0", "false", "no")
 # Weight applied to cosine similarity (~0.3-0.8) when blending into the rank score.
 _SEMANTIC_WEIGHT = float(os.environ.get("PHOTO_INDEX_SEMANTIC_WEIGHT", "25"))
+# Cross-encoder rerank: a precision stage over the merged candidate pool. ON by
+# default for testing — set PHOTO_INDEX_RERANK=0 to A/B back to the old ranking.
+_RERANK_ENABLED = os.environ.get("PHOTO_INDEX_RERANK", "1").strip().lower() not in ("0", "false", "no")
+# Weight on the normalized [0,1] cross-encoder score (comparable to _SEMANTIC_WEIGHT).
+_RERANK_WEIGHT = float(os.environ.get("PHOTO_INDEX_RERANK_WEIGHT", "20"))
+# Cap candidates sent to the cross-encoder to bound latency (pre-trimmed by sem/bm25).
+_RERANK_MAX_CANDIDATES = int(os.environ.get("PHOTO_INDEX_RERANK_MAX_CANDIDATES", "100"))
 _PAGE_LOAD_JS = """
 () => {
   if (!window.__photoSearchEnterBound) {
@@ -786,13 +793,6 @@ def _get_embedding_matrix(conn: sqlite3.Connection, db_path: Path):
         and (now - _EMB_CACHE["loaded_at"]) < _EMB_CACHE_TTL
     ):
         return _EMB_CACHE["uuids"], _EMB_CACHE["mat"]
-    try:
-        uuids, mat = load_embedding_matrix_cached(conn, db_path)
-    except Exception:
-        uuids, mat = [], None
-    _EMB_CACHE["uuids"] = uuids
-    _EMB_CACHE["mat"] = mat
-    _EMB_CACHE["loaded_at"] = now
 
     try:
         count = count_embedded_rows(conn)
@@ -803,6 +803,14 @@ def _get_embedding_matrix(conn: sqlite3.Connection, db_path: Path):
         _EMB_CACHE["loaded_at"] = now
         return _EMB_CACHE["uuids"], _EMB_CACHE["mat"]
 
+    try:
+        uuids, mat = load_embedding_matrix_cached(conn, db_path)
+    except Exception:
+        uuids, mat = [], None
+    _EMB_CACHE["uuids"] = uuids
+    _EMB_CACHE["mat"] = mat
+    _EMB_CACHE["loaded_at"] = now
+    _EMB_CACHE["count"] = count
     return uuids, mat
 
 
@@ -810,7 +818,6 @@ def _semantic_scores(conn: sqlite3.Connection, question: str, k: int, db_path: P
     """Cosine-similarity scores for the top-``k`` rows nearest the query embedding.
 
     Returns {} when semantic search is disabled, no embeddings exist yet, or the
-    _EMB_CACHE["count"] = count
     embedder is unreachable — callers then fall back to keyword retrieval only.
     """
     if not _SEMANTIC_ENABLED or k <= 0:
@@ -1006,6 +1013,35 @@ def _retrieve_rows(
 
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
 
+        # Cross-encoder rerank (relevance mode only): re-score the surviving
+        # candidates by reading each (question, row) pair jointly, then blend the
+        # normalized score into `score()` below. Best-effort — {} on any failure.
+        rerank_map: dict[str, float] = {}
+        if _RERANK_ENABLED and rows and sort_by == SORT_RELEVANT:
+            def _bm25(r: sqlite3.Row) -> float:
+                return float(r["rank"]) if ("rank" in r.keys() and r["rank"] is not None) else 0.0
+
+            cand = rows
+            if len(cand) > _RERANK_MAX_CANDIDATES:
+                cand = sorted(
+                    cand,
+                    key=lambda r: (sem_scores.get(str(r["uuid"]), 0.0), -_bm25(r)),
+                    reverse=True,
+                )[:_RERANK_MAX_CANDIDATES]
+            items = [
+                (
+                    str(r["uuid"]),
+                    f"{r['filename'] or ''}\n{r['ocr_text'] or ''}\n{r['vlm_text'] or ''}",
+                )
+                for r in cand
+            ]
+            try:
+                from photo_index.rerank import rerank_scores
+
+                rerank_map = rerank_scores(question, items)
+            except Exception:
+                rerank_map = {}
+
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
             uid = str(r["uuid"] or "")
             is_imsg = uid.startswith("imsg:")
@@ -1059,6 +1095,8 @@ def _retrieve_rows(
                     entity_bonus -= 12.0
             # Semantic similarity: strong signal for meaning-based relevance.
             entity_bonus += sem_scores.get(uid, 0.0) * _SEMANTIC_WEIGHT
+            # Cross-encoder rerank: highest-precision relevance signal when present.
+            entity_bonus += rerank_map.get(uid, 0.0) * _RERANK_WEIGHT
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
             # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
@@ -1841,7 +1879,7 @@ def build_app(
             upload_answer = gr.Markdown("No document analyzed yet.", elem_id="pi-answer", sanitize_html=False)
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
-                f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`"
+                f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`  \nRerank (cross-encoder): `{'on' if _RERANK_ENABLED else 'off'}`"
             )
             gr.Markdown(
                 f"LLM backend: `{llm_backend()}`  \n"

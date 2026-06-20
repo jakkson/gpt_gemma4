@@ -29,10 +29,15 @@ export PHOTO_INDEX_LLM_MAX_TOKENS_BIG="${PHOTO_INDEX_LLM_MAX_TOKENS_BIG:-4096}"
 export PHOTO_INDEX_PROMPT_FIELD_CHARS_BIG="${PHOTO_INDEX_PROMPT_FIELD_CHARS_BIG:-900}"
 
 export PHOTO_INDEX_QA_MODEL="${PHOTO_INDEX_QA_MODEL:-qwen3-30b-a3b-instruct-2507}"
+
+# Cross-encoder reranking (precision stage over FTS+semantic candidates). ON for
+# testing; set PHOTO_INDEX_RERANK=0 to A/B back to the previous ranking.
+export PHOTO_INDEX_RERANK="${PHOTO_INDEX_RERANK:-1}"
+
 ROUTE_FLAG="--no-auto-route"
 
 echo "[start_search] backend=$PHOTO_INDEX_LLM_BACKEND url=$PHOTO_INDEX_LLM_BASE_URL"
-echo "[start_search] answer model=$PHOTO_INDEX_QA_MODEL"
+echo "[start_search] answer model=$PHOTO_INDEX_QA_MODEL  rerank=$PHOTO_INDEX_RERANK"
 echo "[start_search] open http://127.0.0.1:7860 once Uvicorn reports running"
 
 exec python -m photo_index.gradio_app --top-k 15 --host 127.0.0.1 --port 7860 ${ROUTE_FLAG}

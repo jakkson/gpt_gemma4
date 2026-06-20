@@ -15,3 +15,6 @@ python-pptx>=1.0.0
 openpyxl>=3.1.0
 xlrd>=2.0.1
 striprtf>=0.0.26
+# Cross-encoder reranking (precision stage for retrieval); pulls in torch (MPS on Apple Silicon).
+sentence-transformers>=3.0
+numpy>=1.24
