@@ -24,6 +24,52 @@ Fix: System Settings -> Privacy & Security -> Full Disk Access -> enable for
 Cursor or Terminal, then restart the app and try again.
 """.strip()
 
+def _extract_attributed_body(blob: bytes | None) -> str:
+    """Extract plain text from an NSAttributedString typedstream blob.
+
+    Apple Messages sometimes stores text only in ``attributedBody``
+    (an NSMutableAttributedString archive) and leaves ``text`` NULL.
+    The plain text follows the ``\\x2b`` marker after the NSString class
+    header and ends at the ``\\x86`` attribute-dictionary byte.
+    """
+    if not blob:
+        return ""
+    try:
+        idx = blob.find(b"NSString")
+        if idx < 0:
+            return ""
+        # Locate the \x2b ('+') type marker that precedes the length + text.
+        plus = blob.find(b"\x2b", idx + 8)
+        if plus < 0 or plus > idx + 30:
+            return ""
+        pos = plus + 1
+        if pos >= len(blob):
+            return ""
+        # BER-style length: if high bit set, next byte(s) hold the length.
+        length_byte = blob[pos]
+        pos += 1
+        if length_byte & 0x80:
+            n_len_bytes = length_byte & 0x7F
+            if n_len_bytes < 1 or pos + n_len_bytes > len(blob):
+                return ""
+            length = int.from_bytes(blob[pos:pos + n_len_bytes], "big")
+            pos += n_len_bytes
+        else:
+            length = length_byte
+        # Skip any NUL padding between length and text.
+        while pos < len(blob) and blob[pos] == 0x00:
+            pos += 1
+        # Read until \x86 (attribute dictionary) or exhausted length.
+        end = blob.find(b"\x86", pos)
+        if end < 0:
+            end = pos + length
+        else:
+            end = min(end, pos + length)
+        text_bytes = blob[pos:end]
+        return text_bytes.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
@@ -74,12 +120,14 @@ def run_messages_ingest(
       m.ROWID AS rowid,
       m.guid AS guid,
       m.text AS text,
+      m.attributedBody AS attributed_body,
       m.date AS date_raw,
       m.is_from_me AS is_from_me,
       h.id AS handle_id
     FROM message m
     LEFT JOIN handle h ON h.ROWID = m.handle_id
     WHERE m.text IS NOT NULL AND trim(m.text) != ''
+       OR m.attributedBody IS NOT NULL
     ORDER BY m.ROWID
     """
     if limit is not None:
@@ -98,6 +146,8 @@ def run_messages_ingest(
             _log(f"[messages progress] {i}/{total} ...")
 
         body = (r["text"] or "").strip()
+        if not body:
+            body = _extract_attributed_body(r["attributed_body"])
         if not body:
             skipped_empty += 1
             continue
