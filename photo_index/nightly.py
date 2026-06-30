@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--skip-vlm", action="store_true", help="Photos: OCR only, no VLM captions.")
     p.add_argument("--skip-photos", action="store_true", help="Skip photo_index.ingest.")
     p.add_argument("--skip-messages", action="store_true", help="Skip photo_index.messages_ingest.")
+    p.add_argument("--skip-mail", action="store_true", help="Skip photo_index.mail_ingest.")
     p.add_argument("--skip-documents", action="store_true", help="Skip photo_index.documents_ingest.")
     p.add_argument(
         "--skip-documents-vlm",
@@ -132,6 +133,12 @@ def main(argv: list[str] | None = None) -> None:
         rc = max(rc, _run_module("photo_index.messages_ingest", msg_args))
     else:
         _log("[nightly] skipping photo_index.messages_ingest")
+
+    if not args.skip_mail:
+        mail_args = ["--db", db, "--progress-every", "1000"]
+        rc = max(rc, _run_module("photo_index.mail_ingest", mail_args))
+    else:
+        _log("[nightly] skipping photo_index.mail_ingest")
 
     if not args.skip_documents:
         doc_root = str(Path(args.documents_root).expanduser().resolve())
