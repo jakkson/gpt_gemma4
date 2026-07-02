@@ -9,6 +9,18 @@ PYTHON_BIN="${PHOTO_INDEX_PYTHON:-$ROOT/.venv/bin/python}"
 export PHOTO_INDEX_LLM_BACKEND="${PHOTO_INDEX_LLM_BACKEND:-openai}"
 CAFFEINATE="$(command -v caffeinate || true)"
 
+# Refresh the Evernote backup (incremental; only new/changed notes) before the
+# python ingest reads it. Best-effort: a rate-limit or network error here must
+# not abort the rest of the nightly run, so we don't let it trip `set -e`.
+EN_BACKUP="${EVERNOTE_BACKUP_BIN:-$ROOT/.venv/bin/evernote-backup}"
+EN_DB="$ROOT/data/evernote/en_backup.db"
+if [[ -x "$EN_BACKUP" && -f "$EN_DB" ]]; then
+  echo "[nightly] evernote-backup sync ..."
+  "$EN_BACKUP" sync --database "$EN_DB" || echo "[nightly warn] evernote-backup sync incomplete (rate limit / network); will resume next run"
+else
+  echo "[nightly] skipping evernote-backup sync (binary or db missing)"
+fi
+
 ARGS=(
   -m photo_index.nightly
   --db "$ROOT/data/photo_index.sqlite"

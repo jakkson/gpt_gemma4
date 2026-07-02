@@ -1235,12 +1235,18 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         open_url = r[7] if len(r) > 7 else ""
         is_msg = str(uuid).startswith("imsg:")
         is_m365 = str(uuid).startswith("m365:")
+        is_mail = str(uuid).startswith("mail:")
+        is_evernote = str(uuid).startswith("evernote:")
         is_doc = str(uuid).startswith("doc:")
         source = (
             "Messages"
             if is_msg
             else "Outlook / Microsoft 365"
             if is_m365
+            else "Apple Mail"
+            if is_mail
+            else "Evernote"
+            if is_evernote
             else "Document"
             if is_doc
             else "Photos / Local file"
