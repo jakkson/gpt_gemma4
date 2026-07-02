@@ -40,17 +40,27 @@ def build_script(keyword: str, mode: str, list_subjects: bool) -> str:
     # Gather unread messages first (fast, indexed), then test subject/body. This
     # avoids Mail fetching the body of every message in a large mailbox.
     if mode == "delete":
+        # Capture stable message ids in one scan, THEN delete each by re-resolving
+        # its id. Holding message references across deletes fails on Exchange
+        # (-1728): moving a message re-indexes the mailbox and staled references
+        # abort the loop mid-batch. The per-item `try` also means a single id that
+        # can't be resolved (already moved, thread-collapsed) is skipped, not fatal
+        # — anything missed is simply caught on the next run.
         action = """
-      set matchList to {}
+      set idList to {}
       repeat with m in uMsgs
         if ((subject of m) contains kw) or ((content of m) contains kw) then
-          set end of matchList to m
+          set end of idList to (id of m)
         end if
       end repeat
-      repeat with m in matchList
-        delete m
+      set movedCount to 0
+      repeat with theID in idList
+        try
+          delete (first message of mb whose id is theID)
+          set movedCount to movedCount + 1
+        end try
       end repeat
-      return (count of matchList) as string"""
+      return movedCount as string"""
     else:
         collect = """
       set matchList to {}
