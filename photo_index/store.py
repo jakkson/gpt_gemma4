@@ -221,6 +221,20 @@ def commit_ingest(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def optimize(conn: sqlite3.Connection) -> None:
+    """Refresh query-planner statistics after bulk writes (cheap, incremental).
+
+    SQLite's `PRAGMA optimize` re-ANALYZEs only tables whose contents changed
+    enough to matter, keeping FTS/BM25 and index scans on good query plans as
+    the corpus grows. Safe to call at the end of every ingest/embed pass.
+    """
+    try:
+        conn.execute("PRAGMA optimize")
+        conn.commit()
+    except sqlite3.Error:
+        pass  # advisory only — never fail an ingest over stats
+
+
 def search_meta(conn: sqlite3.Connection, fts_query: str, limit: int = 25) -> list[sqlite3.Row]:
     """BM25-ranked rows from FTS + meta join."""
     q = fts_token_prefix_query(fts_query)

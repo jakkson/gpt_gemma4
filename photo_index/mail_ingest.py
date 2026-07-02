@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import email
+import email.header
 import email.policy
 import email.utils
 import hashlib
@@ -28,7 +29,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from photo_index.ingest_lock import global_ingest_lock
-from photo_index.store import already_indexed, commit_ingest, connect, init_schema, upsert_photo
+from photo_index.store import (
+    already_indexed,
+    commit_ingest,
+    connect,
+    init_schema,
+    optimize,
+    upsert_photo,
+)
 
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 _MAIL_ROOT = Path.home() / "Library" / "Mail" / "V10"
@@ -241,6 +249,23 @@ def _iter_emlx(account_root: Path):
 # Main ingest
 # ---------------------------------------------------------------------------
 
+def _indexed_mail_paths(conn) -> set[str]:
+    """All emlx paths already in the index (one query).
+
+    .emlx files are immutable — Mail writes a new file per message and never
+    edits it — so a path match means the message is already ingested and the
+    file need not be opened or parsed again. This turns the nightly re-run
+    from ~4.5 min of parsing 160k files into a fast directory walk.
+    """
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT image_path_used FROM photo_meta "
+            "WHERE uuid LIKE 'mail:%' AND image_path_used != ''"
+        )
+    }
+
+
 def ingest_account(
     conn,
     account_root: Path,
@@ -251,13 +276,15 @@ def ingest_account(
     """Ingest one account. Returns (indexed, skipped_dup, errors)."""
     indexed = skipped_dup = errors = 0
     batch = 0
+    seen_paths = set() if force else _indexed_mail_paths(conn)
 
     for emlx_path, folder_name in _iter_emlx(account_root):
-        # Cheap UUID check before reading the file
-        # We need the message-id for this, so we must read it.
-        # But we can skip if a previous run indexed this exact file path.
-        # Instead we parse first, then check — parse is fast for headers only.
-        # For large ingest, the already_indexed() check after parse is fine.
+        # Path-level skip: emlx files are immutable, so an already-indexed
+        # path never needs re-parsing. (Message-id dedup below still guards
+        # against the same message appearing under a new path.)
+        if str(emlx_path) in seen_paths:
+            skipped_dup += 1
+            continue
 
         data = _parse_emlx(emlx_path)
         if data is None:
@@ -362,6 +389,8 @@ def main(argv: list[str] | None = None) -> None:
             _log(f"[mail_ingest] {account_root.name[:8]}: "
                  f"{idx:,} new | {dup:,} already indexed | {err:,} errors")
 
+    if total_indexed:
+        optimize(conn)
     elapsed = time.time() - t_start
     _log(f"[mail_ingest] done in {elapsed:.0f}s — "
          f"{total_indexed:,} indexed | {total_dup:,} skipped | {total_err:,} errors")

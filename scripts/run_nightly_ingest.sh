@@ -12,7 +12,9 @@ CAFFEINATE="$(command -v caffeinate || true)"
 # Refresh the Evernote backup (incremental; only new/changed notes) before the
 # python ingest reads it. Best-effort: a rate-limit or network error here must
 # not abort the rest of the nightly run, so we don't let it trip `set -e`.
-EN_BACKUP="${EVERNOTE_BACKUP_BIN:-$ROOT/.venv/bin/evernote-backup}"
+# NOTE: evernote-backup lives in the system Python (homebrew), NOT the venv —
+# its click pin conflicts with gradio's typer. Do not install it in .venv.
+EN_BACKUP="${EVERNOTE_BACKUP_BIN:-$(command -v evernote-backup || echo /opt/homebrew/bin/evernote-backup)}"
 EN_DB="$ROOT/data/evernote/en_backup.db"
 if [[ -x "$EN_BACKUP" && -f "$EN_DB" ]]; then
   echo "[nightly] evernote-backup sync ..."

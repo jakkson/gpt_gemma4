@@ -37,7 +37,7 @@ from pathlib import Path
 
 from photo_index.ingest_lock import global_ingest_lock
 from photo_index.mail_ingest import _clean_text, _strip_html
-from photo_index.store import commit_ingest, connect, init_schema, upsert_photo
+from photo_index.store import commit_ingest, connect, init_schema, optimize, upsert_photo
 
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 _DEFAULT_BACKUP_DB = (
@@ -89,11 +89,14 @@ def _enml_to_text(content: str | None) -> str:
     return _clean_text(text)[:_BODY_MAX_CHARS]
 
 
-def _existing_ingested_at(conn: sqlite3.Connection, uuid: str) -> float | None:
-    row = conn.execute(
-        "SELECT ingested_at FROM photo_meta WHERE uuid = ?", (uuid,)
-    ).fetchone()
-    return None if row is None else float(row[0])
+def _existing_ingested_map(conn: sqlite3.Connection) -> dict[str, float]:
+    """uuid -> ingested_at for all Evernote rows, loaded in one query."""
+    return {
+        r[0]: float(r[1])
+        for r in conn.execute(
+            "SELECT uuid, ingested_at FROM photo_meta WHERE uuid LIKE 'evernote:%'"
+        )
+    }
 
 
 def ingest(
@@ -108,6 +111,7 @@ def ingest(
     bconn = sqlite3.connect(f"file:{backup_db}?mode=ro", uri=True)
     bconn.row_factory = sqlite3.Row
     nb_names = _notebook_names(bconn)
+    ingested_map = _existing_ingested_map(conn)
 
     new = edited = skipped = errors = 0
     batch = 0
@@ -132,7 +136,7 @@ def ingest(
         created_iso = _ms_to_iso(getattr(note, "created", None))
         updated_unix = _ms_to_unix(getattr(note, "updated", None))
 
-        prev_ingested = _existing_ingested_at(conn, uuid)
+        prev_ingested = ingested_map.get(uuid)
         if prev_ingested is not None and not force:
             # Skip unless the note was edited after we last indexed it.
             if updated_unix <= prev_ingested:
@@ -224,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
             force=args.force,
             include_inactive=args.include_inactive,
         )
+    if new or edited:
+        optimize(conn)
     dt = time.time() - t0
     _log(f"[evernote_ingest] done in {dt:.0f}s — "
          f"{new:,} new | {edited:,} edited | {skipped:,} unchanged | {errors:,} errors")

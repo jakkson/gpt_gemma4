@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -1259,7 +1260,7 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         web_open = _safe_https_browser_url(open_url)
         if image_path and not image_path.startswith("https://"):
             encoded = urllib.parse.quote(image_path, safe="")
-            req_path = f"/open-local-file?path={encoded}"
+            req_path = f"/open-local-file?path={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
             data_attr = html.escape(req_path, quote=True)
             link_md = (
                 '<button type="button" class="pi-open-local-file" '
@@ -1285,10 +1286,12 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         else:
             link_md = "(no local link)"
             ref = f"`{uuid}`"
+        # Escape indexed text (email subjects, note titles are external input)
+        # so it can't smuggle HTML into the rendered hit summary.
         parts.append(
-            f"**{i}. {title}**  \n"
+            f"**{i}. {html.escape(str(title))}**  \n"
             f"_{source} • {when}_  \n"
-            f"{snippet}  \n"
+            f"{html.escape(str(snippet))}  \n"
             f"{link_md} — ref: {ref}"
         )
     return "\n\n".join(parts)
@@ -2107,16 +2110,49 @@ def _spawn_open_default_app(path: Path) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-def _open_local_file_handler(path: str) -> Response:
+# Per-run CSRF token for /open-local-file. Without it, any web page the user
+# visits could fire a simple GET at 127.0.0.1:7860 (no CORS preflight applies)
+# and make this process `open` arbitrary local files. The token is embedded in
+# the served page's links, so only our own UI can construct valid requests.
+_OPEN_LOCAL_FILE_TOKEN = secrets.token_urlsafe(16)
+# Set in main(); used to verify requested paths are actually indexed files.
+_OPEN_LOCAL_FILE_DB: Path | None = None
+
+
+def _path_is_indexed(path: str) -> bool:
+    """True if ``path`` is stored as an indexed file (image_path_used) in the DB."""
+    if _OPEN_LOCAL_FILE_DB is None:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{_OPEN_LOCAL_FILE_DB}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM photo_meta WHERE image_path_used = ? LIMIT 1", (path,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _open_local_file_handler(path: str, t: str = "") -> Response:
     """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
 
     Invoked via ``fetch()`` from hit-summary controls (delegated click handler in
     ``_PAGE_LOAD_JS``) so the Gradio SPA never navigates. The handler returns
     immediately after scheduling ``open`` so proxies/tunnels finish the request
     before any foreground UI churn.
+
+    Security: requires the per-run token AND the path to be a file this index
+    actually ingested — both checks stop cross-site "open anything" requests.
     """
+    if not secrets.compare_digest(t or "", _OPEN_LOCAL_FILE_TOKEN):
+        raise HTTPException(status_code=403, detail="bad or missing token")
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
+    if not _path_is_indexed(path):
+        raise HTTPException(status_code=403, detail="path is not an indexed file")
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail=f"not a regular file: {path}")
@@ -2170,6 +2206,8 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     db_path = Path(os.path.abspath(args.db))
+    global _OPEN_LOCAL_FILE_DB
+    _OPEN_LOCAL_FILE_DB = db_path  # lets /open-local-file verify requested paths
     installed_models = list_llm_models()
     blocks = build_app(
         db_path=db_path,
