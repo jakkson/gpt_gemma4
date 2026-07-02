@@ -190,9 +190,32 @@ def _build_prompt(
     aggregate: bool = False,
     scope_month: tuple[int, int] | None = None,
     field_char_cap: int | None = None,
+    conversational: bool = False,
 ) -> str:
     blocks = [row_to_prompt_block(r, field_char_cap=field_char_cap) for r in rows]
     context = "\n\n---\n\n".join(blocks)
+    if conversational:
+        style_block = """
+TONE & STYLE (important)
+- Write like a helpful assistant talking with the user — not like a search
+  engine returning results. Address them as "you".
+- Lead with the direct answer in the first sentence, then weave supporting
+  details into short, natural paragraphs. Avoid bullet-point dumps unless the
+  user explicitly asks for a list, table, or breakdown.
+- Refer to sources conversationally in-sentence — "your Capital One alert from
+  June 21", "an email from Fidelity in January 2019" — the exact records are
+  already listed below your answer, so never paste raw uuids, filenames, or
+  file paths into the prose.
+- If it feels natural, close with one short follow-up offer (e.g. "Want me to
+  break that down by month?"). Keep it to one sentence.
+"""
+        cite_rule = (
+            "- Attribute each fact to its source conversationally (who sent it and "
+            "when); do NOT quote raw uuids or filenames in the answer text."
+        )
+    else:
+        style_block = ""
+        cite_rule = "- Cite each record you use inline by its filename or imsg uuid."
     month_scope = ""
     if scope_month:
         label = _month_label(scope_month)
@@ -212,8 +235,8 @@ DATE SCOPE (critical — read before answering)
 GROUND RULES
 - Use ONLY the indexed records below. Do NOT use outside / general knowledge.
 - Quote exact dollar amounts and dates from the records when relevant.
-- Cite each record you use inline by its filename or imsg uuid.
-{month_scope}
+{cite_rule}
+{month_scope}{style_block}
 REASONING ALLOWED (this is an aggregate / "how much per month" question)
 1. Scan the records and list EVERY recurring/subscription/monthly charge you can find:
    merchant, amount, date, and the imsg uuid of the message.
@@ -244,12 +267,12 @@ STRICT RULES
 - Use ONLY the indexed records below. Do not use outside / general knowledge.
   Do not summarize what a product or company is in general.
 - For money / price / payment / charge / subscription questions, quote the exact
-  dollar amount and date(s) directly from the records, and cite the matching
-  record (filename or imsg uuid) inline.
+  dollar amount and date(s) directly from the records.
+{cite_rule}
 - You MAY add up, count, or compare amounts that are visible in the records.
 - Prefer the most recent matching record when the user asks about "latest",
   "currently", or "right now".
-{month_scope}
+{month_scope}{style_block}
 REFUSAL
 - Only say "I don't see that in your indexed data yet." if there are NO
   records at all that touch the topic. If there are partial matches, list what
@@ -1329,6 +1352,7 @@ def _cache_key(
     auto_route: bool,
     sort_by: str,
     restrict_finance: bool,
+    conversational: bool = False,
 ) -> str:
     q = " ".join((question or "").strip().lower().split())
     # Bind to UI version so any code change (which alters the file hash) auto-
@@ -1337,7 +1361,7 @@ def _cache_key(
     return (
         f"{q}|{db_path}|{top_k}|{qa_model}|{qa_model_small}"
         f"|auto={int(auto_route)}|sort={sort_by}"
-        f"|rf={int(restrict_finance)}|v={version}"
+        f"|rf={int(restrict_finance)}|conv={int(conversational)}|v={version}"
     )
 
 
@@ -1381,6 +1405,7 @@ def answer_question(
     auto_correct: bool,
     sort_by: str = SORT_RELEVANT,
     restrict_finance: bool = True,
+    conversational: bool = True,
 ) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
     q = (question or "").strip()
     if not q:
@@ -1398,6 +1423,7 @@ def answer_question(
         auto_route=auto_route,
         sort_by=sort_by,
         restrict_finance=restrict_finance,
+        conversational=conversational,
     )
     cache = _prune_cache(_load_cache(_CACHE_PATH), now)
     cached = cache.get(key)
@@ -1481,6 +1507,7 @@ def answer_question(
         aggregate=aggregate_mode,
         scope_month=scoped_my,
         field_char_cap=_prompt_field_cap_for_model(first_model),
+        conversational=conversational,
     )
 
     answer, err = _safe_chat(model=first_model, prompt=prompt)
@@ -1933,6 +1960,16 @@ def build_app(
                 label="Sort hits by",
                 info="Most Relevant uses entity/keyword scoring. Most Recent ignores ranking and sorts by date.",
             )
+            answer_style = gr.Radio(
+                choices=["Conversational", "Precise (citations)"],
+                value="Conversational",
+                label="Answer style",
+                info=(
+                    "Conversational reads like a chat reply — sources woven into "
+                    "sentences, no raw uuids. Precise keeps audit-style inline "
+                    "citations (best for double-checking money questions)."
+                ),
+            )
             with gr.Column(scale=0, min_width=140):
                 ask = gr.Button("Search", elem_id="photo-search-btn")
                 stop_search = gr.Button(
@@ -2000,7 +2037,7 @@ def build_app(
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf: answer_question(
+            fn=lambda q, s, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -2010,8 +2047,9 @@ def build_app(
                 auto_correct=auto_correct,
                 sort_by=s,
                 restrict_finance=bool(rf),
+                conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb],
+            inputs=[question, sort_choice, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
@@ -2025,7 +2063,7 @@ def build_app(
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf: answer_question(
+            fn=lambda q, s, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -2035,8 +2073,9 @@ def build_app(
                 auto_correct=auto_correct,
                 sort_by=s,
                 restrict_finance=bool(rf),
+                conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb],
+            inputs=[question, sort_choice, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
