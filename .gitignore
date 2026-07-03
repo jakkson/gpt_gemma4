@@ -14,3 +14,6 @@ data/
 photo_index/_vision_ocr_swift
 data/evernote/en_backup.db
 data/evernote/export/
+data/mail_rule*.watermark
+data/mail_rule*.log
+data/mail_rule*.error.log

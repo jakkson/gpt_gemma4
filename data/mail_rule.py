@@ -26,6 +26,14 @@ ACCT = os.environ.get("PHOTO_MAIL_RULE_ACCOUNT", "Exchange")
 FOLDER = os.environ.get("PHOTO_MAIL_RULE_FOLDER", "Inbox")
 DEFAULT_KEYWORD = os.environ.get("PHOTO_MAIL_RULE_KEYWORD", "trump")
 
+# Incremental scan (for tight polling, e.g. every 60s). A watermark file holds
+# the epoch of the last successful delete run; each run only looks at unread mail
+# received since then (minus a small overlap for clock skew), so a per-minute
+# pass touches only newly-arrived messages instead of re-scanning every unread
+# body. After a long sleep the first run catches up (bounded by MAX_LOOKBACK).
+_OVERLAP_SECONDS = 120
+_MAX_LOOKBACK_SECONDS = 3 * 24 * 3600
+
 
 def as_quote(s: str) -> str:
     """Escape a value for an AppleScript double-quoted string (injection-safe)."""
@@ -33,10 +41,46 @@ def as_quote(s: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", "", s)
 
 
-def build_script(keyword: str, mode: str, list_subjects: bool) -> str:
+def _since_offset_seconds(since_file: str | None):
+    """Return (offset_seconds, now). offset is None => full scan (no watermark).
+
+    offset is 'seconds back from now' to feed AppleScript's `(current date) - N`.
+    """
+    now = time.time()
+    if not since_file:
+        return None, now
+    try:
+        with open(since_file, encoding="utf-8") as f:
+            watermark = float(f.read().strip())
+    except (OSError, ValueError):
+        watermark = 0.0
+    cutoff = watermark - _OVERLAP_SECONDS
+    offset = now - cutoff
+    offset = max(_OVERLAP_SECONDS, min(offset, _MAX_LOOKBACK_SECONDS))
+    return int(offset), now
+
+
+def _write_watermark(since_file: str, ts: float) -> None:
+    try:
+        with open(since_file, "w", encoding="utf-8") as f:
+            f.write(str(int(ts)))
+    except OSError:
+        pass
+
+
+def _unread_filter(since_offset: int | None) -> tuple[str, str]:
+    """(cutoff_line, whose_clause) — adds a date-received floor when incremental."""
+    if since_offset is None:
+        return "", "read status is false"
+    return (f"  set cutoff to (current date) - {int(since_offset)}\n",
+            "read status is false and date received > cutoff")
+
+
+def build_script(keyword: str, mode: str, list_subjects: bool, since_offset: int | None = None) -> str:
     kw = as_quote(keyword)
     acct = as_quote(ACCT)
     folder = as_quote(FOLDER)
+    cutoff_line, unread_where = _unread_filter(since_offset)
     # Gather unread messages first (fast, indexed), then test subject/body. This
     # avoids Mail fetching the body of every message in a large mailbox.
     if mode == "delete":
@@ -82,18 +126,18 @@ tell application "Mail"
   set kw to "{kw}"
   set acct to first account whose name is "{acct}"
   set mb to (first mailbox of acct whose name is "{folder}")
-  set uMsgs to (messages of mb whose read status is false){action}
+{cutoff_line}  set uMsgs to (messages of mb whose {unread_where}){action}
 end tell
 end timeout'''
 
 
-def run(keyword: str, mode: str, list_subjects: bool):
-    script = build_script(keyword, mode, list_subjects)
+def run(keyword: str, mode: str, list_subjects: bool, since_offset: int | None = None):
+    script = build_script(keyword, mode, list_subjects, since_offset)
     t0 = time.time()
     p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     dt = time.time() - t0
     out = (p.stdout or p.stderr).strip()
-    return out, dt
+    return out, dt, (p.returncode == 0)
 
 
 # --- Sender/subject keyword-list path (space+punctuation-insensitive) ---------
@@ -127,17 +171,18 @@ def load_keywords(path: str) -> list[str]:
     return kws
 
 
-def _fetch_unread_sender_subject() -> list[tuple[str, str, str]]:
-    """Return [(id, sender, subject), ...] for unread Inbox messages."""
+def _fetch_unread_sender_subject(since_offset: int | None = None):
+    """Return (rows, ok). rows = [(id, sender, subject), ...] for unread Inbox."""
     acct = as_quote(ACCT)
     folder = as_quote(FOLDER)
+    cutoff_line, unread_where = _unread_filter(since_offset)
     script = f'''with timeout of 1800 seconds
 tell application "Mail"
   set fs to (ASCII character 31)
   set rs to (ASCII character 30)
   set acct to first account whose name is "{acct}"
   set mb to (first mailbox of acct whose name is "{folder}")
-  set uMsgs to (messages of mb whose read status is false)
+{cutoff_line}  set uMsgs to (messages of mb whose {unread_where})
   set out to ""
   repeat with m in uMsgs
     set out to out & (id of m) & fs & (sender of m) & fs & (subject of m) & rs
@@ -154,7 +199,7 @@ end timeout'''
         parts = rec.split(_FS)
         if len(parts) >= 3:
             rows.append((parts[0].strip(), parts[1], parts[2]))
-    return rows
+    return rows, (p.returncode == 0)
 
 
 def _matches(sender: str, subject: str, keywords: list[str]) -> bool:
@@ -189,10 +234,10 @@ end timeout'''
         return 0
 
 
-def run_keyword_file(path: str, mode: str, list_subjects: bool):
+def run_keyword_file(path: str, mode: str, list_subjects: bool, since_offset: int | None = None):
     keywords = load_keywords(path)
     t0 = time.time()
-    rows = _fetch_unread_sender_subject()
+    rows, ok = _fetch_unread_sender_subject(since_offset)
     matched = [(mid, sender, subject) for (mid, sender, subject) in rows
                if _matches(sender, subject, keywords)]
     if mode == "delete":
@@ -200,7 +245,7 @@ def run_keyword_file(path: str, mode: str, list_subjects: bool):
     else:
         moved = len(matched)
     dt = time.time() - t0
-    return keywords, matched, moved, dt
+    return keywords, matched, moved, dt, ok
 
 
 def main():
@@ -208,32 +253,45 @@ def main():
     ap.add_argument("mode", choices=["count", "delete"], help="count = dry run; delete = move to Trash")
     ap.add_argument("--keyword", default=DEFAULT_KEYWORD, help=f"single keyword vs subject/body (default: {DEFAULT_KEYWORD!r})")
     ap.add_argument("--keyword-file", help="file of keywords matched (space/punct-insensitive) vs SENDER or SUBJECT only")
+    ap.add_argument("--since-file", help="watermark file for incremental scans (only unread mail received since last run)")
     ap.add_argument("--list", action="store_true", help="in count mode, also print matching subjects")
     args = ap.parse_args()
 
+    since_offset, now = _since_offset_seconds(args.since_file)
+    # Only advance the watermark on a real delete pass, so a dry-run `count`
+    # can't cause the next delete to skip mail.
+    advance = args.since_file and args.mode == "delete"
+
     # Sender/subject keyword-list path (space+punctuation-insensitive adjacency).
     if args.keyword_file:
-        keywords, matched, moved, dt = run_keyword_file(args.keyword_file, args.mode, args.list)
+        keywords, matched, moved, dt, ok = run_keyword_file(
+            args.keyword_file, args.mode, args.list, since_offset)
         verb = "would move" if args.mode == "count" else "moved to Trash"
+        scope = "since-last-run" if since_offset is not None else "all-unread"
         print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword-file={args.keyword_file} "
-              f"({len(keywords)} keywords, sender/subject) unread-only  ({dt:.0f}s)")
+              f"({len(keywords)} keywords, sender/subject, {scope})  ({dt:.0f}s)")
         print(f"[mail_rule] {moved} unread message(s) {verb}.")
         if args.list and matched:
             for _mid, sender, subject in matched:
                 print(f"  - {subject}   [from: {sender}]")
+        if advance and ok:
+            _write_watermark(args.since_file, now)
         return
 
     # Single-keyword subject/body path (the Trump rule).
-    out, dt = run(args.keyword, args.mode, args.list)
+    out, dt, ok = run(args.keyword, args.mode, args.list, since_offset)
     verb = "would move" if args.mode == "count" else "moved to Trash"
+    scope = "since-last-run" if since_offset is not None else "all-unread"
     # First line of AppleScript output is the count.
     lines = out.splitlines()
     count = lines[0] if lines else "0"
     print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword={args.keyword!r} "
-          f"unread-only  ({dt:.0f}s)")
+          f"{scope}  ({dt:.0f}s)")
     print(f"[mail_rule] {count} unread message(s) {verb}.")
     if args.list and len(lines) > 1:
         print("\n".join(lines[1:]))
+    if advance and ok:
+        _write_watermark(args.since_file, now)
 
 
 if __name__ == "__main__":
