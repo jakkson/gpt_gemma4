@@ -96,13 +96,134 @@ def run(keyword: str, mode: str, list_subjects: bool):
     return out, dt
 
 
+# --- Sender/subject keyword-list path (space+punctuation-insensitive) ---------
+#
+# Matches a LIST of keywords against the sender address OR subject line only
+# (never the body). Matching normalizes both sides to lowercase alphanumerics,
+# so "car tablet" becomes "cartablet" and matches "CarTablet", "car-tablet", or
+# "car tablet" — but NOT "car" alone, "tablet" alone, or the two words far apart
+# (they must be adjacent to form the contiguous run). Fields are matched
+# separately so a keyword can't span the sender/subject boundary.
+
+_FS = "\x1f"  # unit separator between id/sender/subject
+_RS = "\x1e"  # record separator between messages
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def load_keywords(path: str) -> list[str]:
+    """One keyword per line; blanks and #-comments ignored. Returns normalized."""
+    kws: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            norm = _normalize(line)
+            if norm:
+                kws.append(norm)
+    return kws
+
+
+def _fetch_unread_sender_subject() -> list[tuple[str, str, str]]:
+    """Return [(id, sender, subject), ...] for unread Inbox messages."""
+    acct = as_quote(ACCT)
+    folder = as_quote(FOLDER)
+    script = f'''with timeout of 1800 seconds
+tell application "Mail"
+  set fs to (ASCII character 31)
+  set rs to (ASCII character 30)
+  set acct to first account whose name is "{acct}"
+  set mb to (first mailbox of acct whose name is "{folder}")
+  set uMsgs to (messages of mb whose read status is false)
+  set out to ""
+  repeat with m in uMsgs
+    set out to out & (id of m) & fs & (sender of m) & fs & (subject of m) & rs
+  end repeat
+  return out
+end tell
+end timeout'''
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    out = p.stdout or ""
+    rows: list[tuple[str, str, str]] = []
+    for rec in out.split(_RS):
+        if not rec.strip():
+            continue
+        parts = rec.split(_FS)
+        if len(parts) >= 3:
+            rows.append((parts[0].strip(), parts[1], parts[2]))
+    return rows
+
+
+def _matches(sender: str, subject: str, keywords: list[str]) -> bool:
+    ns, nsub = _normalize(sender), _normalize(subject)
+    return any((kw in ns) or (kw in nsub) for kw in keywords)
+
+
+def _delete_ids(ids: list[str]) -> int:
+    if not ids:
+        return 0
+    acct = as_quote(ACCT)
+    folder = as_quote(FOLDER)
+    id_literal = "{" + ", ".join(str(int(i)) for i in ids) + "}"
+    script = f'''with timeout of 1800 seconds
+tell application "Mail"
+  set acct to first account whose name is "{acct}"
+  set mb to (first mailbox of acct whose name is "{folder}")
+  set movedCount to 0
+  repeat with theID in {id_literal}
+    try
+      delete (first message of mb whose id is theID)
+      set movedCount to movedCount + 1
+    end try
+  end repeat
+  return movedCount as string
+end tell
+end timeout'''
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    try:
+        return int((p.stdout or "0").strip())
+    except ValueError:
+        return 0
+
+
+def run_keyword_file(path: str, mode: str, list_subjects: bool):
+    keywords = load_keywords(path)
+    t0 = time.time()
+    rows = _fetch_unread_sender_subject()
+    matched = [(mid, sender, subject) for (mid, sender, subject) in rows
+               if _matches(sender, subject, keywords)]
+    if mode == "delete":
+        moved = _delete_ids([m[0] for m in matched])
+    else:
+        moved = len(matched)
+    dt = time.time() - t0
+    return keywords, matched, moved, dt
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("mode", choices=["count", "delete"], help="count = dry run; delete = move to Trash")
-    ap.add_argument("--keyword", default=DEFAULT_KEYWORD, help=f"keyword to match (default: {DEFAULT_KEYWORD!r})")
+    ap.add_argument("--keyword", default=DEFAULT_KEYWORD, help=f"single keyword vs subject/body (default: {DEFAULT_KEYWORD!r})")
+    ap.add_argument("--keyword-file", help="file of keywords matched (space/punct-insensitive) vs SENDER or SUBJECT only")
     ap.add_argument("--list", action="store_true", help="in count mode, also print matching subjects")
     args = ap.parse_args()
 
+    # Sender/subject keyword-list path (space+punctuation-insensitive adjacency).
+    if args.keyword_file:
+        keywords, matched, moved, dt = run_keyword_file(args.keyword_file, args.mode, args.list)
+        verb = "would move" if args.mode == "count" else "moved to Trash"
+        print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword-file={args.keyword_file} "
+              f"({len(keywords)} keywords, sender/subject) unread-only  ({dt:.0f}s)")
+        print(f"[mail_rule] {moved} unread message(s) {verb}.")
+        if args.list and matched:
+            for _mid, sender, subject in matched:
+                print(f"  - {subject}   [from: {sender}]")
+        return
+
+    # Single-keyword subject/body path (the Trump rule).
     out, dt = run(args.keyword, args.mode, args.list)
     verb = "would move" if args.mode == "count" else "moved to Trash"
     # First line of AppleScript output is the count.
