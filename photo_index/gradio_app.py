@@ -58,7 +58,30 @@ from photo_index.store import (
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 _CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "gradio_search_cache.json"
 _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.json"
+# Persistent user profile: free-text facts ("Zumy is my dog") prepended to every
+# answer + follow-up so the model applies them even when the records don't restate
+# them. Edited in the UI or on disk; read fresh each prompt (tiny file).
+_ABOUT_ME_PATH = Path(__file__).resolve().parent.parent / "data" / "about_me.md"
 _CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+def _load_about_me() -> str:
+    try:
+        return _ABOUT_ME_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _about_me_block() -> str:
+    """Formatted profile block for prompt injection, or '' when no facts set."""
+    facts = _load_about_me()
+    if not facts:
+        return ""
+    return (
+        "KNOWN FACTS ABOUT THE USER (persistent profile — always apply these, "
+        "even if the records below don't restate them):\n"
+        f"{facts}\n\n"
+    )
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
 # In-process cache of the embedding matrix (loaded from the .npy sidecar). On TTL
@@ -195,6 +218,7 @@ def _build_prompt(
 ) -> str:
     blocks = [row_to_prompt_block(r, field_char_cap=field_char_cap) for r in rows]
     context = "\n\n---\n\n".join(blocks)
+    about_me = _about_me_block()
     if conversational:
         style_block = """
 TONE & STYLE (important)
@@ -233,7 +257,7 @@ DATE SCOPE (critical — read before answering)
 (their own photos, OCR, VLM captions, and SMS/iMessage text).
 
 {_LOCAL_INDEX_POLICY}
-GROUND RULES
+{about_me}GROUND RULES
 - Use ONLY the indexed records below. Do NOT use outside / general knowledge.
 - Quote exact dollar amounts and dates from the records when relevant.
 {cite_rule}
@@ -264,7 +288,7 @@ User question: {question}
 (their own photos, OCR, VLM captions, and SMS/iMessage text).
 
 {_LOCAL_INDEX_POLICY}
-STRICT RULES
+{about_me}STRICT RULES
 - Use ONLY the indexed records below. Do not use outside / general knowledge.
   Do not summarize what a product or company is in general.
 - For money / price / payment / charge / subscription questions, quote the exact
@@ -480,6 +504,7 @@ def _chat_system_prompt(context: str) -> str:
         "on-device personal index (their photos, OCR, captions, messages, email, "
         "and notes).\n\n"
         f"{_LOCAL_INDEX_POLICY}"
+        f"{_about_me_block()}"
         "GROUND RULES\n"
         "- Use ONLY the indexed records below plus what has already been said in "
         "this conversation. Do not use outside general knowledge.\n"
@@ -1855,6 +1880,26 @@ def save_alias_json(raw_json: str) -> str:
     return f"Saved aliases to `{_SYNONYMS_PATH}` (changes active immediately)."
 
 
+def load_about_me_text() -> tuple[str, str]:
+    if not _ABOUT_ME_PATH.exists():
+        return "", f"No profile yet — write facts and Save to create `{_ABOUT_ME_PATH}`."
+    try:
+        return _ABOUT_ME_PATH.read_text(encoding="utf-8"), f"Loaded profile from `{_ABOUT_ME_PATH}`"
+    except Exception as e:
+        return "", f"Failed to read profile: {e}"
+
+
+def save_about_me_text(text: str) -> str:
+    _ABOUT_ME_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ABOUT_ME_PATH.write_text((text or "").strip() + "\n", encoding="utf-8")
+    except Exception as e:
+        return f"Failed to save profile: {e}"
+    n = len([ln for ln in (text or "").splitlines() if ln.strip()])
+    return (f"Saved profile to `{_ABOUT_ME_PATH}` ({n} line(s)). "
+            "Applied to every answer from your next search.")
+
+
 def _parse_alias_json(raw_json: str) -> tuple[dict, str | None]:
     text = (raw_json or "").strip() or "{}"
     try:
@@ -2033,6 +2078,23 @@ def build_app(
                 "Vision ingest still uses Ollama. Answers use PHOTO_INDEX_LLM_BACKEND "
                 "(ollama or openai for LM Studio)."
             )
+        with gr.Accordion("🧠 About me — persistent facts the LLM always knows", open=False):
+            gr.Markdown(
+                "Durable facts about you, applied to **every** answer and follow-up "
+                "(even when the records don't restate them). One fact per line.  \n"
+                "_Examples: `Zumy is my dog (Siberian Husky).` · `My dogs are Zumy "
+                "and Bella.` · `I live in Brooklyn.`_"
+            )
+            about_me_box = gr.Textbox(
+                label="About me",
+                lines=8,
+                placeholder="- Zumy is my dog (Siberian Husky).\n- My dogs are Zumy and ___.\n- I live in ___.",
+            )
+            about_me_status = gr.Markdown("Write facts, then Save.")
+            with gr.Row():
+                about_me_load_btn = gr.Button("Load")
+                about_me_save_btn = gr.Button("Save", variant="primary")
+
         with gr.Accordion("Alias Manager (synonyms.json)", open=False):
             canonical = gr.Textbox(
                 label="Canonical term",
@@ -2243,6 +2305,11 @@ def build_app(
         )
         alias_load_btn.click(fn=load_alias_json, outputs=[alias_json, alias_status])
         alias_save_btn.click(fn=save_alias_json, inputs=[alias_json], outputs=[alias_status])
+
+        about_me_load_btn.click(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
+        about_me_save_btn.click(fn=save_about_me_text, inputs=[about_me_box], outputs=[about_me_status])
+        # Show the current profile in the box when the page opens.
+        demo.load(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
 
         # Inject Enter-to-search and delegated "open local file" clicks on load.
         demo.load(fn=lambda: None, js=_PAGE_LOAD_JS)

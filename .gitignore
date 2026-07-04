@@ -17,3 +17,4 @@ data/evernote/export/
 data/mail_rule*.watermark
 data/mail_rule*.log
 data/mail_rule*.error.log
+data/about_me.md
