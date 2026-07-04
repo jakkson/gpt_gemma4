@@ -2191,7 +2191,11 @@ def build_app(
     }
     button.pi-open-local-file:hover { color: #1d4ed8; }
     """
-    with gr.Blocks(title="Personal Index Search", css=custom_css) as demo:
+    # Inject CSS via a <style> element rather than Blocks(css=...): Gradio 6 moved
+    # that param to launch(), but we mount the app instead of launching it, so a
+    # style tag in the layout is the version-proof way to apply custom CSS.
+    with gr.Blocks(title="Personal Index Search") as demo:
+        gr.HTML(f"<style>{custom_css}</style>")
         gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
         with gr.Accordion("📄 Summarize / query an uploaded document", open=False):
