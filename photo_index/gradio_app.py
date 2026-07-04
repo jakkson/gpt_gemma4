@@ -533,8 +533,12 @@ def _set_last_convo(context: str, question: str, answer: str) -> None:
 
 
 def _seed_chat_from_last() -> list:
-    """Seed the Chatbot with the last search's Q/A so follow-ups continue it."""
-    return list(_LAST_CONVO.get("turns") or [])
+    """Seed the Chatbot (messages format) with the last search's Q/A."""
+    msgs: list[dict] = []
+    for u, a in (_LAST_CONVO.get("turns") or []):
+        msgs.append({"role": "user", "content": str(u)})
+        msgs.append({"role": "assistant", "content": str(a)})
+    return msgs
 
 
 def _chat_system_prompt(context: str) -> str:
@@ -573,7 +577,8 @@ def _safe_chat_messages(*, model: str, messages: list[dict]) -> tuple[str, str |
 
 
 def chat_follow_up(user_msg: str, history: list, model: str):
-    """Continue the conversation about the last search's records. Returns
+    """Continue the conversation about the last search's records. History is in
+    Gradio's messages format (list of {role, content}). Returns
     (updated_history, cleared_input)."""
     user_msg = (user_msg or "").strip()
     history = list(history or [])
@@ -581,19 +586,22 @@ def chat_follow_up(user_msg: str, history: list, model: str):
         return history, ""
     context = str(_LAST_CONVO.get("context") or "")
     if not context:
-        history.append((user_msg, "Run a search first — then I can answer "
-                                  "follow-ups about that result."))
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": "Run a search first — then I "
+                        "can answer follow-ups about that result."})
         return history, ""
     messages = [{"role": "system", "content": _chat_system_prompt(context)}]
-    for u, a in history:
-        messages.append({"role": "user", "content": str(u)})
-        messages.append({"role": "assistant", "content": str(a)})
+    for m in history:
+        role = m.get("role") if isinstance(m, dict) else None
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "content": str(m.get("content", ""))})
     messages.append({"role": "user", "content": user_msg})
     reply, err = _safe_chat_messages(model=model, messages=messages)
     if not reply:
         reply = f"(follow-up failed: {err})" if err else "(no response)"
     _log_query(user_msg, status="error" if err else "followup", model=model)
-    history.append((user_msg, reply))
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": reply})
     return history, ""
 
 
@@ -2310,6 +2318,7 @@ def build_app(
         with gr.Accordion("Continue the conversation (follow-up questions)", open=True):
             followup_chat = gr.Chatbot(
                 label="Follow-up chat", elem_id="pi-followup", height=280,
+                type="messages",
             )
             with gr.Row():
                 followup_box = gr.Textbox(
