@@ -1947,6 +1947,96 @@ def save_about_me_text(text: str) -> str:
             "Applied to every answer from your next search.")
 
 
+# Pull nickname aliases out of about_me.md parentheticals, e.g.
+#   "- My dog is Bootsy (also called Boots)."  ->  bootsy: [boots]
+# Deterministic (no LLM): only treats a paren as nicknames when it has an
+# explicit cue ("aka", "also called", "nickname"…) OR is a short name-like token
+# like "(Kate)" / "(BK)". Descriptions such as "(a Siberian Husky)" are skipped.
+_ALIAS_CUE_RE = re.compile(
+    r"\b(?:a\.?k\.?a\.?|also known as|also called|also spelled|nicknamed|"
+    r"nickname[:d]?|goes by|short for|called)\b",
+    re.I,
+)
+
+
+def _split_alias_names(text: str) -> list[str]:
+    parts = re.split(r"\s*(?:,|/|;| and | or )\s*", text.strip().strip('".'))
+    out: list[str] = []
+    for p in parts:
+        p = p.strip().strip("\"'.,").strip()
+        if 2 <= len(p) <= 40 and re.search(r"[A-Za-z]", p):
+            out.append(p.lower())
+    return out
+
+
+def _paren_to_aliases(inner: str) -> list[str]:
+    inner = inner.strip()
+    if not inner:
+        return []
+    cue = _ALIAS_CUE_RE.search(inner)
+    if cue:
+        return _split_alias_names(inner[cue.end():].strip(" :\"'"))
+    # No cue word: accept only a short, name-like bare paren e.g. (Kate), (BK).
+    words = inner.split()
+    if not words or len(words) > 2 or words[0].lower() in ("a", "an", "the"):
+        return []
+    if not inner[:1].isupper() or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.'\- ]*", inner):
+        return []
+    return _split_alias_names(inner)
+
+
+def _extract_alias_pairs(about_text: str) -> list[tuple[str, list[str]]]:
+    pairs: list[tuple[str, list[str]]] = []
+    for line in about_text.splitlines():
+        s = line.strip()
+        if not s.startswith("-") or "___" in s:
+            continue
+        for m in re.finditer(r"([A-Z][A-Za-z0-9.'\-]+)\s*\(([^)]*)\)", s):
+            canon = m.group(1).strip().lower()
+            aliases = [a for a in _paren_to_aliases(m.group(2)) if a and a != canon]
+            if aliases:
+                pairs.append((canon, aliases))
+    return pairs
+
+
+def sync_about_me_aliases() -> tuple[str, str]:
+    """Merge nickname parentheticals from about_me.md into synonyms.json.
+    Returns (refreshed_alias_json_text, status). Never removes existing aliases."""
+    try:
+        about = _ABOUT_ME_PATH.read_text(encoding="utf-8")
+    except OSError:
+        text, _ = load_alias_json()
+        return text, "No about_me.md yet — add facts with nicknames first."
+    pairs = _extract_alias_pairs(about)
+    existing: dict = {}
+    if _SYNONYMS_PATH.exists():
+        try:
+            obj = json.loads(_SYNONYMS_PATH.read_text(encoding="utf-8"))
+            existing = obj if isinstance(obj, dict) else {}
+        except Exception:
+            existing = {}
+    added: list[str] = []
+    for canon, aliases in pairs:
+        cur = {str(x).strip().lower() for x in existing.get(canon, []) if isinstance(existing.get(canon), list)}
+        want = {canon, *aliases}
+        new = want - cur
+        if new:
+            existing[canon] = [canon] + sorted(x for x in (cur | want) if x != canon)
+            added.append(f"{canon} → {sorted(new - {canon})}")
+    if not added:
+        text, _ = load_alias_json()
+        return text, ("No new nicknames found in your profile "
+                      "(descriptions like '(a Siberian Husky)' are skipped).")
+    try:
+        _SYNONYMS_PATH.write_text(json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as e:
+        text, _ = load_alias_json()
+        return text, f"Failed to write aliases: {e}"
+    reset_synonym_cache()
+    text, _ = load_alias_json()
+    return text, "Added from profile: " + "; ".join(added) + ". Active now."
+
+
 def _parse_alias_json(raw_json: str) -> tuple[dict, str | None]:
     text = (raw_json or "").strip() or "{}"
     try:
@@ -2141,6 +2231,12 @@ def build_app(
             with gr.Row():
                 about_me_load_btn = gr.Button("Load")
                 about_me_save_btn = gr.Button("Save", variant="primary")
+                about_me_sync_btn = gr.Button("🔗 Sync nicknames → aliases")
+            gr.Markdown(
+                "_Sync reads your profile and adds nicknames in parentheses "
+                "(e.g. `Bootsy (also called Boots)`) to the alias list so searches "
+                "bridge both names. Descriptions like `(a Siberian Husky)` are ignored._"
+            )
 
         with gr.Accordion("Alias Manager (synonyms.json)", open=False):
             canonical = gr.Textbox(
@@ -2355,6 +2451,10 @@ def build_app(
 
         about_me_load_btn.click(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
         about_me_save_btn.click(fn=save_about_me_text, inputs=[about_me_box], outputs=[about_me_status])
+        # Save the profile first (so parens are on disk), then extract nicknames.
+        about_me_sync_btn.click(
+            fn=save_about_me_text, inputs=[about_me_box], outputs=[about_me_status]
+        ).then(fn=sync_about_me_aliases, outputs=[alias_json, about_me_status])
         # Show the current profile in the box when the page opens.
         demo.load(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
 
