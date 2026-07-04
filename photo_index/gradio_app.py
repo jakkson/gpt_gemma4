@@ -616,6 +616,8 @@ _BANK_ISSUERS = (
     "bank of america", "citi", "citibank", "discover", "venmo", "paypal",
     "apple cash", "apple card", "robinhood", "ally bank", "us bank",
     "synchrony", "barclays", "hsbc", "navy federal", "schwab", "fidelity",
+    # P2P / mobile payment apps — often the whole content of a payment screenshot.
+    "zelle", "cash app", "cashapp", "apple pay", "google pay", "samsung pay",
 )
 _TRANSACTION_WORDS = (
     "chrge", "charge", "charged", "hold ", "transaction", "placed on your",
@@ -675,6 +677,9 @@ _TXN_PHRASES = (
     "balance is", "new statement", "statement for", "posted", "purchase of",
     "you paid", "was placed on", "placed on your", "pay $", "due $",
     "charge on", "charged to", "bill of", "billed",
+    # P2P / payment-app screenshot phrasing (Venmo, Zelle, Apple Pay, Cash App…)
+    "you sent", "sent to", "paid to", "payment to", "you received",
+    "received from", "paid you", "sent you", "requested",
 )
 
 _SUBSCRIPTION_PHRASES = (
