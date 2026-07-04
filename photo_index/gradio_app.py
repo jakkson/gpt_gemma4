@@ -651,14 +651,16 @@ def _is_finance_query(question: str) -> bool:
 def _is_finance_hit_row(r: sqlite3.Row, *, restrict_finance: bool) -> bool:
     """Whether a row belongs in a finance/charge/payment query result set."""
     if restrict_finance:
+        # Narrowed: authoritative bank/credit-card transaction records only.
         return _is_transaction_row(r)
-    uid = str(r["uuid"] or "")
+    # Default (checkbox off): include a real charge/receipt from ANY source —
+    # messages, email, notes, OR a document/statement PDF (receipts, invoices,
+    # statements) — as long as it carries a real money amount plus a
+    # transaction/subscription/issuer signal. Requiring a '$' figure keeps
+    # ordinary text (a colonoscopy prep PDF, an article) from registering as a
+    # charge. Check the box to fall back to strict bank-statement matching.
     blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-    if uid.startswith(("imsg:", "m365:")):
-        return _is_transaction_text(blob)
-    # Documents/photos stay strict even when the checkbox is off — a colonoscopy
-    # prep PDF or ticket image is not a charge.
-    return _is_transaction_row(r)
+    return _is_transaction_text(blob)
 
 
 # Real money amount: must carry a '$' sign (or explicit USD). A bare "3.14" or
