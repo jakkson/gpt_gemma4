@@ -18,3 +18,4 @@ data/mail_rule*.watermark
 data/mail_rule*.log
 data/mail_rule*.error.log
 data/about_me.md
+data/query_log.jsonl

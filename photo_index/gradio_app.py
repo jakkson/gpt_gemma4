@@ -65,6 +65,32 @@ _ABOUT_ME_PATH = Path(__file__).resolve().parent.parent / "data" / "about_me.md"
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
+# Durable, append-only log of every real question + outcome, for reviewing your
+# real-world phrasing and spotting failures (no_match / refusal). One JSON object
+# per line: ts, q, status, hits, route, model.
+_QUERY_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "query_log.jsonl"
+
+
+def _log_query(question: str, *, status: str, hits: int = 0, route: str = "", model: str = "") -> None:
+    q = (question or "").strip()
+    if not q:
+        return
+    try:
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "q": q,
+            "status": status,  # ok | no_match | refusal | error | cache | followup
+            "hits": int(hits),
+            "route": route,
+            "model": model,
+        }
+        _QUERY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _QUERY_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _load_about_me() -> str:
     """Completed profile facts for prompt injection.
 
@@ -566,6 +592,7 @@ def chat_follow_up(user_msg: str, history: list, model: str):
     reply, err = _safe_chat_messages(model=model, messages=messages)
     if not reply:
         reply = f"(follow-up failed: {err})" if err else "(no response)"
+    _log_query(user_msg, status="error" if err else "followup", model=model)
     history.append((user_msg, reply))
     return history, ""
 
@@ -1582,6 +1609,7 @@ def answer_question(
             gallery, gallery_paths = _rows_to_gallery(rows)
             # Seed follow-up chat from the cached records too.
             _set_last_convo(str(cached.get("context", "")), q, answer)
+            _log_query(q, status="cache", hits=len(rows), route=route, model=used_model)
             return answer, rows, stats, hit_md, gallery, gallery_paths
 
     aggregate_mode = _is_aggregate_finance_query(q)
@@ -1616,6 +1644,7 @@ def answer_question(
             no_match_msg = _finance_empty_message(q, restrict_finance=restrict_finance)
         else:
             no_match_msg = "No matches in index yet. Keep ingest running, then try again."
+        _log_query(q, status="no_match", hits=0)
         return (
             no_match_msg,
             [],
@@ -1657,6 +1686,7 @@ def answer_question(
             retry_text, retry_err = _safe_chat(model=qa_model, prompt=prompt)
             if retry_err:
                 elapsed = time.perf_counter() - t0
+                _log_query(q, status="error", hits=len(rows), route=route, model=qa_model)
                 return (
                     f"Search failed: small model `{first_model}` and fallback `{qa_model}` both errored.\n\n"
                     f"small error: {err}\n\nfallback error: {retry_err}",
@@ -1671,6 +1701,7 @@ def answer_question(
             route = f"{route}->large_fallback_on_error"
         else:
             elapsed = time.perf_counter() - t0
+            _log_query(q, status="error", hits=len(rows), route=route, model=qa_model)
             return (
                 f"Search failed with model `{qa_model}`: {err}",
                 [],
@@ -1721,6 +1752,9 @@ def answer_question(
     )
     hit_md = _rows_to_hit_summary(preview_rows)
     gallery, gallery_paths = _rows_to_gallery(preview_rows)
+    # "refusal" = the model punted despite having records (a failure worth review).
+    status = "refusal" if _policy_refusal_answer(answer) else "ok"
+    _log_query(effective_query, status=status, hits=len(preview_rows), route=route, model=used_model)
     return answer, preview_rows, stats, hit_md, gallery, gallery_paths
 
 
