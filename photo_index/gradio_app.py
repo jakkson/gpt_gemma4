@@ -598,6 +598,19 @@ SORT_RELEVANT = "Most Relevant"
 SORT_RECENT = "Most Recent"
 SORT_OPTIONS = (SORT_RELEVANT, SORT_RECENT)
 
+# Words that signal the user wants results ordered by date rather than relevance.
+# Replaces the old manual "Most Recent" radio — recency is inferred from the query.
+_RECENCY_TERMS = (
+    "most recent", "latest", "newest", "recent", "recently", "lately",
+    "last email", "last message", "last text", "last photo", "last note",
+    "this week", "this month", "these days", "just got", "just received",
+)
+
+
+def _wants_recency(question: str) -> bool:
+    q = " ".join((question or "").strip().lower().split())
+    return any(t in q for t in _RECENCY_TERMS)
+
 _BANK_ISSUERS = (
     "capital one", "chase", "wells fargo", "amex", "american express",
     "bank of america", "citi", "citibank", "discover", "venmo", "paypal",
@@ -1489,7 +1502,9 @@ def answer_question(
     if not q:
         return "Enter a question to search your photo index.", [], "Last search: n/a", "No hits yet.", [], []
 
-    sort_by = sort_by if sort_by in SORT_OPTIONS else SORT_RELEVANT
+    # Recency is inferred from the question (no manual sort control): date-order
+    # when the user clearly asks for recent/latest, relevance-order otherwise.
+    sort_by = SORT_RECENT if _wants_recency(q) else SORT_RELEVANT
     t0 = time.perf_counter()
     now = time.time()
     key = _cache_key(
@@ -2041,12 +2056,6 @@ def build_app(
             elem_id="photo-query-input",
         )
         with gr.Row():
-            sort_choice = gr.Radio(
-                choices=list(SORT_OPTIONS),
-                value=SORT_RELEVANT,
-                label="Sort hits by",
-                info="Most Relevant uses entity/keyword scoring. Most Recent ignores ranking and sorts by date.",
-            )
             answer_style = gr.Radio(
                 choices=["Conversational", "Precise (citations)"],
                 value="Conversational",
@@ -2065,20 +2074,19 @@ def build_app(
                     variant="stop",
                     size="md",
                 )
+        # Recency is auto-detected from the question ("latest/recent/newest") — no
+        # manual sort control. Finance defaults to searching ALL sources (email,
+        # notes, messages, docs); check this only to narrow to bank/credit-card
+        # transaction records when a money question pulls in too much chatter.
         restrict_finance_cb = gr.Checkbox(
-            value=True,
-            label="Restrict finance answers to bank/credit-card statements",
-            info=(
-                "When ON, money/subscription queries ignore casual chat and only use "
-                "bank or credit-card transaction messages. When you name a month "
-                "(e.g. May 2026), results are always scoped to that month regardless "
-                "of this setting."
-            ),
-        )
-        always_fresh_cb = gr.Checkbox(
             value=False,
-            label="Always run fresh (clear cache on every new search)",
-            info="When ON, each new search wipes the 24h cache before running so you always see fresh retrieval. Slower for repeat queries. Does NOT affect chat context (each search is independent). The manual 'Clear search cache' button is still available.",
+            label="Narrow money questions to bank/credit-card records only",
+            info=(
+                "Off by default — money questions search every source (email "
+                "receipts, notes, messages, statements). Check to filter down to "
+                "authoritative bank/credit-card transaction records if a query is "
+                "too noisy. Naming a month (e.g. May 2026) always scopes to it."
+            ),
         )
 
         answer = gr.Markdown(
@@ -2136,16 +2144,11 @@ def build_app(
             clear_cache_btn = gr.Button("Clear search cache")
 
         search_event = ask.click(
-            fn=_maybe_wipe_cache,
-            inputs=[always_fresh_cb],
-            outputs=[],
-            queue=False,
-        ).then(
             fn=clear_search_outputs,
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf, style: answer_question(
+            fn=lambda q, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -2153,26 +2156,20 @@ def build_app(
                 qa_model_small=qa_model_small,
                 auto_route=auto_route,
                 auto_correct=auto_correct,
-                sort_by=s,
                 restrict_finance=bool(rf),
                 conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb, answer_style],
+            inputs=[question, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
         search_event.then(fn=_seed_chat_from_last, outputs=[followup_chat], queue=False)
         submit_event = question.submit(
-            fn=_maybe_wipe_cache,
-            inputs=[always_fresh_cb],
-            outputs=[],
-            queue=False,
-        ).then(
             fn=clear_search_outputs,
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf, style: answer_question(
+            fn=lambda q, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -2180,11 +2177,10 @@ def build_app(
                 qa_model_small=qa_model_small,
                 auto_route=auto_route,
                 auto_correct=auto_correct,
-                sort_by=s,
                 restrict_finance=bool(rf),
                 conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb, answer_style],
+            inputs=[question, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
