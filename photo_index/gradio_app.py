@@ -34,6 +34,7 @@ from fastapi.responses import Response
 from PIL import Image
 
 from photo_index.llm_client import (
+    chat_completion_text,
     chat_user_prompt,
     embed_query,
     inference_opts_for_model,
@@ -452,6 +453,83 @@ def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
         )
     except Exception as e:
         return "", str(e)
+
+
+# --- Follow-up conversation ---------------------------------------------------
+#
+# A search is a one-shot RAG lookup. To let the user reply to the answer ("yes,
+# break it down") without re-searching for the literal words, we stash the last
+# search's retrieved records + Q/A here, and the follow-up chat reuses those same
+# records as context (no fresh retrieval) plus the running conversation history.
+_LAST_CONVO: dict[str, Any] = {"context": "", "turns": []}
+
+
+def _set_last_convo(context: str, question: str, answer: str) -> None:
+    _LAST_CONVO["context"] = context or ""
+    _LAST_CONVO["turns"] = [(question, answer)] if (question or answer) else []
+
+
+def _seed_chat_from_last() -> list:
+    """Seed the Chatbot with the last search's Q/A so follow-ups continue it."""
+    return list(_LAST_CONVO.get("turns") or [])
+
+
+def _chat_system_prompt(context: str) -> str:
+    return (
+        "You are having a running conversation with the user about their own "
+        "on-device personal index (their photos, OCR, captions, messages, email, "
+        "and notes).\n\n"
+        f"{_LOCAL_INDEX_POLICY}"
+        "GROUND RULES\n"
+        "- Use ONLY the indexed records below plus what has already been said in "
+        "this conversation. Do not use outside general knowledge.\n"
+        "- Answer in a natural, conversational tone; refer to sources in-sentence "
+        "and never paste raw uuids or filenames.\n"
+        "- If the user asks for something the records and prior turns don't "
+        "support, say so briefly rather than inventing it.\n\n"
+        f"Indexed records:\n{context}\n"
+    )
+
+
+def _safe_chat_messages(*, model: str, messages: list[dict]) -> tuple[str, str | None]:
+    opts = inference_opts_for_model(model)
+    try:
+        return (
+            chat_completion_text(
+                model=model,
+                messages=messages,
+                timeout=float(opts["timeout"]),
+                max_tokens=int(opts["max_tokens"]),
+                stream=False,
+            ),
+            None,
+        )
+    except Exception as e:
+        return "", str(e)
+
+
+def chat_follow_up(user_msg: str, history: list, model: str):
+    """Continue the conversation about the last search's records. Returns
+    (updated_history, cleared_input)."""
+    user_msg = (user_msg or "").strip()
+    history = list(history or [])
+    if not user_msg:
+        return history, ""
+    context = str(_LAST_CONVO.get("context") or "")
+    if not context:
+        history.append((user_msg, "Run a search first — then I can answer "
+                                  "follow-ups about that result."))
+        return history, ""
+    messages = [{"role": "system", "content": _chat_system_prompt(context)}]
+    for u, a in history:
+        messages.append({"role": "user", "content": str(u)})
+        messages.append({"role": "assistant", "content": str(a)})
+    messages.append({"role": "user", "content": user_msg})
+    reply, err = _safe_chat_messages(model=model, messages=messages)
+    if not reply:
+        reply = f"(follow-up failed: {err})" if err else "(no response)"
+    history.append((user_msg, reply))
+    return history, ""
 
 
 def _build_term_vocab(conn: sqlite3.Connection, limit_rows: int = 5000) -> set[str]:
@@ -1442,6 +1520,8 @@ def answer_question(
             )
             hit_md = _rows_to_hit_summary(rows)
             gallery, gallery_paths = _rows_to_gallery(rows)
+            # Seed follow-up chat from the cached records too.
+            _set_last_convo(str(cached.get("context", "")), q, answer)
             return answer, rows, stats, hit_md, gallery, gallery_paths
 
     aggregate_mode = _is_aggregate_finance_query(q)
@@ -1557,12 +1637,19 @@ def answer_question(
         answer = f"{autocorrect_note}\n\n---\n\n{answer}"
     preview_rows = _rows_preview(rows)
 
+    # Stash the retrieved records + this Q/A so follow-up chat can continue
+    # without re-retrieving. Same field cap as the answer prompt used.
+    cap = _prompt_field_cap_for_model(first_model)
+    context_block = "\n\n---\n\n".join(row_to_prompt_block(r, field_char_cap=cap) for r in rows)
+    _set_last_convo(context_block, effective_query, answer)
+
     cache[key] = {
         "cached_at_unix": now,
         "answer": answer,
         "rows": preview_rows,
         "used_model": used_model,
         "route": route,
+        "context": context_block,
     }
     _save_cache(_CACHE_PATH, cache)
 
@@ -1997,6 +2084,27 @@ def build_app(
         answer = gr.Markdown(
             label="Answer", elem_id="pi-answer", sanitize_html=False
         )
+
+        # Follow-up chat: continue the conversation about the answer above without
+        # re-searching. Reuses the records the last search already retrieved.
+        with gr.Accordion("Continue the conversation (follow-up questions)", open=True):
+            followup_chat = gr.Chatbot(
+                label="Follow-up chat", elem_id="pi-followup", height=280,
+            )
+            with gr.Row():
+                followup_box = gr.Textbox(
+                    placeholder='Reply to the answer above — e.g. "yes, break down the ingredients"',
+                    label="Your follow-up", scale=5, lines=1,
+                )
+                with gr.Column(scale=0, min_width=110):
+                    followup_send = gr.Button("Send", variant="primary")
+                    followup_clear = gr.Button("New topic", size="sm")
+            gr.Markdown(
+                "_Follow-ups reuse the records from your last search. For a brand-new "
+                "topic, use the Search box above._",
+                elem_id="pi-followup-note",
+            )
+
         hit_summary = gr.Markdown(
             "No hits yet.", elem_id="pi-hits", sanitize_html=False
         )
@@ -2053,6 +2161,7 @@ def build_app(
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
+        search_event.then(fn=_seed_chat_from_last, outputs=[followup_chat], queue=False)
         submit_event = question.submit(
             fn=_maybe_wipe_cache,
             inputs=[always_fresh_cb],
@@ -2079,6 +2188,7 @@ def build_app(
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
+        submit_event.then(fn=_seed_chat_from_last, outputs=[followup_chat], queue=False)
         stop_search.click(
             fn=None,
             inputs=None,
@@ -2086,6 +2196,19 @@ def build_app(
             cancels=[search_event, submit_event],
             queue=False,
         )
+        followup_send.click(
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model),
+            inputs=[followup_box, followup_chat],
+            outputs=[followup_chat, followup_box],
+            queue=True,
+        )
+        followup_box.submit(
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model),
+            inputs=[followup_box, followup_chat],
+            outputs=[followup_chat, followup_box],
+            queue=True,
+        )
+        followup_clear.click(fn=lambda: [], outputs=[followup_chat], queue=False)
         hits.select(
             fn=preview_selected,
             inputs=[hits],
