@@ -2316,9 +2316,11 @@ def build_app(
         # Follow-up chat: continue the conversation about the answer above without
         # re-searching. Reuses the records the last search already retrieved.
         with gr.Accordion("Continue the conversation (follow-up questions)", open=True):
+            # This Gradio version's Chatbot uses the messages format (role/content
+            # dicts) by default and rejects a `type=` arg — hence the dict-format
+            # data in _seed_chat_from_last / chat_follow_up.
             followup_chat = gr.Chatbot(
                 label="Follow-up chat", elem_id="pi-followup", height=280,
-                type="messages",
             )
             with gr.Row():
                 followup_box = gr.Textbox(
