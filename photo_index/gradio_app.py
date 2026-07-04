@@ -66,10 +66,23 @@ _CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
 def _load_about_me() -> str:
+    """Completed profile facts for prompt injection.
+
+    The file doubles as a fill-in questionnaire, so we skip lines that are notes
+    (start with '#'), blank, or still contain an unfilled blank ('___'). Only
+    finished fact lines reach the model — the raw file (with the questionnaire)
+    is what the UI editor shows via load_about_me_text()."""
     try:
-        return _ABOUT_ME_PATH.read_text(encoding="utf-8").strip()
+        raw = _ABOUT_ME_PATH.read_text(encoding="utf-8")
     except OSError:
         return ""
+    facts: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "___" in s:
+            continue
+        facts.append(s)
+    return "\n".join(facts).strip()
 
 
 def _about_me_block() -> str:
