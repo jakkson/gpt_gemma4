@@ -52,6 +52,30 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+class _StubNote:
+    """Placeholder for pickled evernote SDK classes (Note, NoteAttributes, …).
+
+    The backup DB stores notes as pickled thrift objects from the `evernote`
+    package. We only read plain attributes (title/created/updated/tagNames/
+    content), so instead of requiring that package to be importable (it is NOT
+    installed in .venv — its click pin conflicts with gradio), unpickle every
+    evernote.* class into this attribute bag. Without this, nightly ingest ran
+    under .venv and errored on 100% of notes."""
+
+
+class _NoteUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):  # noqa: D102
+        if module.startswith("evernote."):
+            return _StubNote
+        return super().find_class(module, name)
+
+
+def _load_note(blob: bytes):
+    import io
+
+    return _NoteUnpickler(io.BytesIO(lzma.decompress(blob))).load()
+
+
 def _ms_to_iso(ms: int | None) -> str | None:
     """Evernote timestamps are epoch milliseconds."""
     if not ms:
@@ -125,7 +149,7 @@ def ingest(
     for row in cur:
         seen += 1
         try:
-            note = pickle.loads(lzma.decompress(row["raw_note"]))
+            note = _load_note(row["raw_note"])
         except Exception:
             errors += 1
             continue

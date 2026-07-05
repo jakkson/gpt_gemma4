@@ -30,8 +30,20 @@ ARGS=(
   --progress-every 50
 )
 
+# Keep the Mac awake for the WHOLE script (ingest + embed), not just nightly.
+# (-w $$ ties the assertion to this shell's lifetime.)
 if [[ -n "$CAFFEINATE" ]]; then
-  exec "$CAFFEINATE" -s -w $$ "$PYTHON_BIN" "${ARGS[@]}"
+  "$CAFFEINATE" -s -w $$ &
 fi
 
-exec "$PYTHON_BIN" "${ARGS[@]}"
+rc=0
+"$PYTHON_BIN" "${ARGS[@]}" || rc=$?
+
+# Embed any rows the ingest just added — otherwise new content is invisible to
+# semantic search until someone runs embed_index by hand. Requires LM Studio
+# (:1234) for the nomic model; a failure here must not mask the ingest result.
+echo "[nightly] embedding new rows (embed_index) ..."
+"$PYTHON_BIN" -m photo_index.embed_index --db "$ROOT/data/photo_index.sqlite" \
+  || echo "[nightly warn] embed_index failed (is LM Studio running?); rows stay queued for next run"
+
+exit "$rc"
