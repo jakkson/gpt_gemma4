@@ -671,6 +671,13 @@ SORT_RELEVANT = "Most Relevant"
 SORT_RECENT = "Most Recent"
 SORT_OPTIONS = (SORT_RELEVANT, SORT_RECENT)
 
+# Conversational message / email sources. The 'mail:' Apple-Mail ingest was added
+# AFTER the retrieval logic, which historically only checked imsg:/m365:; treat
+# all three as "message/mail" so email discovery, recency, and scoring include
+# Apple Mail (otherwise e.g. an "email from Walmart" query drops all mail: rows).
+_MSG_MAIL_PREFIXES = ("imsg:", "m365:", "mail:")
+_MSG_MAIL_SQL = "(uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')"
+
 # Words that signal the user wants results ordered by date rather than relevance.
 # Replaces the old manual "Most Recent" radio — recency is inferred from the query.
 _RECENCY_TERMS = (
@@ -820,6 +827,33 @@ def _query_token_overlap(text: str, ql: str) -> int:
     return n
 
 
+# Generic discovery/source words that carry no entity meaning. Used to decide
+# whether a query names a specific thing ("walmart") vs. is a pure "show my
+# recent X" browse — which changes how Most Recent mode filters.
+_DISCOVERY_GENERIC = frozenset({
+    "email", "emails", "mail", "mails", "message", "messages", "text", "texts",
+    "msg", "msgs", "note", "notes", "doc", "docs", "document", "documents",
+    "photo", "photos", "pic", "pics", "picture", "pictures", "image", "images",
+    "find", "show", "list", "get", "see", "give", "recent", "recently", "latest",
+    "newest", "last", "mention", "mentions", "mentioning", "mentioned", "sent",
+    "send", "receive", "received", "about", "fashion", "thread", "threads",
+    "chat", "chats", "conversation", "file", "files", "anything", "everything",
+    # common browse residuals that would otherwise leak in as "entities"
+    "most", "more", "some", "please", "want", "need", "looking", "search",
+    "results", "result", "top", "regarding", "related", "any",
+})
+
+
+def _query_content_terms(ql: str) -> list[str]:
+    """Meaningful entity tokens in a query (drop stopwords + generic browse words)."""
+    out: list[str] = []
+    for tok in re.findall(r"[a-z0-9'.-]+", (ql or "").lower()):
+        if len(tok) < 3 or tok in _OVERLAP_STOP or tok in _DISCOVERY_GENERIC:
+            continue
+        out.append(tok)
+    return out
+
+
 _MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
@@ -961,7 +995,7 @@ def _merge_imessage_like_tokens(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
                   AND (
                     lower(ocr_text) LIKE ?
                     OR lower(vlm_text) LIKE ?
@@ -1110,7 +1144,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
                   AND (
                     ocr_text LIKE '%$%'
                     OR ocr_text LIKE '% chrge %'
@@ -1143,7 +1177,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%'
+                WHERE uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%'
                 ORDER BY date_iso DESC, ingested_at DESC
                 LIMIT ?
                 """,
@@ -1164,6 +1198,7 @@ def _retrieve_rows(
                 WHERE uuid NOT LIKE 'doc:%'
                   AND uuid NOT LIKE 'imsg:%'
                   AND uuid NOT LIKE 'm365:%'
+                  AND uuid NOT LIKE 'mail:%'
                 ORDER BY date_iso DESC, ingested_at DESC
                 LIMIT ?
                 """,
@@ -1241,7 +1276,7 @@ def _retrieve_rows(
             uid = str(r["uuid"] or "")
             is_imsg = uid.startswith("imsg:")
             is_m365 = uid.startswith("m365:")
-            is_chat_mail = is_imsg or is_m365
+            is_chat_mail = uid.startswith(_MSG_MAIL_PREFIXES)
             # bm25 rank (lower is better); fallback rows use 0
             rank = float(r["rank"]) if "rank" in r.keys() and r["rank"] is not None else 0.0
             text = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower()
@@ -1304,6 +1339,31 @@ def _retrieve_rows(
                 f"{month_year[0]:04d}-{month_year[1]:02d}" if month_year else None
             )
 
+            # If the query names a specific entity ("walmart"), keep only rows
+            # actually about it before date-sorting — otherwise the globally-recent
+            # candidate seed drowns out "most recent email from Walmart". Pure
+            # browse queries ("show my recent emails") have no content terms, so
+            # this filter is skipped and all recent rows are kept.
+            _content = _query_content_terms(ql)
+            if _content:
+                _pool = [
+                    (r, f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower())
+                    for r in rows
+                ]
+                # Anchor on the RAREST content term — the distinctive entity
+                # ("walmart"), not a common one ("order") — so multi-word queries
+                # don't dilute with rows that only match the generic word.
+                _counts = {t: sum(1 for _, txt in _pool if t in txt) for t in _content}
+                _present = {t: c for t, c in _counts.items() if c > 0}
+                if _present:
+                    _anchor = min(_present, key=_present.get)
+                    _kept = [
+                        r for r, txt in _pool
+                        if _anchor in txt or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
+                    ]
+                    if _kept:
+                        rows = _kept
+
             def recency_tuple(r: sqlite3.Row) -> tuple[str, str]:
                 return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
 
@@ -1317,17 +1377,10 @@ def _retrieve_rows(
 
             if msg_disc:
                 msgs_only = [
-                    r
-                    for r in rows
-                    if str(r["uuid"]).startswith("imsg:") or str(r["uuid"]).startswith("m365:")
+                    r for r in rows if str(r["uuid"]).startswith(_MSG_MAIL_PREFIXES)
                 ]
                 non_msg = [
-                    r
-                    for r in rows
-                    if not (
-                        str(r["uuid"]).startswith("imsg:")
-                        or str(r["uuid"]).startswith("m365:")
-                    )
+                    r for r in rows if not str(r["uuid"]).startswith(_MSG_MAIL_PREFIXES)
                 ]
                 msgs_only.sort(key=recency_tuple, reverse=True)
                 non_msg.sort(key=recency_tuple, reverse=True)
