@@ -36,6 +36,28 @@ export PHOTO_INDEX_RERANK="${PHOTO_INDEX_RERANK:-1}"
 
 ROUTE_FLAG="--no-auto-route"
 
+# Guard: the answer model MUST be loaded with a large context. LM Studio's
+# default JIT-load uses 4096, which silently truncates RAG prompts — the
+# overflow-shrink path then feeds the model a fraction of the records and it
+# confabulates amounts/merchants (took a long debug session to find). Reload
+# with 16384 whenever the loaded context is too small.
+LMS_BIN="${LMS_BIN:-$HOME/.lmstudio/bin/lms}"
+WANT_CTX=16384
+if [[ -x "$LMS_BIN" ]]; then
+  loaded_ctx=$("$LMS_BIN" ps 2>/dev/null | awk -v m="$PHOTO_INDEX_QA_MODEL" '$1==m {print $5}')
+  if [[ -n "${loaded_ctx:-}" && "$loaded_ctx" =~ ^[0-9]+$ && "$loaded_ctx" -lt "$WANT_CTX" ]]; then
+    echo "[start_search] $PHOTO_INDEX_QA_MODEL loaded with context=$loaded_ctx (<$WANT_CTX); reloading..."
+    "$LMS_BIN" unload "$PHOTO_INDEX_QA_MODEL" >/dev/null 2>&1 || true
+    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" >/dev/null 2>&1 \
+      && echo "[start_search] reloaded with context=$WANT_CTX" \
+      || echo "[start_search warn] could not reload model; answers may truncate records"
+  elif [[ -z "${loaded_ctx:-}" ]]; then
+    echo "[start_search] $PHOTO_INDEX_QA_MODEL not loaded; loading with context=$WANT_CTX..."
+    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" >/dev/null 2>&1 \
+      || echo "[start_search warn] could not load model via lms; LM Studio may JIT-load at 4096"
+  fi
+fi
+
 echo "[start_search] backend=$PHOTO_INDEX_LLM_BACKEND url=$PHOTO_INDEX_LLM_BASE_URL"
 echo "[start_search] answer model=$PHOTO_INDEX_QA_MODEL  rerank=$PHOTO_INDEX_RERANK"
 echo "[start_search] open http://127.0.0.1:7860 once Uvicorn reports running"

@@ -117,9 +117,14 @@ def _about_me_block() -> str:
     if not facts:
         return ""
     return (
-        "KNOWN FACTS ABOUT THE USER (persistent profile — always apply these, "
-        "even if the records below don't restate them):\n"
-        f"{facts}\n\n"
+        "KNOWN FACTS ABOUT THE USER (persistent profile — background context to "
+        "help you interpret the records):\n"
+        f"{facts}\n"
+        "IMPORTANT: these facts ADD context (who people/pets are, what nicknames "
+        "mean). They NEVER override, limit, or negate the indexed records: if the "
+        "records show a purchase, payment, or event, report it as evidence even "
+        "when a profile fact seems to point elsewhere. Records win over profile "
+        "facts whenever they appear to conflict.\n\n"
     )
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
@@ -255,7 +260,53 @@ def _build_prompt(
     field_char_cap: int | None = None,
     conversational: bool = False,
 ) -> str:
-    blocks = [row_to_prompt_block(r, field_char_cap=field_char_cap) for r in rows]
+    # For money questions, prefix each record with deterministic, regex-extracted
+    # key facts (source, date, dollar amounts). Long marketing emails bury the
+    # amounts after hundreds of chars of boilerplate, and models were misreading
+    # or inventing amounts/senders; this hands them clean signals to aggregate.
+    finance_headers = _is_finance_query(question)
+    blocks = []
+    for r in rows:
+        if finance_headers:
+            # Money questions get a COMPACT record: machine-extracted facts plus a
+            # short excerpt around each dollar amount, instead of the full noisy
+            # text. Long marketing emails bury amounts after hundreds of chars of
+            # boilerplate, and small models were misreading or inventing amounts /
+            # merchants when asked to aggregate across 15 full records.
+            raw = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or ""))
+            raw = re.sub(r"\s{3,}", "  ", raw)
+            fn = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["filename"] or ""))
+            uid = str(r["uuid"] or "")
+            # Mail rows pack "date | subject | sender [folder]" into filename —
+            # split into labeled fields so the model reliably attributes the
+            # MERCHANT/SENDER (it was misreading unlabeled pipes and assigning
+            # purchases to the wrong store).
+            parts = [p.strip() for p in fn.split("|")]
+            if uid.startswith(("mail:", "m365:")) and len(parts) >= 3:
+                sender = re.sub(r"\[[^\]]*\]\s*$", "", parts[2]).strip()
+                lines = ["RECORD (email):",
+                         f"  seller/sender: {sender[:90]}",
+                         f"  subject: {parts[1][:120]}"]
+            else:
+                lines = [f"RECORD: {fn[:160]}"]
+            lines.append(f"date: {str(r['date_iso'] or '')[:10] or 'unknown'}")
+            snippets: list[str] = []
+            for m in list(_MONEY_RE.finditer(raw))[:4]:
+                s = max(0, m.start() - 90)
+                snippets.append("…" + raw[s:m.end() + 60].strip() + "…")
+            if snippets:
+                lines.append("money mentions (verbatim excerpts):")
+                lines.extend(f"  - {s}" for s in snippets)
+            else:
+                lines.append("money mentions: NONE (no dollar amount in this record)")
+                lines.append(f"summary: {raw[:220]}")
+            blocks.append("\n".join(lines))
+        else:
+            block = row_to_prompt_block(r, field_char_cap=field_char_cap)
+            # Zero-width/preheader junk eats context — strip it.
+            block = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", block)
+            block = re.sub(r" {3,}", "  ", block)
+            blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
     about_me = _about_me_block()
     if conversational:
@@ -298,6 +349,10 @@ DATE SCOPE (critical — read before answering)
 {_LOCAL_INDEX_POLICY}
 {about_me}GROUND RULES
 - Use ONLY the indexed records below. Do NOT use outside / general knowledge.
+  EXCEPTION: you MAY use general knowledge to recognize what a product, brand,
+  or merchant IS (e.g. that "Full Moon Air Dried Chicken" is dog food, or that
+  a sender is a pet-supply store) — but NEVER to invent transactions, amounts,
+  dates, or events that are not in the records.
 - Quote exact dollar amounts and dates from the records when relevant.
 {cite_rule}
 {month_scope}{style_block}
@@ -330,6 +385,10 @@ User question: {question}
 {about_me}STRICT RULES
 - Use ONLY the indexed records below. Do not use outside / general knowledge.
   Do not summarize what a product or company is in general.
+  EXCEPTION: you MAY use general knowledge to recognize what a product, brand,
+  or merchant IS (e.g. that "Full Moon Air Dried Chicken" is dog food, or that
+  a sender is a pet-supply store) — but NEVER to invent transactions, amounts,
+  dates, or events that are not in the records.
 - For money / price / payment / charge / subscription questions, quote the exact
   dollar amount and date(s) directly from the records.
 {cite_rule}
@@ -550,7 +609,9 @@ def _chat_system_prompt(context: str) -> str:
         f"{_about_me_block()}"
         "GROUND RULES\n"
         "- Use ONLY the indexed records below plus what has already been said in "
-        "this conversation. Do not use outside general knowledge.\n"
+        "this conversation. Do not use outside general knowledge — EXCEPT to "
+        "recognize what a product, brand, or merchant IS (never to invent "
+        "transactions, amounts, dates, or events not in the records).\n"
         "- Answer in a natural, conversational tone; refer to sources in-sentence "
         "and never paste raw uuids or filenames.\n"
         "- If the user asks for something the records and prior turns don't "
@@ -798,7 +859,10 @@ def _is_transaction_row(r: sqlite3.Row) -> bool:
     so articles, summaries, and tax worksheets don't leak into a spending tally."""
     uid = str(r["uuid"] or "")
     blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-    if uid.startswith(("imsg:", "m365:")):
+    # mail: (Apple Mail) belongs with the message-like sources — receipts and
+    # charge alerts arrive there. It was omitted (ingest postdates this code),
+    # which silently dropped ALL email receipts from strict finance retrieval.
+    if uid.startswith(_MSG_MAIL_PREFIXES):
         return _is_transaction_text(blob)
     if not _is_bank_source(blob):
         return False
@@ -844,14 +908,60 @@ _DISCOVERY_GENERIC = frozenset({
 })
 
 
+# Finance verbs / time words are query mechanics, not entities — anchoring on
+# "paying" or "2026" selects the wrong rows entirely.
+_CONTENT_TERM_SKIP = frozenset({
+    "pay", "pays", "paying", "paid", "payment", "payments", "spend", "spending",
+    "spent", "charge", "charged", "charges", "cost", "costs", "bill", "bills",
+    "billing", "fee", "fees", "subscription", "subscriptions", "owe", "due",
+    "price", "prices", "amount", "amounts", "money", "total", "sum",
+    "month", "months", "monthly", "week", "weeks", "weekly", "year", "years",
+    "yearly", "annual", "day", "days", "daily", "each", "every", "per",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    # auxiliaries/fillers — "been" anchored on Apple Card texts ("has been
+    # scheduled") and fed the model the wrong rows entirely
+    "been", "being", "will", "would", "could", "should", "shall", "might",
+    "must", "into", "onto", "over", "under", "there", "their", "them", "then",
+    "than", "when", "where", "which", "while", "who", "whom", "whose",
+})
+
+
 def _query_content_terms(ql: str) -> list[str]:
     """Meaningful entity tokens in a query (drop stopwords + generic browse words)."""
     out: list[str] = []
     for tok in re.findall(r"[a-z0-9'.-]+", (ql or "").lower()):
         if len(tok) < 3 or tok in _OVERLAP_STOP or tok in _DISCOVERY_GENERIC:
             continue
+        if tok in _CONTENT_TERM_SKIP or tok.isdigit():
+            continue
         out.append(tok)
     return out
+
+
+def _entity_focus_rows(question: str, rows: list) -> list:
+    """Rows matching the query's rarest content term (the distinctive entity).
+
+    Small models answer money questions correctly when given ONLY the relevant
+    records, but misattribute merchants/amounts when 3 relevant rows sit among
+    12 unrelated ones. Used to focus the LLM prompt for finance queries; the
+    on-screen hit list keeps the full row set. Falls back to all rows when the
+    query has no content terms or nothing matches."""
+    ql = " ".join((question or "").lower().split())
+    terms = _query_content_terms(ql)
+    if not terms:
+        return rows
+    pool = [
+        (r, f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower())
+        for r in rows
+    ]
+    counts = {t: sum(1 for _, txt in pool if t in txt) for t in terms}
+    present = {t: c for t, c in counts.items() if c > 0}
+    if not present:
+        return rows
+    anchor = min(present, key=present.get)
+    kept = [r for r, txt in pool if anchor in txt]
+    return kept or rows
 
 
 _MONTHS = {
@@ -1628,7 +1738,7 @@ def answer_question(
     auto_route: bool,
     auto_correct: bool,
     sort_by: str = SORT_RELEVANT,
-    restrict_finance: bool = True,
+    restrict_finance: bool = False,  # match the UI default (all sources)
     conversational: bool = True,
 ) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
     q = (question or "").strip()
@@ -1731,9 +1841,15 @@ def answer_question(
             first_model = qa_model
             route = "large_default"
 
+    # Money questions: focus the LLM on the entity-matching rows only (e.g. just
+    # the Walmart records for "dog food at walmart"). Verified: the model answers
+    # these correctly in isolation but misattributes merchants/amounts when the
+    # relevant rows sit among unrelated ones. Hit list below still shows all rows.
+    prompt_rows = _entity_focus_rows(effective_query, rows) if _is_finance_query(q) else rows
+
     prompt = _build_prompt(
         effective_query,
-        rows,
+        prompt_rows,
         aggregate=aggregate_mode,
         scope_month=scoped_my,
         field_char_cap=_prompt_field_cap_for_model(first_model),
@@ -1792,7 +1908,7 @@ def answer_question(
     # Stash the retrieved records + this Q/A so follow-up chat can continue
     # without re-retrieving. Same field cap as the answer prompt used.
     cap = _prompt_field_cap_for_model(first_model)
-    context_block = "\n\n---\n\n".join(row_to_prompt_block(r, field_char_cap=cap) for r in rows)
+    context_block = "\n\n---\n\n".join(row_to_prompt_block(r, field_char_cap=cap) for r in prompt_rows)
     _set_last_convo(context_block, effective_query, answer)
 
     cache[key] = {

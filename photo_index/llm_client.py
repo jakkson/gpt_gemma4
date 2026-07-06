@@ -122,7 +122,10 @@ def chat_completion_text(
         response = chat(
             model=model,
             messages=messages,
-            options={"num_ctx": num_ctx},
+            options={
+                "num_ctx": num_ctx,
+                "temperature": float(os.environ.get("PHOTO_INDEX_LLM_TEMPERATURE", "0.2")),
+            },
         )
         return (response.message.content or "").strip()
     if backend in ("openai", "lmstudio", "llama.cpp", "llamacpp"):
@@ -464,6 +467,9 @@ def _openai_compatible_chat(
         "messages": messages,
         "stream": stream,
         "max_tokens": max_tokens,
+        # Grounded RAG answers must quote records verbatim; the server-side
+        # default (~0.8) makes 4-bit models invent dates/amounts/merchants.
+        "temperature": float(os.environ.get("PHOTO_INDEX_LLM_TEMPERATURE", "0.2")),
     }
     if stream:
         text = _openai_compatible_chat_stream(url=url, payload=payload, timeout=timeout)
