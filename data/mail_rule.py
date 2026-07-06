@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 ACCT = os.environ.get("PHOTO_MAIL_RULE_ACCOUNT", "Exchange")
 FOLDER = os.environ.get("PHOTO_MAIL_RULE_FOLDER", "Inbox")
@@ -250,6 +251,80 @@ end timeout'''
         return 0
 
 
+# --- Sender -> folder routing (data/mail_routes.json) -------------------------
+#
+# {"sender@example.com": "Folder Name", "@somedomain.com": "Other Folder"}
+# Matched case-insensitively as a substring of the full sender field (display
+# name + address), so bare domains work. Messages are MOVED (not trashed) to the
+# named mailbox of the same account. Fed by the Mail Rule Dropper app; enforced
+# continuously by a per-minute launchd job (mail_rule.py route).
+
+_ROUTES_DEFAULT = str(Path(__file__).resolve().parent / "mail_routes.json")
+
+
+def load_routes(path: str) -> dict:
+    import json
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {str(k).strip().lower(): str(v).strip()
+                for k, v in obj.items() if str(k).strip() and str(v).strip()}
+    except (OSError, ValueError):
+        return {}
+
+
+def _move_ids(ids: list[str], folder: str) -> int:
+    """Move messages by id from Inbox to `folder` (same account). Returns moved."""
+    if not ids:
+        return 0
+    acct = as_quote(ACCT)
+    src = as_quote(FOLDER)
+    dst = as_quote(folder)
+    id_literal = "{" + ", ".join(str(int(i)) for i in ids) + "}"
+    script = f'''with timeout of 1800 seconds
+tell application "Mail"
+  set acct to first account whose name is "{acct}"
+  set mb to (first mailbox of acct whose name is "{src}")
+  set target to (first mailbox of acct whose name is "{dst}")
+  set movedCount to 0
+  repeat with theID in {id_literal}
+    try
+      move (first message of mb whose id is theID) to target
+      set movedCount to movedCount + 1
+    end try
+  end repeat
+  return movedCount as string
+end tell
+end timeout'''
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    try:
+        return int((p.stdout or "0").strip())
+    except ValueError:
+        return 0
+
+
+def run_routes(routes_path: str, mode: str, recent_offset: int | None = None):
+    """Apply sender->folder routes to Inbox. Returns (routes, per_folder, dt, ok)."""
+    routes = load_routes(routes_path)
+    t0 = time.time()
+    if not routes:
+        return routes, {}, time.time() - t0, True
+    rows, ok = _fetch_unread_sender_subject(None, recent_offset)
+    plan: dict[str, list[str]] = {}   # folder -> [msg ids]
+    for mid, sender, _subject in rows:
+        s = (sender or "").lower()
+        for needle, folder in routes.items():
+            if needle in s:
+                plan.setdefault(folder, []).append(mid)
+                break
+    per_folder: dict[str, int] = {}
+    for folder, ids in plan.items():
+        if mode == "route":
+            per_folder[folder] = _move_ids(ids, folder)
+        else:  # route-count (dry run)
+            per_folder[folder] = len(ids)
+    return routes, per_folder, time.time() - t0, ok
+
+
 def run_keyword_file(path: str, mode: str, list_subjects: bool,
                      since_offset: int | None = None, recent_offset: int | None = None):
     keywords = load_keywords(path)
@@ -267,9 +342,12 @@ def run_keyword_file(path: str, mode: str, list_subjects: bool,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=["count", "delete"], help="count = dry run; delete = move to Trash")
+    ap.add_argument("mode", choices=["count", "delete", "route", "route-count"],
+                    help="count/delete = keyword trash rules; route/route-count = sender->folder moves")
     ap.add_argument("--keyword", default=DEFAULT_KEYWORD, help=f"single keyword vs subject/body (default: {DEFAULT_KEYWORD!r})")
     ap.add_argument("--keyword-file", help="file of keywords matched (space/punct-insensitive) vs SENDER or SUBJECT only")
+    ap.add_argument("--routes-file", default=_ROUTES_DEFAULT,
+                    help="sender->folder JSON for route modes (default: data/mail_routes.json)")
     ap.add_argument("--since-file", help="watermark file for incremental scans (only unread mail received since last run)")
     ap.add_argument("--recent-minutes", type=int, default=0,
                     help="also catch mail received in the last N minutes even if already READ (0=off)")
@@ -278,6 +356,18 @@ def main():
 
     since_offset, now = _since_offset_seconds(args.since_file)
     recent_offset = args.recent_minutes * 60 if args.recent_minutes and args.recent_minutes > 0 else None
+
+    # Sender -> folder routing path.
+    if args.mode in ("route", "route-count"):
+        routes, per_folder, dt, ok = run_routes(args.routes_file, args.mode, recent_offset)
+        verb = "moved" if args.mode == "route" else "would move"
+        print(f"[mail_rule] account={ACCT} folder={FOLDER} routes-file={args.routes_file} "
+              f"({len(routes)} routes)  ({dt:.0f}s)")
+        if not per_folder:
+            print(f"[mail_rule] 0 message(s) {verb}.")
+        for folder, n in sorted(per_folder.items()):
+            print(f"[mail_rule] {n} message(s) {verb} -> {folder}")
+        return
     # The incremental floor must not clip the recent window: widen it if needed so
     # read-but-recent mail is still fetched.
     if since_offset is not None and recent_offset is not None:
