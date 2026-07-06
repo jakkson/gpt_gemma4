@@ -2677,11 +2677,34 @@ def _spawn_open_default_app(path: Path) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-# Per-run CSRF token for /open-local-file. Without it, any web page the user
-# visits could fire a simple GET at 127.0.0.1:7860 (no CORS preflight applies)
-# and make this process `open` arbitrary local files. The token is embedded in
-# the served page's links, so only our own UI can construct valid requests.
-_OPEN_LOCAL_FILE_TOKEN = secrets.token_urlsafe(16)
+# CSRF token for /open-local-file. Without it, any web page the user visits
+# could fire a simple GET at 127.0.0.1:7860 (no CORS preflight applies) and
+# make this process `open` arbitrary local files. The token is embedded in the
+# served page's links, so only our own UI can construct valid requests.
+# Persisted to disk so server restarts don't invalidate links already rendered
+# in open browser tabs (a per-run token 403'd every on-screen link after each
+# restart). Still secret from other origins — that's all CSRF needs.
+
+
+def _load_or_create_open_token() -> str:
+    tok_path = Path(__file__).resolve().parent.parent / "data" / ".open_local_file_token"
+    try:
+        tok = tok_path.read_text(encoding="utf-8").strip()
+        if len(tok) >= 16:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(16)
+    try:
+        tok_path.parent.mkdir(parents=True, exist_ok=True)
+        tok_path.write_text(tok, encoding="utf-8")
+        os.chmod(tok_path, 0o600)
+    except OSError:
+        pass  # fall back to per-run token if data/ is unwritable
+    return tok
+
+
+_OPEN_LOCAL_FILE_TOKEN = _load_or_create_open_token()
 # Set in main(); used to verify requested paths are actually indexed files.
 _OPEN_LOCAL_FILE_DB: Path | None = None
 
