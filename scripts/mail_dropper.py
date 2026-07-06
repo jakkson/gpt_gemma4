@@ -36,10 +36,44 @@ PYTHON = REPO / ".venv" / "bin" / "python"
 ACCT = "Exchange"
 
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
     _DND = True
 except Exception:  # app still works via the "grab selected" button
     _DND = False
+
+
+def sender_from_message_url(url: str) -> tuple[str, str] | None:
+    """Resolve a dragged Apple Mail 'message://<id>' URL to (address, name)
+    via the Envelope Index — fast, and avoids poking Mail's scripting."""
+    import sqlite3
+    import urllib.parse
+
+    m = re.search(r"message:/*(.+)$", url.strip())
+    if not m:
+        return None
+    mid = urllib.parse.unquote(m.group(1)).strip().strip("/")
+    if not mid:
+        return None
+    if not mid.startswith("<"):
+        mid = f"<{mid}>"
+    db = Path.home() / "Library/Mail/V10/MailData/Envelope Index"
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT a.address, a.comment FROM messages m "
+                "JOIN message_global_data g ON g.message_id = m.message_id "
+                "JOIN addresses a ON a.ROWID = m.sender "
+                "WHERE g.message_id_header = ? LIMIT 1",
+                (mid,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return (str(row[0] or "").strip(), str(row[1] or "").strip())
 
 
 # --- sender extraction ---------------------------------------------------------
@@ -165,13 +199,21 @@ class DropperApp:
             value=("Drop an email here, or use the button below."
                    if _DND else "Drag-drop unavailable — use the button below."))
 
-        drop = tk.Label(root, text="📥  Drop email here\n(drag from Mail or a .eml/.emlx file)",
-                        relief="ridge", bd=2, height=5,
+        drop = tk.Label(root, text="📥  Drag an email here\n(from Mail, or a .eml/.emlx file)",
+                        relief="ridge", bd=2, height=5, bg="#eef2ff",
                         font=("Helvetica", 15))
         drop.pack(fill="x", padx=14, pady=(14, 6))
+        self._drop = drop
         if _DND:
-            drop.drop_target_register(DND_FILES)
+            # Register BOTH files and text/URLs: Mail delivers a message:// URL
+            # (as text/URL), not a real file, so DND_FILES alone catches nothing.
+            try:
+                drop.drop_target_register(DND_FILES, DND_TEXT)
+            except tk.TclError:
+                drop.drop_target_register(DND_FILES)
             drop.dnd_bind("<<Drop>>", self.on_drop)
+            drop.dnd_bind("<<DropEnter>>", lambda e: (drop.config(bg="#c7d2fe"), e.action))
+            drop.dnd_bind("<<DropLeave>>", lambda e: drop.config(bg="#eef2ff"))
 
         tk.Button(root, text="Grab sender from email selected in Mail",
                   command=self.on_grab).pack(pady=4)
@@ -207,23 +249,50 @@ class DropperApp:
             self.root.after(0, lambda: self.status.set(f"Folder list failed: {e}"))
 
     def on_drop(self, event):
-        # tkdnd delivers paths brace-wrapped when they contain spaces.
-        paths = re.findall(r"\{([^}]+)\}|(\S+)", event.data or "")
-        for brace, bare in paths:
-            p = Path(brace or bare)
+        if self._drop is not None:
+            self._drop.config(bg="#eef2ff")
+        data = (event.data or "").strip()
+        # tkdnd brace-wraps items containing spaces; split into tokens.
+        tokens = [b or s for b, s in re.findall(r"\{([^}]*)\}|(\S+)", data)]
+
+        # 1) message:// URL dragged from Apple Mail -> resolve via Envelope Index
+        for tok in tokens:
+            if tok.lower().startswith("message:"):
+                got = sender_from_message_url(tok)
+                if got and got[0]:
+                    self._set_sender(*got, how="dragged from Mail")
+                    return
+                self.status.set("Dragged a Mail message, but its sender wasn't in "
+                                "the local index. Try the Grab button instead.")
+                return
+
+        # 2) a real .eml/.emlx file (dragged from Finder)
+        for tok in tokens:
+            p = Path(tok)
             if p.suffix.lower() in (".eml", ".emlx") and p.exists():
                 try:
                     addr, name = sender_from_message_file(p)
-                    self.addr.set(f"{addr}" + (f"   ({name})" if name else ""))
-                    self._addr = addr
-                    self.status.set("Sender captured — choose the rule and Apply.")
+                    self._set_sender(addr, name, how=f"from {p.name}")
                     return
                 except Exception as e:
                     self.status.set(f"Could not read {p.name}: {e}")
                     return
-        self.status.set("That didn't look like an email file. Tip: drag from Mail "
-                        "to the Desktop first if a direct drop doesn't land, or "
-                        "use the Grab button.")
+
+        # 3) a bare email address as text
+        m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", data)
+        if m:
+            self._set_sender(m.group(0), "", how="from dropped text")
+            return
+
+        # nothing recognized — show the raw payload so we can debug
+        self.status.set("Couldn't read that drop. Use the Grab button, or tell "
+                        f"me what this shows: {data[:120]!r}")
+
+    def _set_sender(self, addr: str, name: str, how: str = ""):
+        addr = (addr or "").strip()
+        self._addr = addr
+        self.addr.set(addr + (f"   ({name})" if name else ""))
+        self.status.set(f"Sender captured {how} — choose a rule and Apply.".strip())
 
     def on_grab(self):
         try:

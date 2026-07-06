@@ -21,3 +21,4 @@ data/about_me.md
 data/query_log.jsonl
 data/.open_local_file_token
 data/mail_routes.json
+data/mail_dropper.log
