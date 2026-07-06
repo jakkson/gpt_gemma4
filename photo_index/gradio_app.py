@@ -246,6 +246,10 @@ _LOCAL_INDEX_POLICY = """LOCAL PRIVATE INDEX (READ FIRST)
   it is reading back text from their own documents.
 - NEVER refuse with "I cannot access medical records", "I'm a chatbot without your health data", or
   "contact your doctor" if the indexed records below actually contain the answer.
+- MATCH THE SPECIES: newsletters about HUMAN nutrition/health (Dr. Weil, Consumer Reports,
+  news digests, etc.) are NOT evidence about pet/dog nutrition or pet food — do not use them
+  to evaluate a pet's diet or recipe unless the question is about people. If the records lack
+  pet-specific guidance, say so instead of substituting human-nutrition content.
 - You MUST still avoid inventing facts not present in the records.
 
 """
