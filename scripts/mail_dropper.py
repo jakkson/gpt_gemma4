@@ -115,14 +115,14 @@ end tell'''
 
 _ENVELOPE_DB = Path.home() / "Library/Mail/V10/MailData/Envelope Index"
 _ACCT_UUID = "B3D3A9D3"  # Exchange (jack@jackpoorman.com)
+_FOLDER_CACHE = DATA / ".mail_folders_cache.json"
+_FOLDER_SKIP = {"inbox", "sent items", "sent messages", "drafts", "outbox",
+                "deleted items", "deleted messages", "junk", "junk email",
+                "bulk mail", "conversation history", "sync issues", "recovered messages"}
 
 
-def list_account_folders() -> list[str]:
-    """Names of mailboxes on the account, for the folder dropdown.
-
-    Read from Mail's Envelope Index (SQLite, read-only) instead of AppleScript:
-    Mail's scripting interface stalls for minutes while it syncs / is driven by
-    the per-minute rule jobs, but the index is always instantly readable."""
+def _folders_from_index() -> list[str]:
+    """Fast path via Mail's Envelope Index — needs Full Disk Access."""
     import sqlite3
     import urllib.parse
 
@@ -133,15 +133,52 @@ def list_account_folders() -> list[str]:
         ).fetchall()
     finally:
         conn.close()
-    skip = {"inbox", "sent items", "sent messages", "drafts", "outbox",
-            "deleted items", "deleted messages", "junk", "junk email",
-            "bulk mail", "archive", "conversation history", "sync issues"}
     names = set()
     for (url,) in rows:
         leaf = urllib.parse.unquote(re.sub(r".*/", "", url or "")).strip()
-        if leaf and leaf.lower() not in skip:
+        if leaf and leaf.lower() not in _FOLDER_SKIP:
             names.add(leaf)
     return sorted(names, key=str.lower)
+
+
+def _folders_from_applescript() -> list[str]:
+    """Automation path — works without Full Disk Access (app already has
+    Automation permission from the Grab button)."""
+    script = f'''tell application "Mail"
+  set nms to name of every mailbox of (first account whose name is "{ACCT}")
+  set {{tid, AppleScript's text item delimiters}} to {{AppleScript's text item delimiters, "\\n"}}
+  set out to nms as string
+  set AppleScript's text item delimiters to tid
+  return out
+end tell'''
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=90)
+    names = {n.strip() for n in (p.stdout or "").splitlines() if n.strip()}
+    return sorted((n for n in names if n.lower() not in _FOLDER_SKIP), key=str.lower)
+
+
+def load_folder_cache() -> list[str]:
+    try:
+        return list(json.loads(_FOLDER_CACHE.read_text(encoding="utf-8")))
+    except Exception:
+        return []
+
+
+def list_account_folders() -> list[str]:
+    """Folder names for the dropdown. Try the fast index (FDA), then AppleScript
+    (Automation, no FDA needed), then the on-disk cache. Cache any live success
+    so future launches are instant."""
+    for fn in (_folders_from_index, _folders_from_applescript):
+        try:
+            folders = fn()
+        except Exception:
+            folders = []
+        if folders:
+            try:
+                _FOLDER_CACHE.write_text(json.dumps(folders), encoding="utf-8")
+            except OSError:
+                pass
+            return folders
+    return load_folder_cache()
 
 
 # --- rule persistence ----------------------------------------------------------
@@ -231,8 +268,13 @@ class DropperApp:
         row = tk.Frame(af); row.pack(anchor="w", fill="x")
         tk.Radiobutton(row, text="File into folder:", variable=self.action,
                        value="folder").pack(side="left")
-        self.folder_box = ttk.Combobox(row, values=["(loading folders…)"], width=30)
+        self.folder_box = ttk.Combobox(row, values=[], width=30)
         self.folder_box.pack(side="left", padx=6)
+        cached = load_folder_cache()
+        if cached:
+            self.folder_box.configure(values=cached)   # instant from cache
+        else:
+            self.folder_box.set("loading…")
 
         tk.Button(root, text="✅  Apply rule", font=("Helvetica", 13, "bold"),
                   command=self.on_apply).pack(pady=8)
@@ -242,11 +284,21 @@ class DropperApp:
         threading.Thread(target=self._load_folders, daemon=True).start()
 
     def _load_folders(self):
-        try:
-            folders = list_account_folders()
-            self.root.after(0, lambda: self.folder_box.configure(values=folders))
-        except Exception as e:
-            self.root.after(0, lambda: self.status.set(f"Folder list failed: {e}"))
+        folders = list_account_folders()
+
+        def _apply():
+            if folders:
+                cur = self.folder_box.get()
+                self.folder_box.configure(values=folders)
+                if cur == "loading…":
+                    self.folder_box.set("")
+            elif not load_folder_cache():
+                self.folder_box.set("")
+                self.status.set("Couldn't list folders. Trash rules still work. "
+                                "For folder filing, grant this app Full Disk Access "
+                                "(System Settings ▸ Privacy & Security), or make sure "
+                                "Mail is open.")
+        self.root.after(0, _apply)
 
     def on_drop(self, event):
         if self._drop is not None:
