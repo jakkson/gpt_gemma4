@@ -293,6 +293,57 @@ def extract_rtf(path: Path) -> str:
     return rtf_to_text(txt)
 
 
+def extract_epub(path: Path) -> str:
+    """EPUB = a zip of XHTML chapters. Stdlib-only: read the OPF spine for the
+    author's chapter order (fallback: name-sorted), strip HTML to plain text
+    with the same stripper the mail ingest uses."""
+    import posixpath
+    import urllib.parse
+    import zipfile
+
+    from photo_index.mail_ingest import _strip_html
+
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        html_names = [n for n in names if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        ordered: list[str] | None = None
+        opf = next((n for n in names if n.lower().endswith(".opf")), None)
+        if opf:
+            try:
+                opf_xml = z.read(opf).decode("utf-8", "replace")
+                manifest = dict(
+                    re.findall(r'<item\b[^>]*\bid="([^"]+)"[^>]*\bhref="([^"]+)"', opf_xml)
+                )
+                # Some OPFs put href before id.
+                for href, iid in re.findall(
+                    r'<item\b[^>]*\bhref="([^"]+)"[^>]*\bid="([^"]+)"', opf_xml
+                ):
+                    manifest.setdefault(iid, href)
+                spine = re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"', opf_xml)
+                base = posixpath.dirname(opf)
+                cand = []
+                for iid in spine:
+                    href = manifest.get(iid)
+                    if not href:
+                        continue
+                    p = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href)))
+                    if p in names:
+                        cand.append(p)
+                if cand:
+                    ordered = cand
+            except Exception:
+                ordered = None
+        parts: list[str] = []
+        for n in (ordered or sorted(html_names))[:500]:
+            try:
+                t = _strip_html(z.read(n).decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if t:
+                parts.append(t)
+    return "\n\n".join(parts)
+
+
 def extract_textutil(path: Path) -> str | None:
     """macOS `textutil` converts legacy Word / Pages / RTF / HTML and more."""
     try:
@@ -326,6 +377,8 @@ def extract_auto(path: Path, ext: str) -> tuple[str | None, str, str | None]:
             return extract_xlsx(path), "openpyxl", None
         if ext == ".xls":
             return extract_xls(path), "xlrd", None
+        if ext == ".epub":
+            return extract_epub(path), "epub-zip", None
         if ext == ".rtf":
             try:
                 return extract_rtf(path), "striprtf", None
