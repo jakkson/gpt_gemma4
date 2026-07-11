@@ -756,6 +756,20 @@ def _wants_recency(question: str) -> bool:
     q = " ".join((question or "").strip().lower().split())
     return any(t in q for t in _RECENCY_TERMS)
 
+
+# Words that ask about the FUTURE ("my next trip", "upcoming flight"). These
+# should order results future-first (soonest upcoming, then most-recent past),
+# instead of plain newest-received — so "when's my next X" finds the real one.
+_FUTURE_TERMS = (
+    "upcoming", "coming up", "next ", "future", "scheduled", "soon",
+    "this weekend", "next week", "next month", "days away", "yet to come",
+)
+
+
+def _wants_future(question: str) -> bool:
+    q = " " + " ".join((question or "").strip().lower().split()) + " "
+    return any(t in q for t in _FUTURE_TERMS)
+
 _BANK_ISSUERS = (
     "capital one", "chase", "wells fargo", "amex", "american express",
     "bank of america", "citi", "citibank", "discover", "venmo", "paypal",
@@ -1356,6 +1370,10 @@ def _retrieve_rows(
                 ]
 
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
+        # "upcoming/next": lift future-dated rows within the relevance ranking
+        # (not a pure date sort) so the nearest upcoming *relevant* item wins.
+        wants_future = _wants_future(question)
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
         # Cross-encoder rerank (relevance mode only): re-score the surviving
         # candidates by reading each (question, row) pair jointly, then blend the
@@ -1441,6 +1459,10 @@ def _retrieve_rows(
             entity_bonus += sem_scores.get(uid, 0.0) * _SEMANTIC_WEIGHT
             # Cross-encoder rerank: highest-precision relevance signal when present.
             entity_bonus += rerank_map.get(uid, 0.0) * _RERANK_WEIGHT
+            # "upcoming/next" queries: reward rows dated today-or-later so the
+            # nearest upcoming item outranks equally-relevant past ones.
+            if wants_future and str(r["date_iso"] or "")[:10] >= today_str:
+                entity_bonus += 12.0
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
             # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
@@ -1749,8 +1771,9 @@ def answer_question(
     if not q:
         return "Enter a question to search your photo index.", [], "Last search: n/a", "No hits yet.", [], []
 
-    # Recency is inferred from the question (no manual sort control): date-order
-    # when the user clearly asks for recent/latest, relevance-order otherwise.
+    # Recency is inferred from the question: date-order for recent/latest.
+    # "upcoming/next" stays on RELEVANCE (a future-date bonus in _retrieve_rows
+    # lifts upcoming items) so vague future queries don't collapse to newest-noise.
     sort_by = SORT_RECENT if _wants_recency(q) else SORT_RELEVANT
     t0 = time.perf_counter()
     now = time.time()
