@@ -170,7 +170,12 @@ def _should_skip_unchanged(
 ) -> bool:
     if force:
         return False
-    row = conn.execute("SELECT vlm_text FROM photo_meta WHERE uuid = ?", (uuid,)).fetchone()
+    # A file is either one row (uuid) or many chunk rows (uuid#0, uuid#1, …);
+    # check either representation for the unchanged mtime/size stamp.
+    row = conn.execute(
+        "SELECT vlm_text FROM photo_meta WHERE uuid IN (?, ?) LIMIT 1",
+        (uuid, f"{uuid}#0"),
+    ).fetchone()
     if row is None:
         return False
     blob = row[0] or ""
@@ -178,6 +183,46 @@ def _should_skip_unchanged(
     if not m:
         return False
     return int(m.group(1)) == mtime_ns and int(m.group(2)) == size
+
+
+# --- Chunking large documents (books, long PDFs) -----------------------------
+#
+# A whole book stored as ONE row is useless for RAG: the prompt only shows a
+# small slice per record, so the model sees page 1 and nothing else. Split long
+# text into overlapping passages, each its own indexed+embedded row, so the
+# retriever can surface the RELEVANT passage and the model reads it in full.
+_CHUNK_MIN_CHARS = 6_000     # below this: keep as a single row
+_CHUNK_SIZE = 1_800          # target chars per chunk (fits the prompt field cap)
+_CHUNK_OVERLAP = 250         # carry-over tail for cross-boundary context
+_CHUNK_MAX = 600             # safety cap on chunks per file (very large books)
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split into ~_CHUNK_SIZE passages on paragraph boundaries, with overlap."""
+    text = text.strip()
+    if len(text) <= _CHUNK_MIN_CHARS:
+        return [text]
+    paras = re.split(r"\n\s*\n", text)
+    chunks: list[str] = []
+    cur = ""
+    for p in paras:
+        p = p.strip()
+        if not p:
+            continue
+        if cur and len(cur) + len(p) + 2 > _CHUNK_SIZE:
+            chunks.append(cur)
+            cur = cur[-_CHUNK_OVERLAP:] + "\n\n" + p  # overlap tail for context
+        else:
+            cur = (cur + "\n\n" + p) if cur else p
+        # A single paragraph larger than the target gets hard-split.
+        while len(cur) > _CHUNK_SIZE * 1.6:
+            chunks.append(cur[:_CHUNK_SIZE])
+            cur = cur[_CHUNK_SIZE - _CHUNK_OVERLAP:]
+        if len(chunks) >= _CHUNK_MAX:
+            break
+    if cur.strip() and len(chunks) < _CHUNK_MAX:
+        chunks.append(cur)
+    return chunks[:_CHUNK_MAX]
 
 
 _TEXT_EXT = frozenset(
@@ -634,7 +679,11 @@ def run_documents_ingest(
                     empty_overflow += 1
             continue
 
-        blob = _truncate(text_raw.strip(), max_chars_per_file)
+        # Chunk long docs into passages; short files stay a single row. Cap the
+        # total per file so a pathological doc can't explode the index.
+        chunks = _chunk_text(text_raw.strip())
+        if len(chunks) == 1:
+            chunks = [_truncate(chunks[0], max_chars_per_file)]
 
         mt = getattr(st, "st_mtime", 0)
         iso = None
@@ -645,23 +694,40 @@ def run_documents_ingest(
         meta = _meta_line(mtime_ns, size_i, rel, root_display)
         how_line = f"extractor={how}"
 
+        # Clean slate for this file: remove any prior rows (a former single-row
+        # book becoming chunks, or a changed chunk count) before writing.
         try:
-            upsert_photo(
-                conn,
-                uuid=uuid,
-                filename=rel,
-                date_iso=iso,
-                ocr_text=blob,
-                vlm_text=f"{meta}\n{how_line}",
-                image_path_used=str(path),
-                commit=False,
+            conn.execute(
+                "DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
+                (uuid, uuid + "#%"),
             )
+        except Exception:
+            pass
+
+        n = len(chunks)
+        wrote = 0
+        for i, chunk in enumerate(chunks):
+            cu = uuid if n == 1 else f"{uuid}#{i}"
+            fn = rel if n == 1 else f"{rel} [part {i + 1}/{n}]"
+            try:
+                upsert_photo(
+                    conn,
+                    uuid=cu,
+                    filename=fn,
+                    date_iso=iso,
+                    ocr_text=chunk,
+                    vlm_text=f"{meta}\n{how_line}",
+                    image_path_used=str(path),
+                    commit=False,
+                )
+                wrote += 1
+            except Exception as e:
+                errors += 1
+                _log(f"[documents warn] {path} chunk {i + 1}/{n}: {e}")
+        if wrote:
             indexed += 1
             if commit_every <= 1 or indexed % commit_every == 0:
                 commit_ingest(conn)
-        except Exception as e:
-            errors += 1
-            _log(f"[documents warn] {path}: {e}")
 
     commit_ingest(conn)
     _maybe_checkpoint(finished=True)
