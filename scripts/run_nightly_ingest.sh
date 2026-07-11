@@ -39,6 +39,18 @@ fi
 rc=0
 "$PYTHON_BIN" "${ARGS[@]}" || rc=$?
 
+# Offline library (books etc.): a local-only folder that Dropbox/iCloud never
+# turn into online-only placeholders, so files are always readable. Same
+# documents_ingest (text extract) — epub/pdf/docx/txt. Runs before embed so new
+# books are searchable that night.
+BOOKS_ROOT="${PHOTO_INDEX_BOOKS_ROOT:-$HOME/LLM_Books}"
+if [[ -d "$BOOKS_ROOT" ]]; then
+  echo "[nightly] ingesting offline library: $BOOKS_ROOT"
+  "$PYTHON_BIN" -m photo_index.documents_ingest \
+    --db "$ROOT/data/photo_index.sqlite" --root "$BOOKS_ROOT" --progress-every 50 \
+    || echo "[nightly warn] library ingest failed"
+fi
+
 # Embed any rows the ingest just added — otherwise new content is invisible to
 # semantic search until someone runs embed_index by hand. Requires LM Studio
 # (:1234) for the nomic model; a failure here must not mask the ingest result.
