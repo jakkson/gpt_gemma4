@@ -114,13 +114,19 @@ def _load_about_me() -> str:
 def _today_note() -> str:
     """Live current-date note injected into EVERY answer/chat prompt so the model
     can reason about past vs. upcoming. Computed from the system clock each call
-    (never a static file, which would go stale). ~40 tokens; zero retrieval cost."""
+    (never a static file, which would go stale). ~90 tokens; zero retrieval cost."""
     return (
-        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}. Dates before "
-        "today are in the PAST; dates on/after today are UPCOMING. For "
-        "\"next/upcoming\" questions, choose the soonest record dated today or "
-        "later and IGNORE the word \"upcoming\" if it appears inside an old record "
-        "(e.g. a screenshot) whose date is already past.\n\n"
+        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}.\n"
+        "DATE RULES (read carefully):\n"
+        "- Each record's 'date' is when it was RECEIVED/created — that is always in "
+        "the past and does NOT mean the event it describes is past.\n"
+        "- The EVENT date (trip, flight, appointment) is inside the record's text. "
+        "Compare THAT to today. A booking received last week for a trip next month "
+        "is UPCOMING.\n"
+        "- Partial dates like '08/06' in a recently received email mean the next "
+        "upcoming occurrence (e.g. August 6 of this year), not a past year.\n"
+        "- An old record (received years ago) describes a PAST event even if its "
+        "text says 'upcoming' — it was upcoming back then, not now.\n\n"
     )
 
 
@@ -282,8 +288,41 @@ def _build_prompt(
     # amounts after hundreds of chars of boilerplate, and models were misreading
     # or inventing amounts/senders; this hands them clean signals to aggregate.
     finance_headers = _is_finance_query(question)
+    itinerary_mode = _is_itinerary_query(question) and _wants_future(question)
     blocks = []
     for r in rows:
+        if itinerary_mode and not finance_headers:
+            # Upcoming-trip questions get a COMPACT labeled record with the
+            # booking facts machine-extracted (confirmation-style codes, dates in
+            # the text) — the same treatment that fixed money answers. Raw JSON
+            # rows made the model cite a marketing email while missing the
+            # destination + confirmation code in the newest booking's subject.
+            raw_orig = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or ""))
+            raw = re.sub(r"\s{3,}", "  ", raw_orig)
+            fn = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["filename"] or ""))
+            uid = str(r["uuid"] or "")
+            parts = [p.strip() for p in fn.split("|")]
+            if uid.startswith(("mail:", "m365:")) and len(parts) >= 3:
+                sender = re.sub(r"\[[^\]]*\]\s*$", "", parts[2]).strip()
+                lines = ["RECORD (email, newest first):",
+                         f"  from: {sender[:90]}",
+                         f"  subject: {parts[1][:140]}"]
+            else:
+                lines = [f"RECORD: {fn[:160]}"]
+            lines.append(f"  received: {str(r['date_iso'] or '')[:10] or 'unknown'}")
+            # Confirmation-style codes: 5-8 chars, mixed letters+digits.
+            codes = [c for c in re.findall(r"\b[A-Z0-9]{5,8}\b", raw_orig)
+                     if re.search(r"[A-Z]", c) and re.search(r"\d", c)][:4]
+            if codes:
+                lines.append("  codes_in_text (possible confirmation numbers): "
+                             + ", ".join(dict.fromkeys(codes)))
+            dates_in = list(dict.fromkeys(
+                re.findall(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", raw)))[:5]
+            if dates_in:
+                lines.append("  dates_in_text: " + ", ".join(dates_in))
+            lines.append(f"  text: {raw[:500]}")
+            blocks.append("\n".join(lines))
+            continue
         if finance_headers:
             # Money questions get a COMPACT record: machine-extracted facts plus a
             # short excerpt around each dollar amount, instead of the full noisy
@@ -326,6 +365,13 @@ def _build_prompt(
             blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
     about_me = _about_me_block() + _today_note()
+    if _is_itinerary_query(question) and _wants_future(question):
+        about_me += (
+            "BOOKING ORDER: the records below are bookings/confirmations ordered "
+            "NEWEST-RECEIVED FIRST. The first record(s) are almost certainly the "
+            "user's current/upcoming plans — answer from them. Bookings received "
+            "years ago are past trips, not upcoming ones.\n\n"
+        )
     if conversational:
         style_block = """
 TONE & STYLE (important)
@@ -1997,9 +2043,11 @@ def answer_question(
         prompt_rows = _entity_focus_rows(effective_query, rows)
     elif _is_itinerary_query(q) and _wants_future(q):
         # "next/upcoming trip": show the model only real booking rows (already
-        # ordered newest-first) so it can't latch onto a distractor like an old
-        # TripIt screenshot that merely contains the word "upcoming".
-        _booking = [r for r in rows if _is_booking_row(r)]
+        # ordered newest-first), capped to the newest 5. Small models cherry-pick
+        # whichever old booking has the richest explicit details (flight numbers,
+        # times) over the newest one, so bookings from prior years must not enter
+        # the prompt at all.
+        _booking = [r for r in rows if _is_booking_row(r)][:5]
         prompt_rows = _booking or rows
     else:
         prompt_rows = rows
