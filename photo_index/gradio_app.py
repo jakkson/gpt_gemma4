@@ -312,7 +312,13 @@ def _build_prompt(
             block = re.sub(r" {3,}", "  ", block)
             blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
-    about_me = _about_me_block()
+    about_me = _about_me_block() + (
+        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}. Dates before "
+        "today are in the PAST; dates on/after today are UPCOMING. For "
+        "\"next/upcoming\" questions, choose the soonest record dated today or "
+        "later and IGNORE the word \"upcoming\" if it appears inside an old record "
+        "(e.g. a screenshot) whose date is already past.\n\n"
+    )
     if conversational:
         style_block = """
 TONE & STYLE (important)
@@ -769,6 +775,72 @@ _FUTURE_TERMS = (
 def _wants_future(question: str) -> bool:
     q = " " + " ".join((question or "").strip().lower().split()) + " "
     return any(t in q for t in _FUTURE_TERMS)
+
+
+# --- Travel / booking / appointment recall -----------------------------------
+#
+# Generic "my next trip / flight / appointment" queries are drowned out by travel
+# MARKETING (fare sales, "book now"). Detect the intent, SEED real itinerary /
+# confirmation / appointment rows into the candidate pool (so recall is
+# guaranteed), and REWARD booking-signal rows in scoring so confirmations beat
+# sale blasts. Pairs with the future-date bonus to surface the *upcoming* one.
+_ITINERARY_TERMS = frozenset({
+    "trip", "trips", "flight", "flights", "flying", "travel", "traveling",
+    "itinerary", "itineraries", "reservation", "reservations", "booking",
+    "booked", "airfare", "layover", "boarding", "departure", "departures",
+    "vacation", "getaway", "hotel", "hotels", "appointment", "appointments",
+    "cruise", "flying", "airline",
+})
+
+
+def _is_itinerary_query(question: str) -> bool:
+    return bool(set(re.findall(r"[a-z]+", (question or "").lower())) & _ITINERARY_TERMS)
+
+
+# STRONG booking markers (transactional, rarely in marketing). Loose phrases
+# like "trip to" / "confirmed:" were dropped — they matched newsletters.
+_BOOKING_STRONG = (
+    "record locator", "boarding pass", "your itinerary", "itinerary for",
+    "e-ticket", "eticket", "flight confirmation", "confirmation number",
+    "confirmation code", "rapid rewards", "reservation confirmed",
+    "reservation number", "booking reference", "check in for your",
+    "checked in for", "your reservation is", "appointment confirmation",
+    "appointment reminder", "your appointment is", "you're checked in",
+)
+# Travel/booking senders — matched only in the FROM field, so a newsletter that
+# merely mentions "Delta" or "hotel" in its body doesn't count as a booking.
+_BOOKING_SENDERS = (
+    "southwest", "tripit", "tripcase", "united airlines", "delta air", "jetblue",
+    "alaska air", "american airlines", "expedia", "kayak", "priceline", "airbnb",
+    "vrbo", "booking.com", "hotels.com", "marriott", "hilton", "hyatt", "avis",
+    "hertz", "opentable", "amtrak", "aa.com", "flysouthwest",
+)
+
+
+def _sender_text(r: sqlite3.Row) -> str:
+    fn = str(r["filename"] or "")
+    sender = fn.rsplit("|", 1)[-1] if "|" in fn else ""
+    m = re.search(r"[Ff]rom:\s*([^\n]+)", str(r["ocr_text"] or ""))
+    if m:
+        sender += " " + m.group(1)[:150]
+    return sender.lower()
+
+
+# So distinctive they rarely appear outside a real booking — count on their own.
+_BOOKING_VERY_STRONG = ("boarding pass", "record locator", "e-ticket", "eticket")
+
+
+def _is_booking_row(r: sqlite3.Row) -> bool:
+    text = f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower()
+    if any(s in text for s in _BOOKING_VERY_STRONG):
+        return True
+    # Otherwise require BOTH a travel/booking sender AND a strong phrase — either
+    # alone is a false-positive magnet (airline marketing has the sender but no
+    # itinerary; a news digest may contain "itinerary for" in its body).
+    if any(s in _sender_text(r) for s in _BOOKING_SENDERS) and \
+       any(s in text for s in _BOOKING_STRONG):
+        return True
+    return False
 
 _BANK_ISSUERS = (
     "capital one", "chase", "wells fargo", "amex", "american express",
@@ -1296,6 +1368,30 @@ def _retrieve_rows(
                 if _money_re.search(blob):
                     merged[r["uuid"]] = r
 
+        # Booking / itinerary / appointment sweep: for travel-ish queries, pull
+        # real confirmation-type rows into the pool so they're candidates at all
+        # (generic "trip"/"flight" tokens otherwise retrieve only marketing).
+        if _is_itinerary_query(question):
+            markers = ["%confirmation%", "%itinerary%", "%reservation%", "%boarding%",
+                       "%your trip%", "%record locator%", "%appointment%",
+                       "%southwest%", "%tripit%", "%airbnb%", "%marriott%",
+                       "%expedia%", "%united airlines%", "%jetblue%",
+                       "%you're going to%", "%you’re going to%"]
+            where = " OR ".join(["lower(ocr_text) LIKE ?"] * len(markers))
+            booking_hits = conn.execute(
+                f"""
+                SELECT *, 0 AS rank FROM photo_meta
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
+                  AND ({where})
+                ORDER BY date_iso DESC, ingested_at DESC
+                LIMIT ?
+                """,
+                (*markers, max(candidate_limit * 4, 400)),
+            ).fetchall()
+            for r in booking_hits:
+                if _is_booking_row(r):
+                    merged[r["uuid"]] = r
+
         # Message-discovery queries must always pull ``imsg:`` candidates: substring
         # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
         # ``Most Recent`` sorting used to float those above real texts.
@@ -1374,6 +1470,9 @@ def _retrieve_rows(
         # (not a pure date sort) so the nearest upcoming *relevant* item wins.
         wants_future = _wants_future(question)
         today_str = datetime.now().strftime("%Y-%m-%d")
+        # Travel/appointment queries: reward real booking/confirmation rows so
+        # they beat travel marketing that shares the same generic keywords.
+        wants_itinerary = _is_itinerary_query(question)
 
         # Cross-encoder rerank (relevance mode only): re-score the surviving
         # candidates by reading each (question, row) pair jointly, then blend the
@@ -1463,6 +1562,10 @@ def _retrieve_rows(
             # nearest upcoming item outranks equally-relevant past ones.
             if wants_future and str(r["date_iso"] or "")[:10] >= today_str:
                 entity_bonus += 12.0
+            # Travel/appointment queries: real bookings/confirmations beat the
+            # sale blasts that share the same generic travel keywords.
+            if wants_itinerary and _is_booking_row(r):
+                entity_bonus += 14.0
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
             # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
@@ -1563,6 +1666,17 @@ def _retrieve_rows(
                     rows.extend(unmatched[: top_k - len(rows)])
         else:
             rows.sort(key=score, reverse=True)
+            if wants_itinerary and wants_future:
+                # The most recently RECEIVED booking is almost always the upcoming
+                # trip — a confirmation arrives before the trip, and the trip date
+                # lives in the email body, not date_iso. So float real bookings to
+                # the top, newest-received first; other rows keep relevance order.
+                def _rk(r: sqlite3.Row) -> tuple[str, str]:
+                    return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
+                booking = sorted((r for r in rows if _is_booking_row(r)),
+                                 key=_rk, reverse=True)
+                rest = [r for r in rows if not _is_booking_row(r)]
+                rows = booking + rest
         return rows[:top_k]
     finally:
         conn.close()
@@ -1872,7 +1986,16 @@ def answer_question(
     # the Walmart records for "dog food at walmart"). Verified: the model answers
     # these correctly in isolation but misattributes merchants/amounts when the
     # relevant rows sit among unrelated ones. Hit list below still shows all rows.
-    prompt_rows = _entity_focus_rows(effective_query, rows) if _is_finance_query(q) else rows
+    if _is_finance_query(q):
+        prompt_rows = _entity_focus_rows(effective_query, rows)
+    elif _is_itinerary_query(q) and _wants_future(q):
+        # "next/upcoming trip": show the model only real booking rows (already
+        # ordered newest-first) so it can't latch onto a distractor like an old
+        # TripIt screenshot that merely contains the word "upcoming".
+        _booking = [r for r in rows if _is_booking_row(r)]
+        prompt_rows = _booking or rows
+    else:
+        prompt_rows = rows
 
     prompt = _build_prompt(
         effective_query,
