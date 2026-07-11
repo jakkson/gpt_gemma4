@@ -111,6 +111,19 @@ def _load_about_me() -> str:
     return "\n".join(facts).strip()
 
 
+def _today_note() -> str:
+    """Live current-date note injected into EVERY answer/chat prompt so the model
+    can reason about past vs. upcoming. Computed from the system clock each call
+    (never a static file, which would go stale). ~40 tokens; zero retrieval cost."""
+    return (
+        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}. Dates before "
+        "today are in the PAST; dates on/after today are UPCOMING. For "
+        "\"next/upcoming\" questions, choose the soonest record dated today or "
+        "later and IGNORE the word \"upcoming\" if it appears inside an old record "
+        "(e.g. a screenshot) whose date is already past.\n\n"
+    )
+
+
 def _about_me_block() -> str:
     """Formatted profile block for prompt injection, or '' when no facts set."""
     facts = _load_about_me()
@@ -312,13 +325,7 @@ def _build_prompt(
             block = re.sub(r" {3,}", "  ", block)
             blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
-    about_me = _about_me_block() + (
-        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}. Dates before "
-        "today are in the PAST; dates on/after today are UPCOMING. For "
-        "\"next/upcoming\" questions, choose the soonest record dated today or "
-        "later and IGNORE the word \"upcoming\" if it appears inside an old record "
-        "(e.g. a screenshot) whose date is already past.\n\n"
-    )
+    about_me = _about_me_block() + _today_note()
     if conversational:
         style_block = """
 TONE & STYLE (important)
@@ -616,7 +623,7 @@ def _chat_system_prompt(context: str) -> str:
         "on-device personal index (their photos, OCR, captions, messages, email, "
         "and notes).\n\n"
         f"{_LOCAL_INDEX_POLICY}"
-        f"{_about_me_block()}"
+        f"{_about_me_block()}{_today_note()}"
         "GROUND RULES\n"
         "- Use ONLY the indexed records below plus what has already been said in "
         "this conversation. Do not use outside general knowledge — EXCEPT to "
