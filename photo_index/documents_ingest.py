@@ -196,6 +196,15 @@ _CHUNK_SIZE = 1_800          # target chars per chunk (fits the prompt field cap
 _CHUNK_OVERLAP = 250         # carry-over tail for cross-boundary context
 _CHUNK_MAX = 600             # safety cap on chunks per file (very large books)
 
+# Only PROSE files get chunked into passages. Data/code files (csv, json, xlsx,
+# source code, plists…) stay a single truncated row: nobody retrieves "page 37
+# of a contacts CSV", and chunking them would add ~100K noise rows competing
+# with real content in every search. FTS still matches terms in the single row.
+_PROSE_CHUNK_EXTS = frozenset({
+    ".pdf", ".doc", ".docx", ".txt", ".rtf", ".md", ".markdown",
+    ".html", ".htm", ".epub", ".pages", ".odt", ".pptx", ".key",
+})
+
 
 def _chunk_text(text: str) -> list[str]:
     """Split into ~_CHUNK_SIZE passages on paragraph boundaries, with overlap."""
@@ -679,9 +688,13 @@ def run_documents_ingest(
                     empty_overflow += 1
             continue
 
-        # Chunk long docs into passages; short files stay a single row. Cap the
-        # total per file so a pathological doc can't explode the index.
-        chunks = _chunk_text(text_raw.strip())
+        # Chunk long PROSE docs into passages; short files and data/code files
+        # stay a single row. Cap total per file so a pathological doc can't
+        # explode the index.
+        if ext in _PROSE_CHUNK_EXTS:
+            chunks = _chunk_text(text_raw.strip())
+        else:
+            chunks = [text_raw.strip()]
         if len(chunks) == 1:
             chunks = [_truncate(chunks[0], max_chars_per_file)]
 

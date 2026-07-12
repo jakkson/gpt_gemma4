@@ -35,6 +35,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from photo_index.documents_ingest import _chunk_text
 from photo_index.ingest_lock import global_ingest_lock
 from photo_index.mail_ingest import _clean_text, _strip_html
 from photo_index.store import commit_ingest, connect, init_schema, optimize, upsert_photo
@@ -44,7 +45,10 @@ _DEFAULT_BACKUP_DB = (
     Path(__file__).resolve().parent.parent / "data" / "evernote" / "en_backup.db"
 )
 
-_BODY_MAX_CHARS = 12_000
+# Long notes are CHUNKED into passages (see below), so this cap only guards
+# against pathological multi-megabyte notes. The old 12_000 cap silently cut
+# note tails at ingest — embedding and prompts then never saw them.
+_BODY_MAX_CHARS = 200_000
 _COMMIT_EVERY = 200
 
 
@@ -160,7 +164,11 @@ def ingest(
         created_iso = _ms_to_iso(getattr(note, "created", None))
         updated_unix = _ms_to_unix(getattr(note, "updated", None))
 
+        # A note is stored either as one row (uuid) or as chunk rows (uuid#0…);
+        # check both forms so chunked notes aren't mistaken for new ones.
         prev_ingested = ingested_map.get(uuid)
+        if prev_ingested is None:
+            prev_ingested = ingested_map.get(f"{uuid}#0")
         if prev_ingested is not None and not force:
             # Skip unless the note was edited after we last indexed it.
             if updated_unix <= prev_ingested:
@@ -186,7 +194,7 @@ def ingest(
             header_bits.append(f"Notebook: {notebook}")
         if tags:
             header_bits.append(f"Tags: {tags}")
-        ocr_text = "\n".join(header_bits) + "\n\n" + body
+        header = "\n".join(header_bits)
 
         filename_bits = [created_iso or "unknown-date", title]
         loc = f"[{notebook}]" if notebook else ""
@@ -194,17 +202,37 @@ def ingest(
             filename_bits.append(f"{loc}{(' ' + tags) if tags else ''}".strip())
         filename = " | ".join(b for b in filename_bits if b)
 
-        upsert_photo(
-            conn,
-            uuid=uuid,
-            filename=filename,
-            date_iso=created_iso,
-            ocr_text=ocr_text,
-            vlm_text="",
-            image_path_used="",  # no local file to open for a note
-            open_url="",
-            commit=False,
+        # Clean slate: a note may switch between single-row and chunked forms
+        # across edits — remove any prior representation before writing.
+        conn.execute(
+            "DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
+            (uuid, f"{uuid}#%"),
         )
+
+        # Long notes become passage rows (like book chunking): embedding and
+        # the answer prompt only ever see ~2K chars per row, so a 12K note
+        # stored whole hides most of itself. Each chunk repeats the header so
+        # every row stays attributable to its note title/notebook.
+        body_chunks = _chunk_text(body)
+        n_chunks = len(body_chunks)
+        for ci, body_chunk in enumerate(body_chunks):
+            cu = uuid if n_chunks == 1 else f"{uuid}#{ci}"
+            fn = (
+                filename
+                if n_chunks == 1
+                else f"{filename} [part {ci + 1}/{n_chunks}]"
+            )
+            upsert_photo(
+                conn,
+                uuid=cu,
+                filename=fn,
+                date_iso=created_iso,
+                ocr_text=header + "\n\n" + body_chunk,
+                vlm_text="",
+                image_path_used="",  # no local file to open for a note
+                open_url="",
+                commit=False,
+            )
         if is_edit:
             edited += 1
         else:
