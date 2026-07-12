@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -289,8 +289,19 @@ def _build_prompt(
     # or inventing amounts/senders; this hands them clean signals to aggregate.
     finance_headers = _is_finance_query(question)
     itinerary_mode = _is_itinerary_query(question) and _wants_future(question)
+    calendar_mode = _is_calendar_query(question)
     blocks = []
     for r in rows:
+        uid0 = str(r["uuid"] or "")
+        if calendar_mode and uid0.startswith("cal:"):
+            # Ingested iCal events already store clean, structured text
+            # ("Calendar event: <title>\nWhen: <date>\nWhere: …\nCalendar: …").
+            # Present it verbatim under an EVENT label — the raw JSON dump (with
+            # the internal vlm_text change-tag) made the model overlook titles
+            # and answer "no event noted".
+            evt = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or "")).strip()
+            blocks.append("EVENT:\n  " + evt.replace("\n", "\n  "))
+            continue
         if itinerary_mode and not finance_headers:
             # Upcoming-trip questions get a COMPACT labeled record with the
             # booking facts machine-extracted (confirmation-style codes, dates in
@@ -848,6 +859,82 @@ _ITINERARY_TERMS = frozenset({
 
 def _is_itinerary_query(question: str) -> bool:
     return bool(set(re.findall(r"[a-z]+", (question or "").lower())) & _ITINERARY_TERMS)
+
+
+# Calendar / schedule intent: the user is asking about their own agenda, not a
+# received email. These queries should surface the ingested iCal events
+# (uuid ``cal:``) rather than losing to recent marketing mail.
+_CALENDAR_TERMS = frozenset({
+    "calendar", "schedule", "scheduled", "agenda", "appointment", "appointments",
+    "meeting", "meetings", "event", "events", "reminder", "reminders", "plans",
+    "booked", "doctor", "dentist", "telemedicine", "telehealth",
+})
+# Phrases that, on their own, signal a schedule lookup ("what's on tomorrow").
+_CALENDAR_PHRASES = (
+    "what do i have", "what's on", "whats on", "what is on", "what's happening",
+    "whats happening", "on my calendar", "on the calendar", "coming up",
+    "due today", "do i have anything", "my day", "my week",
+)
+
+
+def _is_calendar_query(question: str) -> bool:
+    ql = (question or "").lower()
+    if set(re.findall(r"[a-z]+", ql)) & _CALENDAR_TERMS:
+        return True
+    if any(p in ql for p in _CALENDAR_PHRASES):
+        return True
+    # A relative date window ("next week", "tomorrow") also implies a schedule
+    # lookup even without an explicit calendar noun.
+    return _calendar_window(question) is not None
+
+
+def _calendar_window(question: str, today: date | None = None) -> tuple[str, str] | None:
+    """Return an inclusive (start_iso, end_iso) date window for relative phrases
+    like "today", "this week", "next weekend", or None if the query names no
+    window. Weeks are Monday-based."""
+    # Normalize punctuation to spaces so "next week?" still matches " next week ".
+    ql = " " + " ".join(re.sub(r"[^a-z0-9]+", " ", (question or "").lower()).split()) + " "
+    d = today or datetime.now().date()
+
+    def iso(a: date, b: date) -> tuple[str, str]:
+        return (a.isoformat(), b.isoformat())
+
+    monday = d - timedelta(days=d.weekday())  # Monday of the current week
+    # Saturday/Sunday of the current week.
+    sat = monday + timedelta(days=5)
+    sun = monday + timedelta(days=6)
+
+    m = re.search(r"\bnext (\d{1,2}) days\b", ql) or re.search(r"\bin the next (\d{1,2}) days\b", ql)
+    if m:
+        n = max(1, min(int(m.group(1)), 366))
+        return iso(d, d + timedelta(days=n))
+
+    if " day after tomorrow " in ql:
+        return iso(d + timedelta(days=2), d + timedelta(days=2))
+    if " tomorrow " in ql or " tomorrow's " in ql:
+        return iso(d + timedelta(days=1), d + timedelta(days=1))
+    if " today " in ql or " tonight " in ql or " due today " in ql:
+        return iso(d, d)
+    if " next weekend " in ql:
+        return iso(sat + timedelta(days=7), sun + timedelta(days=7))
+    if " this weekend " in ql or " the weekend " in ql or " weekend " in ql:
+        return iso(sat, sun)
+    if " next week " in ql:
+        nm = monday + timedelta(days=7)
+        return iso(nm, nm + timedelta(days=6))
+    if " this week " in ql or " the week " in ql:
+        return iso(d, sun)  # rest of the current week, from today
+    if " next month " in ql:
+        y, mo = (d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1)
+        start = date(y, mo, 1)
+        ny, nmo = (y + (1 if mo == 12 else 0), 1 if mo == 12 else mo + 1)
+        end = date(ny, nmo, 1) - timedelta(days=1)
+        return iso(start, end)
+    if " this month " in ql:
+        ny, nmo = (d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1)
+        end = date(ny, nmo, 1) - timedelta(days=1)
+        return iso(d, end)
+    return None
 
 
 # STRONG booking markers (transactional, rarely in marketing). Loose phrases
@@ -1445,6 +1532,54 @@ def _retrieve_rows(
                 if _is_booking_row(r):
                     merged[r["uuid"]] = r
 
+        # Calendar / schedule sweep: for agenda queries ("what's on my calendar
+        # next week", "when is my next appointment"), pull the relevant iCal
+        # events (uuid cal:) directly so they're candidates. Generic FTS loses
+        # them to recent marketing mail otherwise.
+        if _is_calendar_query(question):
+            cal_win = _calendar_window(question)
+            if cal_win:
+                # Every event inside the named window (today, next week, …).
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%'
+                      AND substr(date_iso,1,10) >= ? AND substr(date_iso,1,10) <= ?
+                    ORDER BY date_iso ASC
+                    LIMIT ?
+                    """,
+                    (cal_win[0], cal_win[1], max(candidate_limit * 4, 200)),
+                ):
+                    merged[r["uuid"]] = r
+            # Content-term matches among events (e.g. "telemedicine", "dentist").
+            for term in _query_content_terms(ql):
+                if len(term) < 3:
+                    continue
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%' AND lower(ocr_text) LIKE ?
+                    ORDER BY date_iso DESC
+                    LIMIT ?
+                    """,
+                    (f"%{term}%", candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+            # "Next / upcoming" agenda with no explicit window: seed the soonest
+            # future events so the nearest appointment is in the pool.
+            if _wants_future(question) and not cal_win:
+                today_iso = datetime.now().strftime("%Y-%m-%d")
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%' AND substr(date_iso,1,10) >= ?
+                    ORDER BY date_iso ASC
+                    LIMIT ?
+                    """,
+                    (today_iso, candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+
         # Message-discovery queries must always pull ``imsg:`` candidates: substring
         # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
         # ``Most Recent`` sorting used to float those above real texts.
@@ -1526,6 +1661,11 @@ def _retrieve_rows(
         # Travel/appointment queries: reward real booking/confirmation rows so
         # they beat travel marketing that shares the same generic keywords.
         wants_itinerary = _is_itinerary_query(question)
+        # Calendar / schedule intent: float ingested iCal events (cal:) and,
+        # for a named date window, the events that fall inside it.
+        wants_calendar = _is_calendar_query(question)
+        cal_window = _calendar_window(question) if wants_calendar else None
+        cal_future = wants_calendar and _wants_future(question)
 
         # Cross-encoder rerank (relevance mode only): re-score the surviving
         # candidates by reading each (question, row) pair jointly, then blend the
@@ -1619,11 +1759,42 @@ def _retrieve_rows(
             # sale blasts that share the same generic travel keywords.
             if wants_itinerary and _is_booking_row(r):
                 entity_bonus += 14.0
+            # Calendar / schedule intent: the ingested iCal events are the
+            # authoritative answer; lift them above competing mail.
+            is_cal = uid.startswith("cal:")
+            row_day = str(r["date_iso"] or "")[:10]
+            # cal_pref is a TOP-priority sort key (like msg_pref): for a strong
+            # schedule query — a named window ("next week") or a "next/upcoming"
+            # lookup — the matching events must lead regardless of how the
+            # rerank/semantic weights score competing mail. Additive bonuses
+            # alone can't reliably outweigh those, so we gate at the tuple level.
+            cal_pref = 0
+            if wants_calendar and is_cal:
+                entity_bonus += 10.0
+                if cal_window:
+                    if cal_window[0] <= row_day <= cal_window[1]:
+                        cal_pref = 1
+                        entity_bonus += 30.0
+                    else:
+                        entity_bonus -= 20.0  # right kind, wrong dates
+                if cal_future and not cal_window and row_day >= today_str:
+                    cal_pref = 1
+                    # Soonest upcoming wins: decay the bonus with days away so the
+                    # very next appointment outranks later ones.
+                    try:
+                        days = (datetime.strptime(row_day, "%Y-%m-%d").date()
+                                - datetime.now().date()).days
+                        entity_bonus += max(0.0, 25.0 - 0.15 * days)
+                    except ValueError:
+                        pass
+                elif cal_future and row_day < today_str:
+                    entity_bonus -= 15.0  # past events aren't the "next" one
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
-            # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
-            # then better (lower) bm25 rank, then most-recent date_iso lex sort.
-            return (msg_pref, overlap + entity_bonus, -rank, date_key)
+            # Tuple sorted desc: schedule events first (for strong calendar
+            # queries), then chat/mail rows, then higher overlap+bonus, then
+            # better (lower) bm25 rank, then most-recent date_iso lex sort.
+            return (cal_pref, msg_pref, overlap + entity_bonus, -rank, date_key)
 
         if sort_by == SORT_RECENT:
             month_year = _query_month_year(question)
@@ -1719,17 +1890,45 @@ def _retrieve_rows(
                     rows.extend(unmatched[: top_k - len(rows)])
         else:
             rows.sort(key=score, reverse=True)
-            if wants_itinerary and wants_future:
+            if wants_future and (wants_itinerary or wants_calendar):
                 # The most recently RECEIVED booking is almost always the upcoming
                 # trip — a confirmation arrives before the trip, and the trip date
                 # lives in the email body, not date_iso. So float real bookings to
                 # the top, newest-received first; other rows keep relevance order.
+                # BUT for a schedule query ("next appointment") the ingested
+                # calendar events are the authoritative answer — keep them first
+                # (they are already soonest-first from score()), then bookings,
+                # then the rest. "appointment" lives in both term sets, so this
+                # ordering stops a travel confirmation from burying the real
+                # calendar appointment.
                 def _rk(r: sqlite3.Row) -> tuple[str, str]:
                     return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
-                booking = sorted((r for r in rows if _is_booking_row(r)),
-                                 key=_rk, reverse=True)
-                rest = [r for r in rows if not _is_booking_row(r)]
-                rows = booking + rest
+                cal_rows = (
+                    [r for r in rows if str(r["uuid"] or "").startswith("cal:")]
+                    if wants_calendar else []
+                )
+                cal_ids = {str(r["uuid"]) for r in cal_rows}
+                booking = sorted(
+                    (r for r in rows
+                     if str(r["uuid"]) not in cal_ids and _is_booking_row(r)),
+                    key=_rk, reverse=True,
+                )
+                picked = cal_ids | {str(r["uuid"]) for r in booking}
+                rest = [r for r in rows if str(r["uuid"]) not in picked]
+                rows = cal_rows + booking + rest
+        # Windowed schedule query ("next week", "tomorrow"): the answer is the set
+        # of events inside that window. Drop everything else so the prompt isn't
+        # padded with far-future events the content-seed pulled in (every event's
+        # text contains the word "Calendar"). If nothing falls in the window, keep
+        # the ranked rows so the model can say the calendar is clear.
+        if wants_calendar and cal_window:
+            in_win = [
+                r for r in rows
+                if str(r["uuid"] or "").startswith("cal:")
+                and cal_window[0] <= str(r["date_iso"] or "")[:10] <= cal_window[1]
+            ]
+            if in_win:
+                rows = in_win
         return rows[:top_k]
     finally:
         conn.close()

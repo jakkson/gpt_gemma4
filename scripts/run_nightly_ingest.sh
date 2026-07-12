@@ -51,6 +51,15 @@ if [[ -d "$BOOKS_ROOT" ]]; then
     || echo "[nightly warn] library ingest failed"
 fi
 
+# Apple Calendar (iCal) events: personal calendars in full, holidays only for
+# the next 365 days, subscribed feeds skipped. Reads a copy of the Calendar
+# store so a running Calendar app can't lock it. Runs before embed so new/
+# changed events are searchable that night. Best-effort.
+echo "[nightly] ingesting Apple Calendar events ..."
+"$PYTHON_BIN" -m photo_index.calendar_ingest \
+  --db "$ROOT/data/photo_index.sqlite" --progress-every 2000 \
+  || echo "[nightly warn] calendar ingest failed"
+
 # Embed any rows the ingest just added — otherwise new content is invisible to
 # semantic search until someone runs embed_index by hand. Requires LM Studio
 # (:1234) for the nomic model; a failure here must not mask the ingest result.
