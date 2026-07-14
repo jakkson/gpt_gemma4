@@ -1154,7 +1154,35 @@ _CONTENT_TERM_SKIP = frozenset({
     "been", "being", "will", "would", "could", "should", "shall", "might",
     "must", "into", "onto", "over", "under", "there", "their", "them", "then",
     "than", "when", "where", "which", "while", "who", "whom", "whose",
+    # ask-mechanics — "20 word summary of my..." made "word"/"summary" leak in
+    # as entities and anchor on marketing rows
+    "can", "cannot", "word", "words", "summary", "summarize", "summarise",
+    "brief", "briefly", "short", "quick",
 })
+
+
+def _title_phrases(question: str) -> list[str]:
+    """Multi-word Title-Case runs in the raw question, lowercased.
+
+    "my most recent SF Log Meeting" → ["sf log meeting"]. These are the user
+    naming a specific thing; token-level matching loses them ("SF" is dropped
+    by the <3-char filter, "log"/"meeting" are generic alone). A phrase is only
+    returned when at least one word isn't a stopword/filler, so sentence-start
+    pairs like "Can You" never qualify."""
+    out: list[str] = []
+    for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){1,5})\b",
+        question or "",
+    ):
+        words = m.group(1).split()
+        lowered = [w.lower().strip(".,'") for w in words]
+        if all(
+            w in _OVERLAP_STOP or w in _DISCOVERY_GENERIC or w in _CONTENT_TERM_SKIP
+            for w in lowered
+        ):
+            continue
+        out.append(" ".join(lowered))
+    return out
 
 
 def _query_content_terms(ql: str) -> list[str]:
@@ -1167,6 +1195,65 @@ def _query_content_terms(ql: str) -> list[str]:
             continue
         out.append(tok)
     return out
+
+
+# --- Self-correcting retrieval (CRAG-lite) -----------------------------------
+#
+# The failure mode we kept hand-patching (SF Log, telemedicine, Walmart, …) is
+# always the same shape: the user NAMED a concrete thing and the first pass
+# didn't surface it. Rather than add a 14th intent detector each time, detect
+# that shape generically — a named anchor absent from the results — and let the
+# LLM rewrite the query once and retry. Frontier "corrective RAG" in miniature.
+_SELF_CORRECT_ON = os.environ.get("PHOTO_INDEX_SELF_CORRECT", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _query_anchors(question: str) -> tuple[list[str], list[str]]:
+    """Concrete things the user named: (title_phrases, distinctive_terms).
+
+    Distinctive = content terms of length >= 5 (short/generic words like "log"
+    or "note" don't count as a nameable anchor on their own)."""
+    phrases = _title_phrases(question)
+    terms = [t for t in _query_content_terms((question or "").lower()) if len(t) >= 5]
+    return phrases, terms
+
+
+def _rows_contain_anchor(rows: list, phrases: list[str], terms: list[str], top_n: int = 6) -> bool:
+    for r in rows[:top_n]:
+        txt = f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower()
+        if any(p in txt for p in phrases):
+            return True
+        if any(t in txt for t in terms):
+            return True
+    return False
+
+
+def _llm_rewrite_query(question: str, rows: list, model: str) -> str:
+    """Ask the local model for a better search query when the first pass missed.
+
+    Returns a cleaned keyword query, or "" on any failure (best-effort)."""
+    titles = "\n".join(f"- {str(r['filename'] or '')[:80]}" for r in rows[:6]) or "- (nothing)"
+    prompt = (
+        "You optimize search queries for a personal archive (emails, notes, "
+        "messages, documents, calendar).\n"
+        f"The user asked: {question!r}\n"
+        "A search returned these top results, which look off-topic or wrong:\n"
+        f"{titles}\n\n"
+        "Write ONE better search query to find what the user actually wants.\n"
+        "- Keep the distinctive names/entities, drop filler words.\n"
+        "- FIX likely typos and spelling ('Logg Meating' -> 'Log Meeting').\n"
+        "- Expand or contract obvious abbreviations if it helps ('SF' <-> "
+        "'San Francisco').\n"
+        "Output ONLY the query text — no quotes, no labels, no explanation."
+    )
+    try:
+        out = chat_user_prompt(model=model, prompt=prompt, max_tokens=40, stream=False)
+    except Exception:
+        return ""
+    line = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+    # Strip common wrappers the model adds despite instructions.
+    line = re.sub(r'^(search query|query|answer)\s*[:\-]\s*', "", line, flags=re.I)
+    line = line.strip().strip('"').strip("'").strip()
+    return line[:120]
 
 
 def _entity_focus_rows(question: str, rows: list) -> list:
@@ -1580,6 +1667,25 @@ def _retrieve_rows(
                 ):
                     merged[r["uuid"]] = r
 
+        # Title-phrase seeding: when the user names a specific titled thing
+        # ("SF Log Meeting"), guarantee rows containing the exact phrase are in
+        # the pool, newest first. Token-level FTS can drop the distinctive part
+        # ("SF" is under the 3-char floor) and rank generic matches above it.
+        q_phrases = _title_phrases(question)
+        if q_phrases:
+            for ph in q_phrases[:3]:
+                like = f"%{ph}%"  # SQLite LIKE is already case-insensitive
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE filename LIKE ? OR ocr_text LIKE ?
+                    ORDER BY date_iso DESC
+                    LIMIT ?
+                    """,
+                    (like, like, candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+
         # Message-discovery queries must always pull ``imsg:`` candidates: substring
         # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
         # ``Most Recent`` sorting used to float those above real texts.
@@ -1711,6 +1817,11 @@ def _retrieve_rows(
                 if tok in text:
                     overlap += 1.0
             entity_bonus = 0.0
+            # Exact title-phrase match ("sf log meeting") is the strongest
+            # entity signal a row can carry — the user literally named it.
+            for _ph in q_phrases:
+                if _ph in text:
+                    entity_bonus += 12.0
             has_nyt = any(k in text for k in ("new york times", "nytimes", "nyt ", "ny times"))
             has_dollar_figure = bool(_CURRENCY_RE.search(text))
             has_currency = has_dollar_figure or any(
@@ -1808,6 +1919,19 @@ def _retrieve_rows(
             # browse queries ("show my recent emails") have no content terms, so
             # this filter is skipped and all recent rows are kept.
             _content = _query_content_terms(ql)
+            # A named title-phrase ("SF Log Meeting") supersedes single-token
+            # anchoring entirely: keep only rows containing the exact phrase.
+            # Anchor terms like "summary"/"log" alone let a book chunk or JSON
+            # blob with a newer file date bury the actual named item.
+            if q_phrases:
+                _ppool = [
+                    (r, f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower())
+                    for r in rows
+                ]
+                _pkept = [r for r, txt in _ppool if any(p in txt for p in q_phrases)]
+                if _pkept:
+                    rows = _pkept
+                    _content = []  # phrase matched; skip anchor filtering
             if _content:
                 _pool = [
                     (r, f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower())
@@ -1932,6 +2056,60 @@ def _retrieve_rows(
         return rows[:top_k]
     finally:
         conn.close()
+
+
+def _retrieve_rows_corrected(
+    db_path: Path,
+    question: str,
+    top_k: int,
+    sort_by: str,
+    restrict_finance: bool,
+    model: str,
+) -> tuple[list[sqlite3.Row], str | None]:
+    """Retrieve, and if the user named something the first pass missed, let the
+    model rewrite the query once and retry. Returns (rows, correction_note)."""
+    rows = _retrieve_rows(
+        db_path=db_path, question=question, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    if not _SELF_CORRECT_ON:
+        return rows, None
+    phrases, terms = _query_anchors(question)
+    if not (phrases or terms):
+        return rows, None  # nothing concrete to verify — trust semantic match
+    if _rows_contain_anchor(rows, phrases, terms):
+        return rows, None  # the named thing is present — first pass was fine
+
+    # Named anchor absent from the results → one corrective rewrite + retry.
+    rewrite = _llm_rewrite_query(question, rows, model)
+    if not rewrite or rewrite.lower() == (question or "").strip().lower():
+        return rows, None
+    rows2 = _retrieve_rows(
+        db_path=db_path, question=rewrite, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    # Accept the retry only if it surfaced a concrete anchor — but a rewrite that
+    # FIXES a misspelling ("SF Logg Meating" -> "SF Log Meeting") changes the
+    # anchor, so validate against the rewrite's OWN anchors too, not just the
+    # original query's. This keeps a garbage rewrite (finds nothing) from
+    # replacing decent original rows, while letting spelling/paraphrase fixes
+    # through.
+    r_phrases, r_terms = _query_anchors(rewrite)
+    recovered = rows2 and (
+        _rows_contain_anchor(rows2, phrases, terms)
+        or ((r_phrases or r_terms) and _rows_contain_anchor(rows2, r_phrases, r_terms))
+    )
+    if recovered:
+        seen: set[str] = set()
+        merged: list[sqlite3.Row] = []
+        for r in list(rows2) + list(rows):
+            u = str(r["uuid"])
+            if u in seen:
+                continue
+            seen.add(u)
+            merged.append(r)
+        return merged[:top_k], rewrite
+    return rows, None
 
 
 def _safe_https_browser_url(url: str) -> str | None:
@@ -2182,12 +2360,17 @@ def answer_question(
     # (often zero hits — skip sending 40 rows to a slow 32B model).
     effective_top_k = max(top_k, 40) if aggregate_mode and not scoped_my else top_k
 
-    rows = _retrieve_rows(
+    rows, _correction = _retrieve_rows_corrected(
         db_path=db_path, question=q, top_k=effective_top_k,
-        sort_by=sort_by, restrict_finance=restrict_finance,
+        sort_by=sort_by, restrict_finance=restrict_finance, model=qa_model,
     )
     effective_query = q
     autocorrect_note = ""
+    if _correction:
+        # The model rewrote the query to find a named thing the first pass
+        # missed; answer from the corrected rows, note it for transparency.
+        effective_query = _correction
+        autocorrect_note = f"_(refined your search to find: **{_correction}**)_"
     if not rows and auto_correct:
         suggested = _suggest_query(q, db_path=db_path)
         if suggested != q:

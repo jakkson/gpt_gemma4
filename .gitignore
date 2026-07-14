@@ -22,3 +22,6 @@ data/query_log.jsonl
 data/.open_local_file_token
 data/mail_routes.json
 data/mail_dropper.log
+
+# Retrieval eval suite embeds real personal query examples — keep local
+photo_index/eval_retrieval.py
