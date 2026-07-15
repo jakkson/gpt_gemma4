@@ -41,20 +41,44 @@ ROUTE_FLAG="--no-auto-route"
 # overflow-shrink path then feeds the model a fraction of the records and it
 # confabulates amounts/merchants (took a long debug session to find). Reload
 # with 16384 whenever the loaded context is too small.
+# Free the vision model (Ollama gemma, ~10 GB on the GPU) before loading the
+# answer model. On a 32 GB Mac, gemma (10 GB) + Qwen (~17 GB) co-resident blows
+# past unified memory and the answer model crashes mid-generation with a Metal
+# "Insufficient Memory" abort. Search never needs gemma; the nightly ingest
+# reloads it automatically. Best-effort — never block the UI on this.
+OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama || echo /opt/homebrew/bin/ollama)}"
+if [[ -x "$OLLAMA_BIN" ]]; then
+  "$OLLAMA_BIN" ps 2>/dev/null | awk 'NR>1{print $1}' | while read -r _m; do
+    [[ -n "$_m" ]] && "$OLLAMA_BIN" stop "$_m" >/dev/null 2>&1 || true
+  done
+fi
+
 LMS_BIN="${LMS_BIN:-$HOME/.lmstudio/bin/lms}"
 WANT_CTX=16384
+# parallel=1: a single user needs one KV-cache slot, not four. parallel=4 (the
+# default) reserves a full 16384-token KV cache PER slot — ~4x the GPU memory —
+# which is what tipped the machine into the OOM crash under load.
+WANT_PARALLEL=1
 if [[ -x "$LMS_BIN" ]]; then
-  loaded_ctx=$("$LMS_BIN" ps 2>/dev/null | awk -v m="$PHOTO_INDEX_QA_MODEL" '$1==m {print $5}')
-  if [[ -n "${loaded_ctx:-}" && "$loaded_ctx" =~ ^[0-9]+$ && "$loaded_ctx" -lt "$WANT_CTX" ]]; then
-    echo "[start_search] $PHOTO_INDEX_QA_MODEL loaded with context=$loaded_ctx (<$WANT_CTX); reloading..."
+  read -r loaded_ctx loaded_par < <(
+    "$LMS_BIN" ps 2>/dev/null | awk -v m="$PHOTO_INDEX_QA_MODEL" '$1==m {print $5, $6}'
+  )
+  # Reload if not loaded, context too small, OR parallel too high (all three are
+  # memory/quality correctness conditions).
+  need_reload=0
+  if [[ -z "${loaded_ctx:-}" ]]; then
+    need_reload=1
+  elif [[ "$loaded_ctx" =~ ^[0-9]+$ && "$loaded_ctx" -lt "$WANT_CTX" ]]; then
+    need_reload=1
+  elif [[ "${loaded_par:-}" =~ ^[0-9]+$ && "$loaded_par" -gt "$WANT_PARALLEL" ]]; then
+    need_reload=1
+  fi
+  if [[ "$need_reload" == "1" ]]; then
+    echo "[start_search] loading $PHOTO_INDEX_QA_MODEL (context=$WANT_CTX parallel=$WANT_PARALLEL)..."
     "$LMS_BIN" unload "$PHOTO_INDEX_QA_MODEL" >/dev/null 2>&1 || true
-    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" >/dev/null 2>&1 \
-      && echo "[start_search] reloaded with context=$WANT_CTX" \
-      || echo "[start_search warn] could not reload model; answers may truncate records"
-  elif [[ -z "${loaded_ctx:-}" ]]; then
-    echo "[start_search] $PHOTO_INDEX_QA_MODEL not loaded; loading with context=$WANT_CTX..."
-    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" >/dev/null 2>&1 \
-      || echo "[start_search warn] could not load model via lms; LM Studio may JIT-load at 4096"
+    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" --parallel "$WANT_PARALLEL" >/dev/null 2>&1 \
+      && echo "[start_search] loaded (context=$WANT_CTX parallel=$WANT_PARALLEL)" \
+      || echo "[start_search warn] could not load model via lms; answers may truncate or OOM"
   fi
 fi
 
