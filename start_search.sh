@@ -60,9 +60,12 @@ WANT_CTX=16384
 # which is what tipped the machine into the OOM crash under load.
 WANT_PARALLEL=1
 if [[ -x "$LMS_BIN" ]]; then
+  # NB: `read` returns non-zero at EOF (when no model is loaded, awk prints
+  # nothing) — the `|| true` stops `set -e` from aborting the whole script.
+  loaded_ctx=""; loaded_par=""
   read -r loaded_ctx loaded_par < <(
     "$LMS_BIN" ps 2>/dev/null | awk -v m="$PHOTO_INDEX_QA_MODEL" '$1==m {print $5, $6}'
-  )
+  ) || true
   # Reload if not loaded, context too small, OR parallel too high (all three are
   # memory/quality correctness conditions).
   need_reload=0
