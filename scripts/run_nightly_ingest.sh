@@ -9,6 +9,41 @@ PYTHON_BIN="${PHOTO_INDEX_PYTHON:-$ROOT/.venv/bin/python}"
 export PHOTO_INDEX_LLM_BACKEND="${PHOTO_INDEX_LLM_BACKEND:-openai}"
 CAFFEINATE="$(command -v caffeinate || true)"
 
+# Model-memory arbitration. On a 32 GB Mac the answer model (~17 GB, LM Studio)
+# and the vision model (~10 GB, Ollama, used for photo/document captions) cannot
+# both be resident — together they exhaust unified memory and have caused GPU
+# OOM crashes and a kernel panic (IOGPUGroupMemory). So: free the answer model
+# for the duration of the ingest's vision passes, then reload it at the end so
+# the search UI can answer again without a manual restart. Best-effort — these
+# must never abort the run.
+LMS_BIN="${LMS_BIN:-$HOME/.lmstudio/bin/lms}"
+QA_MODEL="${PHOTO_INDEX_QA_MODEL:-qwen3-30b-a3b-instruct-2507}"
+OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama || echo /opt/homebrew/bin/ollama)}"
+
+reload_answer_model() {
+  # Best-effort cleanup from the EXIT trap: never let a failing probe (e.g.
+  # ollama server down) propagate out of here.
+  set +e
+  # Free the vision model, then bring the answer model back for search.
+  if [[ -x "$OLLAMA_BIN" ]]; then
+    "$OLLAMA_BIN" ps 2>/dev/null | awk 'NR>1{print $1}' | while read -r _m; do
+      [[ -n "$_m" ]] && "$OLLAMA_BIN" stop "$_m" >/dev/null 2>&1 || true
+    done
+  fi
+  if [[ -x "$LMS_BIN" ]]; then
+    echo "[nightly] reloading answer model $QA_MODEL (context=16384 parallel=1)"
+    "$LMS_BIN" load "$QA_MODEL" --context-length 16384 --parallel 1 >/dev/null 2>&1 \
+      || echo "[nightly warn] could not reload $QA_MODEL; open the search UI to load it"
+  fi
+}
+# Guarantee the answer model is restored even if the ingest errors out partway.
+trap reload_answer_model EXIT
+
+if [[ -x "$LMS_BIN" ]]; then
+  echo "[nightly] unloading answer model $QA_MODEL to free memory for vision ingest"
+  "$LMS_BIN" unload "$QA_MODEL" >/dev/null 2>&1 || true
+fi
+
 # Refresh the Evernote backup (incremental; only new/changed notes) before the
 # python ingest reads it. Best-effort: a rate-limit or network error here must
 # not abort the rest of the nightly run, so we don't let it trip `set -e`.
