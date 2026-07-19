@@ -682,6 +682,13 @@ def _chat_system_prompt(context: str) -> str:
         f"{_LOCAL_INDEX_POLICY}"
         f"{_about_me_block()}{_today_note()}"
         "GROUND RULES\n"
+        "- The indexed records below were retrieved as the MOST RELEVANT to the "
+        "user's latest message — treat them as the material to answer from. If a "
+        "brand, sender, or name in the records matches the user's wording even "
+        "with different spacing or capitalization (e.g. 'Been Verified' IS the "
+        "'BeenVerified' sender in the records), that is exactly what they are "
+        "asking about — describe what those records show, don't reinterpret the "
+        "question into something the records lack.\n"
         "- Use ONLY the indexed records below plus what has already been said in "
         "this conversation. Do not use outside general knowledge — EXCEPT to "
         "recognize what a product, brand, or merchant IS (never to invent "
@@ -689,7 +696,12 @@ def _chat_system_prompt(context: str) -> str:
         "- Answer in a natural, conversational tone; refer to sources in-sentence "
         "and never paste raw uuids or filenames.\n"
         "- If the user asks for something the records and prior turns don't "
-        "support, say so briefly rather than inventing it.\n\n"
+        "support, say so briefly rather than inventing it.\n"
+        "- NEVER say you 'cannot access' the user's email, messages, photos, or "
+        "files, or that you lack access to external servers — these are the "
+        "user's OWN indexed records, already retrieved below. If they contain "
+        "the answer, use it; if they don't, just say you didn't find it in the "
+        "index.\n\n"
         f"Indexed records:\n{context}\n"
     )
 
@@ -711,27 +723,79 @@ def _safe_chat_messages(*, model: str, messages: list[dict]) -> tuple[str, str |
         return "", str(e)
 
 
-def chat_follow_up(user_msg: str, history: list, model: str):
-    """Continue the conversation about the last search's records. History is in
-    Gradio's messages format (list of {role, content}). Returns
-    (updated_history, cleared_input)."""
+# Words that mark a follow-up as a meta-instruction / drill-down on the prior
+# answer rather than a new topic to search for.
+_FOLLOWUP_META = frozenset({
+    "summarize", "summarise", "summary", "shorter", "short", "brief", "briefly",
+    "rephrase", "reword", "condense", "expand", "elaborate", "list", "bullet",
+    "bullets", "sentence", "sentences", "tldr", "recap", "simplify", "clarify",
+    "explain", "detail", "details", "more", "less", "again", "instead",
+})
+
+
+def chat_follow_up(user_msg: str, history: list, model: str,
+                   db_path: Path | None = None, top_k: int = 15):
+    """Continue the conversation. History is in Gradio's messages format
+    (list of {role, content}). Returns (updated_history, cleared_input).
+
+    A follow-up that names a NEW topic ("what about Been Verified?") is no longer
+    confined to the previous search's records: we retrieve fresh records for it
+    and merge them with the prior context, so the model doesn't falsely deny
+    data that IS in the index just because the last search didn't surface it."""
     user_msg = (user_msg or "").strip()
     history = list(history or [])
     if not user_msg:
         return history, ""
-    context = str(_LAST_CONVO.get("context") or "")
-    if not context:
-        history.append({"role": "user", "content": user_msg})
-        history.append({"role": "assistant", "content": "Run a search first — then I "
-                        "can answer follow-ups about that result."})
-        return history, ""
-    messages = [{"role": "system", "content": _chat_system_prompt(context)}]
-    for m in history:
-        role = m.get("role") if isinstance(m, dict) else None
-        if role in ("user", "assistant"):
-            messages.append({"role": role, "content": str(m.get("content", ""))})
-    messages.append({"role": "user", "content": user_msg})
-    reply, err = _safe_chat_messages(model=model, messages=messages)
+    # Retrieve fresh records only when the follow-up names a NEW topic — not for
+    # meta-instructions ("summarize that shorter") or references to the prior
+    # answer ("those", "them"), which must stay a drill-down over prior context.
+    ql = user_msg.lower()
+    _referential = any(
+        f" {w} " in f" {ql} "
+        for w in ("that", "those", "these", "them", "it", "this", "they")
+    )
+    _topic_terms = [t for t in _query_content_terms(ql) if t not in _FOLLOWUP_META]
+    fresh_rows: list = []
+    if db_path is not None and _topic_terms and not _referential:
+        try:
+            sort = SORT_RECENT if _wants_recency(user_msg) else SORT_RELEVANT
+            fresh_rows = _retrieve_rows(
+                db_path=db_path, question=user_msg, top_k=top_k,
+                sort_by=sort, restrict_finance=False,
+            )
+        except Exception:
+            fresh_rows = []
+
+    if fresh_rows:
+        # New-topic follow-up: answer with the SAME prompt the main search uses —
+        # records go in the USER turn, where this small model actually reads them
+        # (the chat structure buried them in the system message and the model
+        # denied records that were right in front of it). Refresh the stored
+        # context so later drill-down follow-ups work on this new topic.
+        prompt = _build_prompt(user_msg, fresh_rows, conversational=True)
+        reply, err = _safe_chat(model=model, prompt=prompt)
+        if reply:
+            cap = _prompt_field_cap_for_model(model)
+            new_ctx = "\n\n---\n\n".join(
+                row_to_prompt_block(r, field_char_cap=cap) for r in fresh_rows
+            )
+            _set_last_convo(new_ctx, user_msg, reply)
+    else:
+        # Pure drill-down over the previous search's records (pronouns, "shorter").
+        context = str(_LAST_CONVO.get("context") or "")
+        if not context:
+            history.append({"role": "user", "content": user_msg})
+            history.append({"role": "assistant", "content": "Run a search first — then "
+                            "I can answer follow-ups about that result."})
+            return history, ""
+        messages = [{"role": "system", "content": _chat_system_prompt(context)}]
+        for m in history:
+            role = m.get("role") if isinstance(m, dict) else None
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": str(m.get("content", ""))})
+        messages.append({"role": "user", "content": user_msg})
+        reply, err = _safe_chat_messages(model=model, messages=messages)
+
     if not reply:
         reply = f"(follow-up failed: {err})" if err else "(no response)"
     _log_query(user_msg, status="error" if err else "followup", model=model)
@@ -3176,13 +3240,13 @@ def build_app(
             queue=False,
         )
         followup_send.click(
-            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model),
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model, db_path, top_k),
             inputs=[followup_box, followup_chat],
             outputs=[followup_chat, followup_box],
             queue=True,
         )
         followup_box.submit(
-            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model),
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model, db_path, top_k),
             inputs=[followup_box, followup_chat],
             outputs=[followup_chat, followup_box],
             queue=True,
