@@ -2122,6 +2122,48 @@ def _retrieve_rows(
         conn.close()
 
 
+def _retrieve_rows_multi_doc(
+    db_path: Path, question: str, phrases: list[str], top_k: int,
+    sort_by: str, restrict_finance: bool,
+) -> list[sqlite3.Row]:
+    """Comparative / cross-document query ("in JP Memoir, per The Elements of
+    Style ..."). A single ranked list lets the stronger topic take every slot and
+    starve the other (Elements of Style took all 15, JP Memoir got 0). So
+    retrieve for EACH named document separately, guarantee each a share of the
+    slots, then fill the remainder from the full-question ranking."""
+    per_share = max(2, top_k // len(phrases))
+    picked: list[sqlite3.Row] = []
+    seen: set[str] = set()
+    for p in phrases:
+        pr = _retrieve_rows(
+            db_path=db_path, question=p, top_k=top_k,
+            sort_by=sort_by, restrict_finance=restrict_finance,
+        )
+        taken = 0
+        for r in pr:
+            u = str(r["uuid"])
+            if u in seen:
+                continue
+            seen.add(u)
+            picked.append(r)
+            taken += 1
+            if taken >= per_share:
+                break
+    # Fill any remaining slots from the natural full-question ranking.
+    full = _retrieve_rows(
+        db_path=db_path, question=question, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    for r in full:
+        if len(picked) >= top_k:
+            break
+        u = str(r["uuid"])
+        if u not in seen:
+            seen.add(u)
+            picked.append(r)
+    return picked[:top_k]
+
+
 def _retrieve_rows_corrected(
     db_path: Path,
     question: str,
@@ -2132,6 +2174,16 @@ def _retrieve_rows_corrected(
 ) -> tuple[list[sqlite3.Row], str | None]:
     """Retrieve, and if the user named something the first pass missed, let the
     model rewrite the query once and retry. Returns (rows, correction_note)."""
+    # Multi-document query: the user named two+ distinct things ("in JP Memoir
+    # ... The Elements of Style"). Retrieve per document and merge so one can't
+    # starve the other — this supersedes single-anchor self-correction here
+    # (which passed as soon as EITHER named thing appeared).
+    _mphrases = list(dict.fromkeys(_title_phrases(question)))
+    if len(_mphrases) >= 2:
+        return _retrieve_rows_multi_doc(
+            db_path, question, _mphrases, top_k, sort_by, restrict_finance
+        ), None
+
     rows = _retrieve_rows(
         db_path=db_path, question=question, top_k=top_k,
         sort_by=sort_by, restrict_finance=restrict_finance,
