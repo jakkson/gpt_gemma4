@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# launchd entry: keep the Mac awake for the full nightly ingest run.
+# launchd entry: run the incremental ingest overnight, then restore search.
+#
+# Schedule (see the launchd plist): starts at 00:00 and HARD-STOPS at 04:30 no
+# matter what — the ingest is fully incremental, so a 04:30 kill just resumes
+# the next night. The hard stop guarantees the vision ingest can never bleed
+# into the day: on a 32 GB Mac the answer model (~17 GB) and the vision model
+# (~19 GB) cannot coexist, and a daytime overlap caused GPU-OOM crashes and a
+# kernel panic. For the same reason we take the SEARCH APP OFFLINE for the whole
+# run (a running UI would JIT-reload the answer model on top of the vision model
+# and crash) and relaunch it at the end.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,53 +18,75 @@ PYTHON_BIN="${PHOTO_INDEX_PYTHON:-$ROOT/.venv/bin/python}"
 export PHOTO_INDEX_LLM_BACKEND="${PHOTO_INDEX_LLM_BACKEND:-openai}"
 CAFFEINATE="$(command -v caffeinate || true)"
 
-# Model-memory arbitration. On a 32 GB Mac the answer model (~17 GB, LM Studio)
-# and the vision model (~10 GB, Ollama, used for photo/document captions) cannot
-# both be resident — together they exhaust unified memory and have caused GPU
-# OOM crashes and a kernel panic (IOGPUGroupMemory). So: free the answer model
-# for the duration of the ingest's vision passes, then reload it at the end so
-# the search UI can answer again without a manual restart. Best-effort — these
-# must never abort the run.
 LMS_BIN="${LMS_BIN:-$HOME/.lmstudio/bin/lms}"
 QA_MODEL="${PHOTO_INDEX_QA_MODEL:-qwen3-30b-a3b-instruct-2507}"
 OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama || echo /opt/homebrew/bin/ollama)}"
 
-reload_answer_model() {
-  # Best-effort cleanup from the EXIT trap: never let a failing probe (e.g.
-  # ollama server down) propagate out of here.
+# --- cleanup: always restore search, however we exit --------------------------
+restore_search() {
+  # Runs on ANY exit (normal finish, 04:30 hard stop, or error). Frees the
+  # vision model and relaunches the search app, which reloads the answer model
+  # (parallel=1) and serves the UI again. The launchd plist sets
+  # AbandonProcessGroup=true so this detached app survives after the job exits.
   set +e
-  # Free the vision model, then bring the answer model back for search.
+  [ -n "${DEADLINE_PID:-}" ] && kill "$DEADLINE_PID" 2>/dev/null
   if [[ -x "$OLLAMA_BIN" ]]; then
     "$OLLAMA_BIN" ps 2>/dev/null | awk 'NR>1{print $1}' | while read -r _m; do
       [[ -n "$_m" ]] && "$OLLAMA_BIN" stop "$_m" >/dev/null 2>&1 || true
     done
   fi
-  if [[ -x "$LMS_BIN" ]]; then
-    echo "[nightly] reloading answer model $QA_MODEL (context=16384 parallel=1)"
-    "$LMS_BIN" load "$QA_MODEL" --context-length 16384 --parallel 1 >/dev/null 2>&1 \
-      || echo "[nightly warn] could not reload $QA_MODEL; open the search UI to load it"
-  fi
+  echo "[nightly] restoring search app"
+  nohup "$ROOT/start_search.sh" </dev/null >"$ROOT/data/search_app.log" 2>&1 &
 }
-# Guarantee the answer model is restored even if the ingest errors out partway.
-trap reload_answer_model EXIT
+trap restore_search EXIT
+trap 'exit 143' TERM INT
 
-if [[ -x "$LMS_BIN" ]]; then
-  echo "[nightly] unloading answer model $QA_MODEL to free memory for vision ingest"
-  "$LMS_BIN" unload "$QA_MODEL" >/dev/null 2>&1 || true
+# --- take search offline for the ingest window --------------------------------
+echo "[nightly] taking search app + answer model offline for the ingest"
+pkill -f "photo_index.gradio_app" 2>/dev/null || true
+[[ -x "$LMS_BIN" ]] && "$LMS_BIN" unload "$QA_MODEL" >/dev/null 2>&1 || true
+
+# --- 04:30 hard stop ----------------------------------------------------------
+# Kill every ingest worker at 04:30 wall-clock. If launched after 04:30 (e.g. a
+# wake-from-sleep catch-up run), cap the run at 4.5 h instead so it still can't
+# run all day.
+HARD_STOP=$(date -v4H -v30M -v0S +%s 2>/dev/null || echo 0)
+NOW=$(date +%s)
+if [ "$HARD_STOP" -le "$NOW" ]; then HARD_STOP=$((NOW + 16200)); fi
+# Test hook: PHOTO_INDEX_NIGHTLY_MAX_SECONDS=<n> forces a short window so the
+# whole cycle (app-down -> deadline kill -> app restore) can be verified quickly.
+if [ -n "${PHOTO_INDEX_NIGHTLY_MAX_SECONDS:-}" ]; then
+  HARD_STOP=$((NOW + PHOTO_INDEX_NIGHTLY_MAX_SECONDS))
+fi
+past_deadline() { [ "$(date +%s)" -ge "$HARD_STOP" ]; }
+
+(
+  sleep $((HARD_STOP - NOW))
+  echo "[nightly] hard stop ($(date -r "$HARD_STOP" '+%H:%M')) — ending ingest"
+  for _ in 1 2 3; do
+    for m in nightly documents_ingest documents_vlm_ingest messages_ingest \
+             mail_ingest evernote_ingest calendar_ingest embed_index; do
+      pkill -f "photo_index.$m" 2>/dev/null
+    done
+    sleep 3
+  done
+) &
+DEADLINE_PID=$!
+
+# Keep the Mac awake for the whole run (-w $$ ties it to this shell's lifetime).
+if [[ -n "$CAFFEINATE" ]]; then
+  "$CAFFEINATE" -s -w $$ &
 fi
 
-# Refresh the Evernote backup (incremental; only new/changed notes) before the
-# python ingest reads it. Best-effort: a rate-limit or network error here must
-# not abort the rest of the nightly run, so we don't let it trip `set -e`.
-# NOTE: evernote-backup lives in the system Python (homebrew), NOT the venv —
-# its click pin conflicts with gradio's typer. Do not install it in .venv.
+# --- ingest steps (each skipped if we've passed the 04:30 deadline) -----------
+# Refresh the Evernote backup (incremental) before the python ingest reads it.
+# evernote-backup lives in the system Python (homebrew), NOT the venv — its
+# click pin conflicts with gradio's typer. Do not install it in .venv.
 EN_BACKUP="${EVERNOTE_BACKUP_BIN:-$(command -v evernote-backup || echo /opt/homebrew/bin/evernote-backup)}"
 EN_DB="$ROOT/data/evernote/en_backup.db"
-if [[ -x "$EN_BACKUP" && -f "$EN_DB" ]]; then
+if ! past_deadline && [[ -x "$EN_BACKUP" && -f "$EN_DB" ]]; then
   echo "[nightly] evernote-backup sync ..."
-  "$EN_BACKUP" sync --database "$EN_DB" || echo "[nightly warn] evernote-backup sync incomplete (rate limit / network); will resume next run"
-else
-  echo "[nightly] skipping evernote-backup sync (binary or db missing)"
+  "$EN_BACKUP" sync --database "$EN_DB" || echo "[nightly warn] evernote-backup sync incomplete; resumes next run"
 fi
 
 ARGS=(
@@ -65,41 +96,33 @@ ARGS=(
   --progress-every 50
 )
 
-# Keep the Mac awake for the WHOLE script (ingest + embed), not just nightly.
-# (-w $$ ties the assertion to this shell's lifetime.)
-if [[ -n "$CAFFEINATE" ]]; then
-  "$CAFFEINATE" -s -w $$ &
-fi
-
 rc=0
-"$PYTHON_BIN" "${ARGS[@]}" || rc=$?
+past_deadline || "$PYTHON_BIN" "${ARGS[@]}" || rc=$?
 
-# Offline library (books etc.): a local-only folder that Dropbox/iCloud never
-# turn into online-only placeholders, so files are always readable. Same
-# documents_ingest (text extract) — epub/pdf/docx/txt. Runs before embed so new
-# books are searchable that night.
+# Offline library (books etc.): a local-only folder Dropbox/iCloud never turn
+# into online-only placeholders. Same documents_ingest (epub/pdf/docx/txt).
 BOOKS_ROOT="${PHOTO_INDEX_BOOKS_ROOT:-$HOME/LLM_Books}"
-if [[ -d "$BOOKS_ROOT" ]]; then
+if ! past_deadline && [[ -d "$BOOKS_ROOT" ]]; then
   echo "[nightly] ingesting offline library: $BOOKS_ROOT"
   "$PYTHON_BIN" -m photo_index.documents_ingest \
     --db "$ROOT/data/photo_index.sqlite" --root "$BOOKS_ROOT" --progress-every 50 \
     || echo "[nightly warn] library ingest failed"
 fi
 
-# Apple Calendar (iCal) events: personal calendars in full, holidays only for
-# the next 365 days, subscribed feeds skipped. Reads a copy of the Calendar
-# store so a running Calendar app can't lock it. Runs before embed so new/
-# changed events are searchable that night. Best-effort.
-echo "[nightly] ingesting Apple Calendar events ..."
-"$PYTHON_BIN" -m photo_index.calendar_ingest \
-  --db "$ROOT/data/photo_index.sqlite" --progress-every 2000 \
-  || echo "[nightly warn] calendar ingest failed"
+# Apple Calendar events (personal cals in full, holidays next 365 d, subscribed
+# skipped). Reads a copy of the store so a running Calendar app can't lock it.
+if ! past_deadline; then
+  echo "[nightly] ingesting Apple Calendar events ..."
+  "$PYTHON_BIN" -m photo_index.calendar_ingest \
+    --db "$ROOT/data/photo_index.sqlite" --progress-every 2000 \
+    || echo "[nightly warn] calendar ingest failed"
+fi
 
-# Embed any rows the ingest just added — otherwise new content is invisible to
-# semantic search until someone runs embed_index by hand. Requires LM Studio
-# (:1234) for the nomic model; a failure here must not mask the ingest result.
-echo "[nightly] embedding new rows (embed_index) ..."
-"$PYTHON_BIN" -m photo_index.embed_index --db "$ROOT/data/photo_index.sqlite" \
-  || echo "[nightly warn] embed_index failed (is LM Studio running?); rows stay queued for next run"
+# Embed new rows (nomic in LM Studio — independent of the unloaded answer model).
+if ! past_deadline; then
+  echo "[nightly] embedding new rows (embed_index) ..."
+  "$PYTHON_BIN" -m photo_index.embed_index --db "$ROOT/data/photo_index.sqlite" \
+    || echo "[nightly warn] embed_index failed; rows stay queued for next run"
+fi
 
 exit "$rc"
