@@ -2974,52 +2974,78 @@ def remove_alias_entry(raw_json: str, canonical: str) -> tuple[str, str]:
 _UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "32000"))
 
 
-def analyze_uploaded_file(file_path: str | None, question: str, qa_model: str) -> str:
-    """Extract text from an uploaded document and answer/summarize it with the LLM.
+def analyze_uploaded_file(file_paths, question: str, qa_model: str) -> str:
+    """Extract text from one or more uploaded documents and answer/summarize them.
 
-    Separate from index search: this works only on the one uploaded file, not the
-    SQLite corpus. Text documents only (the answer model has no vision/OCR).
+    Separate from index search: works only on the uploaded files, not the SQLite
+    corpus. Text documents only (the answer model has no vision/OCR). Accepts a
+    single path (str) or a list of paths (multi-file upload); the total text is
+    budgeted across the files so the combined prompt fits the model context.
     """
-    if not file_path:
-        return "Drop or browse a document first (PDF, Word, PowerPoint, Excel, text…)."
+    if not file_paths:
+        return "Drop or browse one or more documents first (PDF, Word, PowerPoint, Excel, text…)."
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
     from photo_index.documents_ingest import extract_auto
 
-    path = Path(file_path)
-    ext = path.suffix.lower()
-    try:
-        text, method, err = extract_auto(path, ext)
-    except Exception as e:  # noqa: BLE001
-        return f"Could not read **{path.name}**: {e}"
-    if err or not text or not text.strip():
-        return (
-            f"No extractable text in **{path.name}** ({err or 'empty'}). "
-            "Scanned / image-only PDFs need OCR, which this text model can't do."
-        )
-    text = text.strip()
-    truncated = len(text) > _UPLOAD_TEXT_CHAR_CAP
-    if truncated:
-        text = text[:_UPLOAD_TEXT_CHAR_CAP]
-    task = (question or "").strip() or "Summarize this document concisely, capturing the key points."
-    prompt = f"""You are analyzing a single document the user uploaded.
-Use ONLY the document text below. Do not use outside knowledge.
+    docs: list[tuple[str, str, str]] = []  # (name, text, method)
+    skipped: list[str] = []
+    for fp in file_paths:
+        if not fp:
+            continue
+        path = Path(fp)
+        try:
+            text, method, err = extract_auto(path, path.suffix.lower())
+        except Exception as e:  # noqa: BLE001
+            skipped.append(f"- **{path.name}**: could not read ({e})")
+            continue
+        if err or not text or not text.strip():
+            skipped.append(f"- **{path.name}**: no extractable text ({err or 'empty'} — scanned/image PDFs need OCR)")
+            continue
+        docs.append((path.name, text.strip(), method))
 
-Document: {path.name}
+    if not docs:
+        return "No extractable text found.\n\n" + "\n".join(skipped)
 
---- DOCUMENT START ---
-{text}
---- DOCUMENT END ---
+    # Budget the TOTAL text across all files to fit the model context, sharing
+    # it evenly so one long file can't crowd out the others.
+    per_doc_cap = max(1500, _UPLOAD_TEXT_CHAR_CAP // len(docs))
+    truncated_any = False
+    blocks = []
+    for name, text, method in docs:
+        if len(text) > per_doc_cap:
+            text = text[:per_doc_cap]
+            truncated_any = True
+        blocks.append(f"--- DOCUMENT: {name} (extracted via {method}) ---\n{text}\n--- END: {name} ---")
+
+    multi = len(docs) > 1
+    default_task = (
+        "Summarize each document briefly, then note the key similarities, "
+        "differences, or how they relate."
+        if multi else
+        "Summarize this document concisely, capturing the key points."
+    )
+    task = (question or "").strip() or default_task
+    prompt = f"""You are analyzing {len(docs)} document(s) the user uploaded.
+Use ONLY the document text below. Do not use outside knowledge. Refer to each
+document by its filename when it helps.
+
+{chr(10).join(blocks)}
 
 Task: {task}
 """
     answer, chat_err = _safe_chat(model=qa_model, prompt=prompt)
     if chat_err:
-        return f"Model error analyzing **{path.name}**: {chat_err}"
-    note = (
-        f"\n\n*(Document truncated to {_UPLOAD_TEXT_CHAR_CAP:,} chars to fit the model context.)*"
-        if truncated
-        else ""
-    )
-    return f"**{path.name}** · extracted via `{method}`\n\n{answer}{note}"
+        return f"Model error analyzing the document(s): {chat_err}"
+
+    header = " · ".join(name for name, _, _ in docs)
+    notes = []
+    if truncated_any:
+        notes.append(f"*(Each document capped at ~{per_doc_cap:,} chars to fit the model context.)*")
+    if skipped:
+        notes.append("**Skipped:**\n" + "\n".join(skipped))
+    note_str = ("\n\n" + "\n\n".join(notes)) if notes else ""
+    return f"**Analyzed {len(docs)} file(s):** {header}\n\n{answer}{note_str}"
 
 
 def build_app(
@@ -3070,24 +3096,25 @@ def build_app(
         gr.HTML(f"<style>{custom_css}</style>")
         gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
-        with gr.Accordion("📄 Summarize / query an uploaded document", open=False):
+        with gr.Accordion("📄 Summarize / query uploaded documents", open=False):
             gr.Markdown(
-                "Drop a file (PDF, Word, PowerPoint, Excel, text) to summarize or ask "
-                "about it directly — this is separate from your index. Text documents "
-                "only (no scanned/image OCR)."
+                "Drop **one or more files** (PDF, Word, PowerPoint, Excel, text) to "
+                "summarize, compare, or ask about them directly — this is separate "
+                "from your index. Text documents only (no scanned/image OCR)."
             )
             upload_file = gr.File(
-                label="Drop a document here or browse",
+                label="Drop documents here or browse (multiple allowed)",
+                file_count="multiple",
                 file_types=[".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".rtf", ".csv"],
                 type="filepath",
             )
             upload_question = gr.Textbox(
-                label="What should I do with it?",
-                placeholder="Leave blank to summarize, or ask e.g. 'What are the payment terms?'",
+                label="What should I do with them?",
+                placeholder="Leave blank to summarize each, or ask e.g. 'Compare these two contracts' / 'What are the payment terms?'",
                 lines=2,
             )
-            upload_btn = gr.Button("Analyze document", variant="primary")
-            upload_answer = gr.Markdown("No document analyzed yet.", elem_id="pi-answer", sanitize_html=False)
+            upload_btn = gr.Button("Analyze document(s)", variant="primary")
+            upload_answer = gr.Markdown("No documents analyzed yet.", elem_id="pi-answer", sanitize_html=False)
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
                 f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`  \nRerank (cross-encoder): `{'on' if _RERANK_ENABLED else 'off'}`"
