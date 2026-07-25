@@ -46,7 +46,8 @@ from urllib.parse import urldefrag, urljoin, urlparse
 import requests
 
 from .documents_ingest import _chunk_text, _truncate
-from .store import commit_ingest, connect, init_schema, upsert_photo
+from .store import (commit_ingest, connect, init_schema,
+                    invalidate_embedding_sidecar, upsert_photo)
 
 try:  # embedding is optional at commit time (needs the LLM backend running)
     from .embed_index import run as _embed_run
@@ -480,6 +481,43 @@ def commit_staging_dir(dir_: Path, db_path: Path, *, min_chars: int,
     return {"pages": pages, "rows": rows, "skipped": skipped}
 
 
+def purge_domain(db_path: Path, needle: str, *, dry_run: bool = False,
+                 log=print) -> dict:
+    """Remove previously-ingested web: rows whose URL contains `needle`.
+
+    Scoped to `uuid LIKE 'web:%'`, so it can only ever touch web-scraped pages —
+    never mail/docs/photos. FTS entries drop via the AFTER DELETE trigger; the
+    embedding sidecar is invalidated so the search matrix rebuilds. Fully
+    reversible clean-up: re-fetch + commit puts the page back.
+    """
+    conn = connect(db_path)
+    like = f"%{needle}%"
+    where = "uuid LIKE 'web:%' AND (open_url LIKE ? OR image_path_used LIKE ?)"
+    rows = conn.execute(f"SELECT count(*) FROM photo_meta WHERE {where}",
+                        (like, like)).fetchone()[0]
+    pages = conn.execute(
+        f"SELECT count(DISTINCT open_url) FROM photo_meta WHERE {where}",
+        (like, like)).fetchone()[0]
+    if dry_run:
+        conn.close()
+        log(f"[purge] would remove {rows} row(s) across {pages} page(s) "
+            f"matching {needle!r}.")
+        return {"rows": rows, "pages": pages, "deleted": False}
+    conn.execute(f"DELETE FROM photo_meta WHERE {where}", (like, like))
+    conn.commit()
+    conn.close()
+    if rows:
+        invalidate_embedding_sidecar(db_path)
+    log(f"[purge] removed {rows} row(s) across {pages} page(s) "
+        f"matching {needle!r}.")
+    return {"rows": rows, "pages": pages, "deleted": True}
+
+
+def cmd_purge(args) -> int:
+    purge_domain(Path(args.db), args.domain, dry_run=args.dry_run)
+    return 0
+
+
 def cmd_commit(args) -> int:
     dir_ = _stage_dir(args.name, Path(args.staging_root))
     res = commit_staging_dir(dir_, Path(args.db), min_chars=args.min_chars,
@@ -533,6 +571,15 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--embed", action="store_true",
                    help="run embed_index right after (needs the LLM backend up)")
     c.set_defaults(func=cmd_commit)
+
+    pg = sub.add_parser("purge",
+                        help="remove previously-ingested web pages by domain/URL")
+    pg.add_argument("--db", default=str(_DEFAULT_DB))
+    pg.add_argument("--domain", required=True,
+                    help="domain or URL substring to remove, e.g. adcontrarian.blogspot.com")
+    pg.add_argument("--dry-run", action="store_true",
+                    help="show how many rows/pages would be removed, delete nothing")
+    pg.set_defaults(func=cmd_purge)
 
     args = ap.parse_args(argv)
     return args.func(args)

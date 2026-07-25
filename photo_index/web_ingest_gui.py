@@ -140,6 +140,16 @@ def do_commit(table, embed, run_dir, idx_to_path, db_path):
     return "\n".join(logs)
 
 
+def do_purge(domain, db_path, apply):
+    if not (domain or "").strip():
+        return "Enter a domain or URL substring (e.g. adcontrarian.blogspot.com)."
+    logs: list[str] = []
+    W.purge_domain(Path(db_path), domain.strip(), dry_run=not apply, log=logs.append)
+    if not apply:
+        logs.append("Preview only — nothing deleted. Click **Purge** to remove.")
+    return "\n".join(logs)
+
+
 def build(db_default: str) -> gr.Blocks:
     with gr.Blocks(title="Web Ingest") as demo:
         gr.Markdown("## Web Ingest — scrape permitted sites into your index\n"
@@ -191,6 +201,20 @@ def build(db_default: str) -> gr.Blocks:
             commit_btn = gr.Button("Commit kept pages", variant="primary")
             commit_log = gr.Textbox(label="Commit result", lines=6, interactive=False)
 
+        with gr.Accordion("Remove ingested web pages (undo)", open=False):
+            gr.Markdown("Delete previously-committed pages by domain or URL "
+                        "substring. Only affects **web:** pages — never your mail, "
+                        "docs, or photos. Preview first to see the count.")
+            with gr.Row():
+                purge_domain = gr.Textbox(
+                    label="Domain / URL substring",
+                    placeholder="adcontrarian.blogspot.com", scale=3)
+                purge_db = gr.Textbox(value=db_default, label="Database", scale=3)
+            with gr.Row():
+                preview_btn = gr.Button("Preview (count only)")
+                purge_btn = gr.Button("Purge", variant="stop")
+            purge_log = gr.Textbox(label="Result", lines=3, interactive=False)
+
         mode.change(lambda m: gr.update(visible=(m == _MODES[2])),
                     inputs=mode, outputs=crawl_opts)
         fetch_btn.click(
@@ -204,6 +228,10 @@ def build(db_default: str) -> gr.Blocks:
                        outputs=save_status)
         commit_btn.click(do_commit, inputs=[table, embed, run_dir, idx_map, db_path],
                          outputs=commit_log)
+        preview_btn.click(lambda d, db: do_purge(d, db, False),
+                          inputs=[purge_domain, purge_db], outputs=purge_log)
+        purge_btn.click(lambda d, db: do_purge(d, db, True),
+                        inputs=[purge_domain, purge_db], outputs=purge_log)
     return demo
 
 
