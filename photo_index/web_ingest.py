@@ -203,6 +203,12 @@ def _sitemap_urls(url: str, *, timeout: int, ua: str, depth: int = 0) -> list[st
             out.extend(_sitemap_urls(child.strip(), timeout=timeout, ua=ua,
                                      depth=depth + 1))
         return out
+    # Forgiving: given a bare domain/homepage (no <loc>s), try the conventional
+    # /sitemap.xml once so "example.com" works as well as "example.com/sitemap.xml".
+    if not locs and depth == 0 and "sitemap" not in url.lower():
+        guess = url.rstrip("/") + "/sitemap.xml"
+        print(f"  [sitemap] no <loc> at {url}; trying {guess}", file=sys.stderr)
+        return _sitemap_urls(guess, timeout=timeout, ua=ua, depth=1)
     return [u.strip() for u in locs]
 
 
