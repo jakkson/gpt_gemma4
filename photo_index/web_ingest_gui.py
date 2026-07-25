@@ -30,7 +30,7 @@ _MODES = ["Single page(s)", "Whole site (sitemap)", "Bounded crawl"]
 
 
 def _targets_for(mode: str, urls_text: str, max_pages: int, max_depth: int,
-                 ignore_robots: bool, delay: float) -> list[str]:
+                 ignore_robots: bool, delay: float, limit: int) -> list[str]:
     lines = [ln.strip() for ln in (urls_text or "").splitlines() if ln.strip()]
     ns = SimpleNamespace(
         url=lines if mode == _MODES[0] else None,
@@ -39,21 +39,21 @@ def _targets_for(mode: str, urls_text: str, max_pages: int, max_depth: int,
         crawl=lines[0] if (mode == _MODES[2] and lines) else None,
         max_pages=int(max_pages), max_depth=int(max_depth),
         timeout=30, user_agent=W._UA, ignore_robots=ignore_robots,
-        delay=float(delay), limit=None,
+        delay=float(delay), limit=(int(limit) or None),
     )
     return W._gather_targets(ns)
 
 
-def do_fetch(urls_text, mode, max_pages, max_depth, name, dry_run, render,
-             ignore_robots, delay):
-    """Fetch + stage. Returns log, table, dropdown, states, preview, and reveals."""
+def do_fetch(urls_text, mode, max_pages, max_depth, limit, name, dry_run,
+             render, ignore_robots, delay):
+    """Fetch + stage. Returns log, table, dropdown, states, preview, reveal, text."""
     logs: list[str] = []
     targets = _targets_for(mode, urls_text, max_pages, max_depth,
-                           ignore_robots, delay)
+                           ignore_robots, delay, limit)
     if not targets:
         return ("No URLs found. Paste at least one URL above.", [],
                 gr.update(choices=[], value=None), "", {}, "",
-                gr.update(visible=False))
+                gr.update(visible=False), "")
     logs.append(f"{len(targets)} target(s). "
                 f"{'PREVIEW — nothing will be staged.' if dry_run else ''}")
     logs.append(f"{'#':>4}  {'chars':>7}  status  title")
@@ -69,7 +69,7 @@ def do_fetch(urls_text, mode, max_pages, max_depth, name, dry_run, render,
             f"### {r['title'] or r['url']}\n{r['url']}\n\n{r['text'][:4000]}"
             for r in results if r["text"])
         return ("\n".join(logs), [], gr.update(choices=[], value=None), "", {},
-                preview or "(no text extracted)", gr.update(visible=False))
+                preview or "(no text extracted)", gr.update(visible=False), "")
 
     table, idx_to_path, choices = [], {}, []
     for r in results:
@@ -78,10 +78,17 @@ def do_fetch(urls_text, mode, max_pages, max_depth, name, dry_run, render,
         table.append([True, r["idx"], r["chars"], (r["title"] or "")[:80], r["url"]])
         idx_to_path[str(r["idx"])] = str(r["staged"])
         choices.append(f"{r['idx']}: {(r['title'] or r['url'])[:70]}")
-    logs.append(f"\nStaged {len(table)} page(s) in {dir_}. "
-                "Untick 'Keep' to drop a page; select one below to read/trim it.")
-    return ("\n".join(logs), table, gr.update(choices=choices, value=None),
-            str(dir_), idx_to_path, "", gr.update(visible=bool(table)))
+    # Auto-load the first staged page so the captured text is visible at once.
+    first_text = ""
+    if table:
+        parsed = W._parse_stage(Path(idx_to_path[str(table[0][1])]))
+        first_text = parsed[1] if parsed else ""
+    logs.append(f"\nStaged {len(table)} page(s) in {dir_}. The first page's text "
+                "is shown below — use the dropdown to read others, untick 'Keep' "
+                "to drop a page.")
+    return ("\n".join(logs), table,
+            gr.update(choices=choices, value=(choices[0] if choices else None)),
+            str(dir_), idx_to_path, "", gr.update(visible=bool(table)), first_text)
 
 
 def load_page(selected, idx_to_path):
@@ -154,6 +161,7 @@ def build(db_default: str) -> gr.Blocks:
                 max_depth = gr.Number(value=2, label="Max depth", precision=0)
         with gr.Row():
             name = gr.Textbox(value="gui", label="Staging run name")
+            limit = gr.Number(value=25, precision=0, label="Max pages (0 = all)")
             delay = gr.Slider(0, 5, value=1.5, step=0.5, label="Delay between requests (s)")
         with gr.Row():
             dry_run = gr.Checkbox(label="Preview only (don't stage)")
@@ -173,7 +181,9 @@ def build(db_default: str) -> gr.Blocks:
             with gr.Row():
                 pick = gr.Dropdown(choices=[], label="Read / trim a page", scale=2)
                 save_btn = gr.Button("Save edits to this page", scale=1)
-            page_text = gr.Textbox(label="Page text (edit to trim, then Save)", lines=14)
+            page_text = gr.Textbox(
+                label="Captured text — read it here; edit to trim, then Save",
+                lines=18)
             save_status = gr.Markdown()
             with gr.Row():
                 db_path = gr.Textbox(value=db_default, label="Database", scale=3)
@@ -185,9 +195,10 @@ def build(db_default: str) -> gr.Blocks:
                     inputs=mode, outputs=crawl_opts)
         fetch_btn.click(
             do_fetch,
-            inputs=[urls, mode, max_pages, max_depth, name, dry_run, render,
-                    ignore_robots, delay],
-            outputs=[log, table, pick, run_dir, idx_map, preview, review])
+            inputs=[urls, mode, max_pages, max_depth, limit, name, dry_run,
+                    render, ignore_robots, delay],
+            outputs=[log, table, pick, run_dir, idx_map, preview, review,
+                     page_text])
         pick.change(load_page, inputs=[pick, idx_map], outputs=page_text)
         save_btn.click(save_page, inputs=[pick, page_text, idx_map],
                        outputs=save_status)
