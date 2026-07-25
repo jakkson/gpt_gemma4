@@ -25,3 +25,10 @@ data/mail_dropper.log
 
 # Retrieval eval suite embeds real personal query examples — keep local
 photo_index/eval_retrieval.py
+
+# Personal documents — never commit to the public repo
+LLM_Ingest_Pipelines.docx
+Local_LLM_Stack_Chat.pdf
+Personal_LLM_Stack_Overview.docx
+*.docx
+*.pdf
