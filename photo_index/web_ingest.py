@@ -316,6 +316,76 @@ def _gather_targets(args) -> list[str]:
     return out
 
 
+def fetch_page(url: str, *, robots: _Robots, ua: str, timeout: int,
+               render: bool, render_empty: bool, min_chars: int) -> dict:
+    """Fetch + extract one page. Returns a dict; text is "" on skip/empty.
+
+    status: HTTP code, or 'robots' / 'error'. Pure — writes nothing.
+    """
+    if not robots.ok(url):
+        return {"url": url, "title": None, "date": None, "text": "",
+                "status": "robots"}
+    try:
+        code, content, final, ctype = _http_get(url, timeout=timeout, ua=ua)
+    except Exception as e:  # noqa: BLE001
+        return {"url": url, "title": None, "date": None, "text": "",
+                "status": f"error: {e}"}
+    html = _decode(content, ctype)
+    if render:
+        r = _render_html(url, timeout=timeout, ua=ua)
+        if r:
+            html = r
+    text, title, date = _extract(html, final)
+    if (not text or len(text) < min_chars) and render_empty and not render:
+        r = _render_html(url, timeout=timeout, ua=ua)
+        if r:
+            text, title, date = _extract(r, final)
+    text = _truncate(text, _PAGE_CHAR_CAP)
+    return {"url": final, "title": title, "date": date, "text": text,
+            "status": code}
+
+
+def stage_targets(targets: list[str], dir_: Path, *, robots: _Robots, ua: str,
+                  timeout: int, delay: float, render: bool, render_empty: bool,
+                  min_chars: int, dry_run: bool = False, log=print) -> list[dict]:
+    """Fetch every target and (unless dry_run) write one .md per page to dir_.
+
+    Returns a result dict per page: idx, url, title, date, chars, status,
+    staged (Path|None), and text (populated on dry_run for previewing).
+    Shared by the CLI and the GUI so both take the identical code path.
+    """
+    if not dry_run:
+        dir_.mkdir(parents=True, exist_ok=True)
+    manifest = None if dry_run else (dir_ / "_manifest.jsonl")
+    results: list[dict] = []
+    for i, url in enumerate(targets, 1):
+        p = fetch_page(url, robots=robots, ua=ua, timeout=timeout,
+                       render=render, render_empty=render_empty,
+                       min_chars=min_chars)
+        text = p["text"]
+        row = {"idx": i, "url": p["url"], "title": p["title"], "date": p["date"],
+               "chars": len(text), "status": p["status"], "staged": None,
+               "text": text if dry_run else ""}
+        shown = (p["title"] or p["url"])[:60]
+        if isinstance(p["status"], str):  # robots / error
+            log(f"{i:>4}  {'-':>7}  {p['status'][:6]:<6}  {shown}")
+            results.append(row)
+            continue
+        note = "" if text else "  (empty — try Render)"
+        log(f"{i:>4}  {len(text):>7}  {p['status']:>4}    {shown}{note}")
+        if dry_run or not text:
+            results.append(row)
+            continue
+        path = _write_stage(dir_, i, p["url"], p["title"], p["date"], text)
+        row["staged"] = path
+        with manifest.open("a", encoding="utf-8") as mf:
+            mf.write(json.dumps({"idx": i, "url": p["url"], "title": p["title"],
+                                 "date": p["date"], "chars": len(text)}) + "\n")
+        results.append(row)
+        time.sleep(delay)
+    return results
+
+
 def cmd_fetch(args) -> int:
     targets = _gather_targets(args)
     if not targets:
@@ -323,81 +393,67 @@ def cmd_fetch(args) -> int:
         return 1
     robots = _Robots(args.user_agent, args.ignore_robots)
     dir_ = _stage_dir(args.name, Path(args.staging_root))
-    if not args.dry_run:
-        dir_.mkdir(parents=True, exist_ok=True)
-    manifest = dir_ / "_manifest.jsonl" if not args.dry_run else None
-
     print(f"[fetch] {len(targets)} page(s) → "
           f"{'DRY RUN (stdout only)' if args.dry_run else dir_}")
     print(f"{'#':>4}  {'chars':>7}  status  title")
-    kept = 0
-    for i, url in enumerate(targets, 1):
-        if not robots.ok(url):
-            print(f"{i:>4}  {'-':>7}  robots  (disallowed) {url}")
-            continue
-        try:
-            status, content, final, ctype = _http_get(
-                url, timeout=args.timeout, ua=args.user_agent)
-        except Exception as e:  # noqa: BLE001
-            print(f"{i:>4}  {'-':>7}  ERROR   {e} {url}")
-            continue
-        html = _decode(content, ctype)
-        if args.render:
-            r = _render_html(url, timeout=args.timeout, ua=args.user_agent)
-            if r:
-                html = r
-        text, title, date = _extract(html, final)
-        if (not text or len(text) < args.min_chars) and args.render_empty and not args.render:
-            r = _render_html(url, timeout=args.timeout, ua=args.user_agent)
-            if r:
-                text, title, date = _extract(r, final)
-        text = _truncate(text, _PAGE_CHAR_CAP)
-        note = "" if text else "  (empty — try --render)"
-        print(f"{i:>4}  {len(text):>7}  {status:>4}    {(title or url)[:60]}{note}")
-        if args.dry_run:
-            print("-" * 72)
-            print(text[:4000] + ("\n… [truncated in dry-run preview]" if len(text) > 4000 else ""))
-            print("-" * 72)
-            continue
-        if not text:
-            continue
-        _write_stage(dir_, i, final, title, date, text)
-        with manifest.open("a", encoding="utf-8") as mf:
-            mf.write(json.dumps({"idx": i, "url": final, "title": title,
-                                 "date": date, "chars": len(text)}) + "\n")
-        kept += 1
-        time.sleep(args.delay)
-
-    if not args.dry_run:
-        print(f"\n[fetch] staged {kept} page(s) in {dir_}")
-        print("Review them (delete/edit files you don't want), then:")
-        print(f"  python -m photo_index.web_ingest commit --name {args.name} --embed")
+    results = stage_targets(
+        targets, dir_, robots=robots, ua=args.user_agent, timeout=args.timeout,
+        delay=args.delay, render=args.render, render_empty=args.render_empty,
+        min_chars=args.min_chars, dry_run=args.dry_run)
+    if args.dry_run:
+        for r in results:
+            if r["text"]:
+                print("-" * 72)
+                print(r["text"][:4000] +
+                      ("\n… [truncated in dry-run preview]" if len(r["text"]) > 4000 else ""))
+                print("-" * 72)
+        return 0
+    kept = sum(1 for r in results if r["staged"])
+    print(f"\n[fetch] staged {kept} page(s) in {dir_}")
+    print("Review them (delete/edit files you don't want), then:")
+    print(f"  python -m photo_index.web_ingest commit --name {args.name} --embed")
     return 0
 
 
-def cmd_commit(args) -> int:
-    dir_ = _stage_dir(args.name, Path(args.staging_root))
+def rewrite_stage_body(path: Path, new_body: str) -> None:
+    """Replace a staged page's text while keeping its header (for GUI edits)."""
+    parsed = _parse_stage(path)
+    if not parsed:
+        return
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    header, _, _ = raw.partition(_HEADER_CLOSE)
+    path.write_text(f"{header}{_HEADER_CLOSE}\n\n{new_body.strip()}\n",
+                    encoding="utf-8")
+
+
+def commit_staging_dir(dir_: Path, db_path: Path, *, min_chars: int,
+                       embed: bool, log=print) -> dict:
+    """Ingest every .md still present in dir_ as web: rows. Returns counts.
+
+    The set of files present IS the review decision — deleting a staging file
+    (in Finder or the GUI) excludes that page. Re-commit is idempotent:
+    DELETE web:<hash>#% before insert, so refreshing never duplicates.
+    """
     files = sorted(p for p in dir_.glob("*.md"))
     if not files:
-        print(f"No staged .md files in {dir_}. Run `fetch --name {args.name}` first.")
-        return 1
-    conn = connect(Path(args.db))
+        log(f"No staged .md files in {dir_}.")
+        return {"pages": 0, "rows": 0, "skipped": 0}
+    conn = connect(db_path)
     init_schema(conn)
     pages = rows = skipped = 0
     for path in files:
         parsed = _parse_stage(path)
         if not parsed:
-            print(f"  [skip] no header: {path.name}")
+            log(f"  [skip] no header: {path.name}")
             continue
         meta, body = parsed
         url = meta.get("url", "").strip()
-        if not url or len(body) < args.min_chars:
+        if not url or len(body) < min_chars:
             skipped += 1
             continue
         title = meta.get("title") or url
         date_iso = meta.get("date") or datetime.now(timezone.utc).isoformat()
         base = "web:" + hashlib.sha1(url.encode()).hexdigest()[:16]
-        # Clean slate so a re-commit of an edited page doesn't duplicate.
         conn.execute("DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
                      (base, base + "#%"))
         chunks = _chunk_text(body)
@@ -413,15 +469,22 @@ def cmd_commit(args) -> int:
         pages += 1
     commit_ingest(conn)
     conn.close()
-    print(f"[commit] ingested {pages} page(s) → {rows} rows "
-          f"({skipped} skipped as too short). Source prefix: web:")
-    if args.embed:
+    log(f"[commit] ingested {pages} page(s) → {rows} rows "
+        f"({skipped} skipped as too short). Source prefix: web:")
+    if embed:
         if _embed_run is None:
-            print("[commit] embed_index unavailable; run it manually.")
+            log("[commit] embed_index unavailable; run it manually.")
         else:
-            print("[commit] embedding new rows…")
-            _embed_run(Path(args.db), batch=64, limit=None)
-    else:
+            log("[commit] embedding new rows…")
+            _embed_run(db_path, batch=64, limit=None)
+    return {"pages": pages, "rows": rows, "skipped": skipped}
+
+
+def cmd_commit(args) -> int:
+    dir_ = _stage_dir(args.name, Path(args.staging_root))
+    res = commit_staging_dir(dir_, Path(args.db), min_chars=args.min_chars,
+                             embed=args.embed)
+    if not args.embed and res["pages"]:
         print("Now embed the new rows:\n"
               "  PHOTO_INDEX_LLM_BACKEND=openai "
               "PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1 \\\n"
