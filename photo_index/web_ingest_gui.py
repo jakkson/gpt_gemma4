@@ -48,11 +48,24 @@ def do_fetch(urls_text, mode, max_pages, max_depth, limit, name, dry_run,
              render, ignore_robots, delay):
     """Fetch + stage. Returns log, table, dropdown, states, preview, reveal, text."""
     logs: list[str] = []
+    first = next((ln.strip() for ln in (urls_text or "").splitlines()
+                  if ln.strip()), "")
     targets = _targets_for(mode, urls_text, max_pages, max_depth,
                            ignore_robots, delay, limit)
     if not targets:
-        return ("No URLs found. Paste at least one URL above.", [],
-                gr.update(choices=[], value=None), "", {}, "",
+        if not first:
+            msg = "Paste at least one URL above."
+        elif mode == _MODES[1]:
+            msg = (f"Sitemap returned 0 URLs from {first!r}. Check it's a real "
+                   "sitemap.xml (open it in a browser) and that it loaded just "
+                   "now — retry once; a transient fetch failure lands here too.")
+        elif mode == _MODES[2]:
+            msg = (f"Crawl found 0 pages from {first!r}. Check the start URL "
+                   "loads and links stay on the same host.")
+        else:
+            msg = (f"Couldn't use {first!r}. In Single mode paste the page URL "
+                   "directly; for a sitemap switch Mode to 'Whole site (sitemap)'.")
+        return (msg, [], gr.update(choices=[], value=None), "", {}, "",
                 gr.update(visible=False), "")
     logs.append(f"{len(targets)} target(s). "
                 f"{'PREVIEW — nothing will be staged.' if dry_run else ''}")
