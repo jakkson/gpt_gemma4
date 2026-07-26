@@ -109,6 +109,21 @@ if ! past_deadline && [[ -d "$BOOKS_ROOT" ]]; then
     || echo "[nightly warn] library ingest failed"
 fi
 
+# Extra document folders outside ~/Dropbox/Documents (text extraction only, same
+# as the library step — images/video/audio are not captioned here). Add more
+# paths to the array as needed.
+EXTRA_DOC_ROOTS=(
+  "$HOME/Dropbox/KPIX"
+)
+for extra in "${EXTRA_DOC_ROOTS[@]}"; do
+  if ! past_deadline && [[ -d "$extra" ]]; then
+    echo "[nightly] ingesting extra folder: $extra"
+    "$PYTHON_BIN" -m photo_index.documents_ingest \
+      --db "$ROOT/data/photo_index.sqlite" --root "$extra" --progress-every 50 \
+      || echo "[nightly warn] extra folder ingest failed: $extra"
+  fi
+done
+
 # Apple Calendar events (personal cals in full, holidays next 365 d, subscribed
 # skipped). Reads a copy of the store so a running Calendar app can't lock it.
 if ! past_deadline; then
