@@ -363,6 +363,11 @@ def stage_targets(targets: list[str], dir_: Path, *, robots: _Robots, ua: str,
     """
     if not dry_run:
         dir_.mkdir(parents=True, exist_ok=True)
+        prior = list(dir_.glob("*.md"))
+        if prior:
+            log(f"[fetch] note: {len(prior)} un-committed file(s) already staged "
+                f"under this run name — commit would include them too. Use a new "
+                f"--name for a separate run, or commit/clear these first.")
     manifest = None if dry_run else (dir_ / "_manifest.jsonl")
     results: list[dict] = []
     for i, url in enumerate(targets, 1):
@@ -478,6 +483,20 @@ def commit_staging_dir(dir_: Path, db_path: Path, *, min_chars: int,
     conn.close()
     log(f"[commit] ingested {pages} page(s) → {rows} rows "
         f"({skipped} skipped as too short). Source prefix: web:")
+    # Archive the just-committed files out of the active review area so a later
+    # commit/fetch to the same run name can NEVER re-ingest them (the bug that
+    # duplicated a blog when its first crawl's files lingered in staging).
+    archived = dir_ / "_committed" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        archived.mkdir(parents=True, exist_ok=True)
+        for p in files:
+            p.rename(archived / p.name)
+        man = dir_ / "_manifest.jsonl"
+        if man.exists():
+            man.rename(archived / "_manifest.jsonl")
+        log(f"[commit] archived {len(files)} staged file(s) → {archived}")
+    except Exception as e:  # noqa: BLE001 — archiving is best-effort
+        log(f"[commit] (note) could not archive staged files: {e}")
     if embed:
         if _embed_run is None:
             log("[commit] embed_index unavailable; run it manually.")
