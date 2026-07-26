@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # launchd entry: run the incremental ingest overnight, then restore search.
 #
-# Schedule (see the launchd plist): starts at 00:00 and HARD-STOPS at 04:30 no
-# matter what — the ingest is fully incremental, so a 04:30 kill just resumes
-# the next night. The hard stop guarantees the vision ingest can never bleed
+# Schedule (see the launchd plist): starts at 22:00 and HARD-STOPS at 04:30 no
+# matter what (a ~6.5 h window, 7 days a week) — the ingest is fully incremental,
+# so a 04:30 kill just resumes the next night. The hard stop guarantees the vision ingest can never bleed
 # into the day: on a 32 GB Mac the answer model (~17 GB) and the vision model
 # (~19 GB) cannot coexist, and a daytime overlap caused GPU-OOM crashes and a
 # kernel panic. For the same reason we take the SEARCH APP OFFLINE for the whole
@@ -47,12 +47,18 @@ pkill -f "photo_index.gradio_app" 2>/dev/null || true
 [[ -x "$LMS_BIN" ]] && "$LMS_BIN" unload "$QA_MODEL" >/dev/null 2>&1 || true
 
 # --- 04:30 hard stop ----------------------------------------------------------
-# Kill every ingest worker at 04:30 wall-clock. If launched after 04:30 (e.g. a
-# wake-from-sleep catch-up run), cap the run at 4.5 h instead so it still can't
-# run all day.
-HARD_STOP=$(date -v4H -v30M -v0S +%s 2>/dev/null || echo 0)
+# Schedule: launchd fires at 22:00; this kills every ingest worker at the NEXT
+# 04:30 wall-clock (a ~6.5 h window). Computed as the upcoming 04:30 — if today's
+# 04:30 has already passed (any evening start, incl. the 22:00 norm), use
+# tomorrow's. A 7 h safety cap keeps a wrong-time catch-up run (e.g. a daytime
+# wake-from-sleep launch) from bleeding through the whole day.
 NOW=$(date +%s)
-if [ "$HARD_STOP" -le "$NOW" ]; then HARD_STOP=$((NOW + 16200)); fi
+HARD_STOP=$(date -v4H -v30M -v0S +%s 2>/dev/null || echo 0)
+if [ "$HARD_STOP" -le "$NOW" ]; then
+  HARD_STOP=$(date -v+1d -v4H -v30M -v0S +%s 2>/dev/null || echo $((NOW + 23400)))
+fi
+MAX_END=$((NOW + 25200))   # 7 h safety cap
+if [ "$HARD_STOP" -gt "$MAX_END" ]; then HARD_STOP="$MAX_END"; fi
 # Test hook: PHOTO_INDEX_NIGHTLY_MAX_SECONDS=<n> forces a short window so the
 # whole cycle (app-down -> deadline kill -> app restore) can be verified quickly.
 if [ -n "${PHOTO_INDEX_NIGHTLY_MAX_SECONDS:-}" ]; then
