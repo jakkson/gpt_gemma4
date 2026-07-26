@@ -121,11 +121,20 @@ fi
 EXTRA_DOC_ROOTS=(
   "$HOME/Dropbox/KPIX"
 )
+# Subfolders to skip within the extra roots (raw data we'll parse with a
+# dedicated tool later, not free-text). KPIX Ratings = ~150K near-duplicate
+# ratings-table chunks; excluded from generic text ingest.
+EXTRA_DOC_EXCLUDES=(
+  "$HOME/Dropbox/KPIX/KPIX Ratings"
+)
 for extra in "${EXTRA_DOC_ROOTS[@]}"; do
   if ! past_deadline && [[ -d "$extra" ]]; then
     echo "[nightly] ingesting extra folder: $extra"
+    excl_args=()
+    for ex in "${EXTRA_DOC_EXCLUDES[@]}"; do excl_args+=(--exclude "$ex"); done
     "$PYTHON_BIN" -m photo_index.documents_ingest \
       --db "$ROOT/data/photo_index.sqlite" --root "$extra" --progress-every 50 \
+      "${excl_args[@]}" \
       || echo "[nightly warn] extra folder ingest failed: $extra"
   fi
 done

@@ -472,10 +472,17 @@ def run_documents_ingest(
     skip_images: bool,
     skip_audio: bool,
     max_chars_per_file: int,
+    exclude: tuple[str, ...] = (),
 ) -> dict[str, int | float]:
     root = Path(os.path.abspath(root)).resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Root is not a directory: {root}")
+    # Absolute, resolved prefixes to skip entirely (e.g. a noisy subfolder).
+    exclude_prefixes = tuple(
+        str(Path(os.path.abspath(os.path.expanduser(e))).resolve()) for e in exclude
+    )
+    if exclude_prefixes:
+        _log(f"[documents] excluding paths under: {', '.join(exclude_prefixes)}")
 
     conn = connect(index_db_path)
     init_schema(conn)
@@ -616,6 +623,9 @@ def run_documents_ingest(
             rp = p.resolve()
             rel_parts = rp.relative_to(root_rp).parts
         except ValueError:
+            continue
+        if exclude_prefixes and str(rp).startswith(exclude_prefixes):
+            skipped_noise += 1
             continue
         if any(seg.startswith(".") for seg in rel_parts):
             skipped_hidden += 1
@@ -812,6 +822,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Truncate stored text beyond this character count.",
     )
     p.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Skip files under this path (repeatable). E.g. a noisy subfolder.",
+    )
+    p.add_argument(
         "--no-global-ingest-lock",
         action="store_true",
         help="Don't use shared content-ingest.lock (not recommended).",
@@ -844,6 +861,7 @@ def main(argv: list[str] | None = None) -> None:
             skip_images=not args.include_images,
             skip_audio=not args.include_audio,
             max_chars_per_file=max(10_000, args.max_chars_per_file),
+            exclude=tuple(args.exclude),
         )
 
     if args.no_global_ingest_lock:
