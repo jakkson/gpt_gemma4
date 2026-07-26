@@ -65,7 +65,7 @@ past_deadline() { [ "$(date +%s)" -ge "$HARD_STOP" ]; }
   echo "[nightly] hard stop ($(date -r "$HARD_STOP" '+%H:%M')) — ending ingest"
   for _ in 1 2 3; do
     for m in nightly documents_ingest documents_vlm_ingest messages_ingest \
-             mail_ingest evernote_ingest calendar_ingest embed_index; do
+             mail_ingest evernote_ingest calendar_ingest history_ingest embed_index; do
       pkill -f "photo_index.$m" 2>/dev/null
     done
     sleep 3
@@ -116,6 +116,16 @@ if ! past_deadline; then
   "$PYTHON_BIN" -m photo_index.calendar_ingest \
     --db "$ROOT/data/photo_index.sqlite" --progress-every 2000 \
     || echo "[nightly warn] calendar ingest failed"
+fi
+
+# Browser history (Safari + Chrome): title/URL metadata for "where/what did I
+# see?". Read-only on the browsers (copies each DB first). Incremental: re-runs
+# refresh recency and only re-embed genuinely new/changed pages.
+if ! past_deadline; then
+  echo "[nightly] ingesting browser history (Safari + Chrome) ..."
+  "$PYTHON_BIN" -m photo_index.history_ingest \
+    --db "$ROOT/data/photo_index.sqlite" \
+    || echo "[nightly warn] history ingest failed"
 fi
 
 # Embed new rows (nomic in LM Studio — independent of the unloaded answer model).
