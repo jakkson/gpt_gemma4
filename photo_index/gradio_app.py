@@ -3088,6 +3088,19 @@ def build_app(
       display: inline;
     }
     button.pi-open-local-file:hover { color: #1d4ed8; }
+
+    /* Mobile (iPhone etc.): the search + follow-up controls sit in horizontal
+       Rows that overflow a narrow screen, pushing the Search button off to the
+       right. Below a phone-width breakpoint, stack those Rows vertically and let
+       every control fill the width, so the button is always reachable without
+       sideways scrolling. Desktop layout is unaffected (media query). */
+    @media (max-width: 640px) {
+      .gradio-container { max-width: 100% !important; padding-left: 6px !important; padding-right: 6px !important; }
+      .pi-row-mobile { flex-direction: column !important; align-items: stretch !important; }
+      .pi-row-mobile > * { width: 100% !important; min-width: 0 !important; }
+      #photo-search-btn, #photo-stop-search-btn { width: 100% !important; }
+      body { overflow-x: hidden; }
+    }
     """
     # Inject CSS via a <style> element rather than Blocks(css=...): Gradio 6 moved
     # that param to launch(), but we mount the app instead of launching it, so a
@@ -3178,7 +3191,7 @@ def build_app(
             lines=2,
             elem_id="photo-query-input",
         )
-        with gr.Row():
+        with gr.Row(elem_classes=["pi-row-mobile"]):
             answer_style = gr.Radio(
                 choices=["Conversational", "Precise (citations)"],
                 value="Conversational",
@@ -3225,7 +3238,7 @@ def build_app(
             followup_chat = gr.Chatbot(
                 label="Follow-up chat", elem_id="pi-followup", height=280,
             )
-            with gr.Row():
+            with gr.Row(elem_classes=["pi-row-mobile"]):
                 followup_box = gr.Textbox(
                     placeholder='Reply to the answer above — e.g. "yes, break down the ingredients"',
                     label="Your follow-up", scale=5, lines=1,
