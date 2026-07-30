@@ -34,6 +34,14 @@ export PHOTO_INDEX_QA_MODEL="${PHOTO_INDEX_QA_MODEL:-qwen3-30b-a3b-instruct-2507
 # testing; set PHOTO_INDEX_RERANK=0 to A/B back to the previous ranking.
 export PHOTO_INDEX_RERANK="${PHOTO_INDEX_RERANK:-1}"
 
+# Optional app login for remote (Tailscale) access. Credential lives in a LOCAL,
+# gitignored file (data/.search_auth: PHOTO_INDEX_AUTH="user:pass") so it never
+# enters the public repo. Absent file = no login gate (local-only behaviour).
+if [[ -f data/.search_auth ]]; then
+  # shellcheck disable=SC1091
+  source data/.search_auth
+fi
+
 ROUTE_FLAG="--no-auto-route"
 
 # Guard: the answer model MUST be loaded with a large context. LM Studio's

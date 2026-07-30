@@ -3546,7 +3546,19 @@ def main(argv: list[str] | None = None) -> None:
         include_in_schema=False,
     )
     port = _find_free_port(args.host, args.port, attempts=10)
-    gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host, server_port=port)
+    # Optional app login (defense-in-depth for remote access over Tailscale).
+    # PHOTO_INDEX_AUTH="user:pass" enables a Gradio login gate; unset = no gate
+    # (unchanged local behaviour). The credential is supplied via a local,
+    # gitignored env file — never hard-coded here.
+    auth = None
+    _auth_env = os.environ.get("PHOTO_INDEX_AUTH", "").strip()
+    if _auth_env and ":" in _auth_env:
+        _u, _pw = _auth_env.split(":", 1)
+        if _u and _pw:
+            auth = (_u, _pw)
+            print(f"[gradio] app login enabled for user {_u!r}", flush=True)
+    gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host,
+                        server_port=port, auth=auth)
     uvicorn.run(api_app, host=args.host, port=port, log_level="info")
 
 
