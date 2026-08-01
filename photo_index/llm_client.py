@@ -95,6 +95,25 @@ def inference_opts_for_model(model: str) -> dict[str, Any]:
     }
 
 
+def _apply_no_think(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """When PHOTO_INDEX_NO_THINK is truthy, append Qwen3's ``/no_think`` switch so
+    a HYBRID thinking model (e.g. dense Qwen3-32B) answers directly instead of
+    emitting chain-of-thought that overflows the large RAG prompt. No-op for the
+    non-thinking instruct models (30B-A3B, 235B-A22B) — only set the env for a
+    thinking-capable model. Applied here so every answer path is covered at once.
+    """
+    flag = os.environ.get("PHOTO_INDEX_NO_THINK", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return messages
+    out = [dict(m) for m in messages]
+    tgt = next((m for m in out if m.get("role") == "system"), None)
+    if tgt is None:
+        tgt = next((m for m in reversed(out) if m.get("role") == "user"), None)
+    if tgt is not None and "/no_think" not in str(tgt.get("content", "")):
+        tgt["content"] = f"{str(tgt.get('content', '')).rstrip()}\n\n/no_think"
+    return out
+
+
 def chat_completion_text(
     *,
     model: str,
@@ -104,6 +123,7 @@ def chat_completion_text(
     stream: bool | None = None,
 ) -> str:
     """Run a chat completion; return assistant text."""
+    messages = _apply_no_think(messages)
     opts = inference_opts_for_model(model)
     if timeout is None:
         timeout = float(opts["timeout"])
