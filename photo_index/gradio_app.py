@@ -724,12 +724,26 @@ def _safe_chat_messages(*, model: str, messages: list[dict]) -> tuple[str, str |
 
 
 # Words that mark a follow-up as a meta-instruction / drill-down on the prior
-# answer rather than a new topic to search for.
+# answer rather than a new topic to search for. Includes affirmative openers
+# (answering the assistant's "want me to…?" offer) and generic "split it into
+# parts" words — so "yes, break down the ingredients" continues the current
+# conversation instead of literally searching for "ingredients" (which used to
+# jump to an unrelated recipe). A genuinely new entity in the reply (e.g.
+# "…what about BeenVerified?") still leaves a non-meta term and triggers a
+# fresh search.
 _FOLLOWUP_META = frozenset({
     "summarize", "summarise", "summary", "shorter", "short", "brief", "briefly",
     "rephrase", "reword", "condense", "expand", "elaborate", "list", "bullet",
     "bullets", "sentence", "sentences", "tldr", "recap", "simplify", "clarify",
     "explain", "detail", "details", "more", "less", "again", "instead",
+    # affirmative / continuation openers
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "go", "ahead",
+    "continue", "proceed", "do", "sounds", "great", "thanks",
+    # generic "break it into parts" / drill-down structure words
+    "break", "down", "breakdown", "walk", "through", "step", "steps", "part",
+    "parts", "piece", "pieces", "component", "components", "element", "elements",
+    "aspect", "aspects", "point", "points", "ingredient", "ingredients",
+    "factor", "factors", "reason", "reasons", "area", "areas", "item", "items",
 })
 
 
