@@ -18,3 +18,4 @@ striprtf>=0.0.26
 # Cross-encoder reranking (precision stage for retrieval); pulls in torch (MPS on Apple Silicon).
 sentence-transformers>=3.0
 numpy>=1.24
+trafilatura>=2.1

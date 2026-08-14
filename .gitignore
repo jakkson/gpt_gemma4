@@ -12,3 +12,23 @@ data/
 # Compiled Swift OCR helper (architecture-specific binary; rebuild from
 # photo_index/_vision_ocr_swift.swift via `swiftc -O -parse-as-library …`)
 photo_index/_vision_ocr_swift
+data/evernote/en_backup.db
+data/evernote/export/
+data/mail_rule*.watermark
+data/mail_rule*.log
+data/mail_rule*.error.log
+data/about_me.md
+data/query_log.jsonl
+data/.open_local_file_token
+data/mail_routes.json
+data/mail_dropper.log
+
+# Retrieval eval suite embeds real personal query examples — keep local
+photo_index/eval_retrieval.py
+
+# Personal documents — never commit to the public repo
+LLM_Ingest_Pipelines.docx
+Local_LLM_Stack_Chat.pdf
+Personal_LLM_Stack_Overview.docx
+*.docx
+*.pdf

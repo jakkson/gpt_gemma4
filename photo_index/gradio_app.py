@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -16,7 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -33,6 +34,7 @@ from fastapi.responses import Response
 from PIL import Image
 
 from photo_index.llm_client import (
+    chat_completion_text,
     chat_user_prompt,
     embed_query,
     inference_opts_for_model,
@@ -56,7 +58,93 @@ from photo_index.store import (
 _DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "photo_index.sqlite"
 _CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "gradio_search_cache.json"
 _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.json"
+# Persistent user profile: free-text facts ("Zumy is my dog") prepended to every
+# answer + follow-up so the model applies them even when the records don't restate
+# them. Edited in the UI or on disk; read fresh each prompt (tiny file).
+_ABOUT_ME_PATH = Path(__file__).resolve().parent.parent / "data" / "about_me.md"
 _CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+# Durable, append-only log of every real question + outcome, for reviewing your
+# real-world phrasing and spotting failures (no_match / refusal). One JSON object
+# per line: ts, q, status, hits, route, model.
+_QUERY_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "query_log.jsonl"
+
+
+def _log_query(question: str, *, status: str, hits: int = 0, route: str = "", model: str = "") -> None:
+    q = (question or "").strip()
+    if not q:
+        return
+    try:
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "q": q,
+            "status": status,  # ok | no_match | refusal | error | cache | followup
+            "hits": int(hits),
+            "route": route,
+            "model": model,
+        }
+        _QUERY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _QUERY_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _load_about_me() -> str:
+    """Completed profile facts for prompt injection.
+
+    The file doubles as a fill-in questionnaire, so we skip lines that are notes
+    (start with '#'), blank, or still contain an unfilled blank ('___'). Only
+    finished fact lines reach the model — the raw file (with the questionnaire)
+    is what the UI editor shows via load_about_me_text()."""
+    try:
+        raw = _ABOUT_ME_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    facts: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "___" in s:
+            continue
+        facts.append(s)
+    return "\n".join(facts).strip()
+
+
+def _today_note() -> str:
+    """Live current-date note injected into EVERY answer/chat prompt so the model
+    can reason about past vs. upcoming. Computed from the system clock each call
+    (never a static file, which would go stale). ~90 tokens; zero retrieval cost."""
+    return (
+        f"TODAY'S DATE is {datetime.now().strftime('%A, %B %-d, %Y')}.\n"
+        "DATE RULES (read carefully):\n"
+        "- Each record's 'date' is when it was RECEIVED/created — that is always in "
+        "the past and does NOT mean the event it describes is past.\n"
+        "- The EVENT date (trip, flight, appointment) is inside the record's text. "
+        "Compare THAT to today. A booking received last week for a trip next month "
+        "is UPCOMING.\n"
+        "- Partial dates like '08/06' in a recently received email mean the next "
+        "upcoming occurrence (e.g. August 6 of this year), not a past year.\n"
+        "- An old record (received years ago) describes a PAST event even if its "
+        "text says 'upcoming' — it was upcoming back then, not now.\n\n"
+    )
+
+
+def _about_me_block() -> str:
+    """Formatted profile block for prompt injection, or '' when no facts set."""
+    facts = _load_about_me()
+    if not facts:
+        return ""
+    return (
+        "KNOWN FACTS ABOUT THE USER (persistent profile — background context to "
+        "help you interpret the records):\n"
+        f"{facts}\n"
+        "IMPORTANT: these facts ADD context (who people/pets are, what nicknames "
+        "mean). They NEVER override, limit, or negate the indexed records: if the "
+        "records show a purchase, payment, or event, report it as evidence even "
+        "when a profile fact seems to point elsewhere. Records win over profile "
+        "facts whenever they appear to conflict.\n\n"
+    )
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
 # In-process cache of the embedding matrix (loaded from the .npy sidecar). On TTL
@@ -177,6 +265,10 @@ _LOCAL_INDEX_POLICY = """LOCAL PRIVATE INDEX (READ FIRST)
   it is reading back text from their own documents.
 - NEVER refuse with "I cannot access medical records", "I'm a chatbot without your health data", or
   "contact your doctor" if the indexed records below actually contain the answer.
+- MATCH THE SPECIES: newsletters about HUMAN nutrition/health (Dr. Weil, Consumer Reports,
+  news digests, etc.) are NOT evidence about pet/dog nutrition or pet food — do not use them
+  to evaluate a pet's diet or recipe unless the question is about people. If the records lack
+  pet-specific guidance, say so instead of substituting human-nutrition content.
 - You MUST still avoid inventing facts not present in the records.
 
 """
@@ -189,9 +281,130 @@ def _build_prompt(
     aggregate: bool = False,
     scope_month: tuple[int, int] | None = None,
     field_char_cap: int | None = None,
+    conversational: bool = False,
 ) -> str:
-    blocks = [row_to_prompt_block(r, field_char_cap=field_char_cap) for r in rows]
+    # For money questions, prefix each record with deterministic, regex-extracted
+    # key facts (source, date, dollar amounts). Long marketing emails bury the
+    # amounts after hundreds of chars of boilerplate, and models were misreading
+    # or inventing amounts/senders; this hands them clean signals to aggregate.
+    finance_headers = _is_finance_query(question)
+    itinerary_mode = _is_itinerary_query(question) and _wants_future(question)
+    calendar_mode = _is_calendar_query(question)
+    blocks = []
+    for r in rows:
+        uid0 = str(r["uuid"] or "")
+        if calendar_mode and uid0.startswith("cal:"):
+            # Ingested iCal events already store clean, structured text
+            # ("Calendar event: <title>\nWhen: <date>\nWhere: …\nCalendar: …").
+            # Present it verbatim under an EVENT label — the raw JSON dump (with
+            # the internal vlm_text change-tag) made the model overlook titles
+            # and answer "no event noted".
+            evt = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or "")).strip()
+            blocks.append("EVENT:\n  " + evt.replace("\n", "\n  "))
+            continue
+        if itinerary_mode and not finance_headers:
+            # Upcoming-trip questions get a COMPACT labeled record with the
+            # booking facts machine-extracted (confirmation-style codes, dates in
+            # the text) — the same treatment that fixed money answers. Raw JSON
+            # rows made the model cite a marketing email while missing the
+            # destination + confirmation code in the newest booking's subject.
+            raw_orig = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or ""))
+            raw = re.sub(r"\s{3,}", "  ", raw_orig)
+            fn = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["filename"] or ""))
+            uid = str(r["uuid"] or "")
+            parts = [p.strip() for p in fn.split("|")]
+            if uid.startswith(("mail:", "m365:")) and len(parts) >= 3:
+                sender = re.sub(r"\[[^\]]*\]\s*$", "", parts[2]).strip()
+                lines = ["RECORD (email, newest first):",
+                         f"  from: {sender[:90]}",
+                         f"  subject: {parts[1][:140]}"]
+            else:
+                lines = [f"RECORD: {fn[:160]}"]
+            lines.append(f"  received: {str(r['date_iso'] or '')[:10] or 'unknown'}")
+            # Confirmation-style codes: 5-8 chars, mixed letters+digits.
+            codes = [c for c in re.findall(r"\b[A-Z0-9]{5,8}\b", raw_orig)
+                     if re.search(r"[A-Z]", c) and re.search(r"\d", c)][:4]
+            if codes:
+                lines.append("  codes_in_text (possible confirmation numbers): "
+                             + ", ".join(dict.fromkeys(codes)))
+            dates_in = list(dict.fromkeys(
+                re.findall(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", raw)))[:5]
+            if dates_in:
+                lines.append("  dates_in_text: " + ", ".join(dates_in))
+            lines.append(f"  text: {raw[:500]}")
+            blocks.append("\n".join(lines))
+            continue
+        if finance_headers:
+            # Money questions get a COMPACT record: machine-extracted facts plus a
+            # short excerpt around each dollar amount, instead of the full noisy
+            # text. Long marketing emails bury amounts after hundreds of chars of
+            # boilerplate, and small models were misreading or inventing amounts /
+            # merchants when asked to aggregate across 15 full records.
+            raw = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["ocr_text"] or ""))
+            raw = re.sub(r"\s{3,}", "  ", raw)
+            fn = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", str(r["filename"] or ""))
+            uid = str(r["uuid"] or "")
+            # Mail rows pack "date | subject | sender [folder]" into filename —
+            # split into labeled fields so the model reliably attributes the
+            # MERCHANT/SENDER (it was misreading unlabeled pipes and assigning
+            # purchases to the wrong store).
+            parts = [p.strip() for p in fn.split("|")]
+            if uid.startswith(("mail:", "m365:")) and len(parts) >= 3:
+                sender = re.sub(r"\[[^\]]*\]\s*$", "", parts[2]).strip()
+                lines = ["RECORD (email):",
+                         f"  seller/sender: {sender[:90]}",
+                         f"  subject: {parts[1][:120]}"]
+            else:
+                lines = [f"RECORD: {fn[:160]}"]
+            lines.append(f"date: {str(r['date_iso'] or '')[:10] or 'unknown'}")
+            snippets: list[str] = []
+            for m in list(_MONEY_RE.finditer(raw))[:4]:
+                s = max(0, m.start() - 90)
+                snippets.append("…" + raw[s:m.end() + 60].strip() + "…")
+            if snippets:
+                lines.append("money mentions (verbatim excerpts):")
+                lines.extend(f"  - {s}" for s in snippets)
+            else:
+                lines.append("money mentions: NONE (no dollar amount in this record)")
+                lines.append(f"summary: {raw[:220]}")
+            blocks.append("\n".join(lines))
+        else:
+            block = row_to_prompt_block(r, field_char_cap=field_char_cap)
+            # Zero-width/preheader junk eats context — strip it.
+            block = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", block)
+            block = re.sub(r" {3,}", "  ", block)
+            blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
+    about_me = _about_me_block() + _today_note()
+    if _is_itinerary_query(question) and _wants_future(question):
+        about_me += (
+            "BOOKING ORDER: the records below are bookings/confirmations ordered "
+            "NEWEST-RECEIVED FIRST. The first record(s) are almost certainly the "
+            "user's current/upcoming plans — answer from them. Bookings received "
+            "years ago are past trips, not upcoming ones.\n\n"
+        )
+    if conversational:
+        style_block = """
+TONE & STYLE (important)
+- Write like a helpful assistant talking with the user — not like a search
+  engine returning results. Address them as "you".
+- Lead with the direct answer in the first sentence, then weave supporting
+  details into short, natural paragraphs. Avoid bullet-point dumps unless the
+  user explicitly asks for a list, table, or breakdown.
+- Refer to sources conversationally in-sentence — "your Capital One alert from
+  June 21", "an email from Fidelity in January 2019" — the exact records are
+  already listed below your answer, so never paste raw uuids, filenames, or
+  file paths into the prose.
+- If it feels natural, close with one short follow-up offer (e.g. "Want me to
+  break that down by month?"). Keep it to one sentence.
+"""
+        cite_rule = (
+            "- Attribute each fact to its source conversationally (who sent it and "
+            "when); do NOT quote raw uuids or filenames in the answer text."
+        )
+    else:
+        style_block = ""
+        cite_rule = "- Cite each record you use inline by its filename or imsg uuid."
     month_scope = ""
     if scope_month:
         label = _month_label(scope_month)
@@ -208,11 +421,15 @@ DATE SCOPE (critical — read before answering)
 (their own photos, OCR, VLM captions, and SMS/iMessage text).
 
 {_LOCAL_INDEX_POLICY}
-GROUND RULES
+{about_me}GROUND RULES
 - Use ONLY the indexed records below. Do NOT use outside / general knowledge.
+  EXCEPTION: you MAY use general knowledge to recognize what a product, brand,
+  or merchant IS (e.g. that "Full Moon Air Dried Chicken" is dog food, or that
+  a sender is a pet-supply store) — but NEVER to invent transactions, amounts,
+  dates, or events that are not in the records.
 - Quote exact dollar amounts and dates from the records when relevant.
-- Cite each record you use inline by its filename or imsg uuid.
-{month_scope}
+{cite_rule}
+{month_scope}{style_block}
 REASONING ALLOWED (this is an aggregate / "how much per month" question)
 1. Scan the records and list EVERY recurring/subscription/monthly charge you can find:
    merchant, amount, date, and the imsg uuid of the message.
@@ -239,16 +456,20 @@ User question: {question}
 (their own photos, OCR, VLM captions, and SMS/iMessage text).
 
 {_LOCAL_INDEX_POLICY}
-STRICT RULES
+{about_me}STRICT RULES
 - Use ONLY the indexed records below. Do not use outside / general knowledge.
   Do not summarize what a product or company is in general.
+  EXCEPTION: you MAY use general knowledge to recognize what a product, brand,
+  or merchant IS (e.g. that "Full Moon Air Dried Chicken" is dog food, or that
+  a sender is a pet-supply store) — but NEVER to invent transactions, amounts,
+  dates, or events that are not in the records.
 - For money / price / payment / charge / subscription questions, quote the exact
-  dollar amount and date(s) directly from the records, and cite the matching
-  record (filename or imsg uuid) inline.
+  dollar amount and date(s) directly from the records.
+{cite_rule}
 - You MAY add up, count, or compare amounts that are visible in the records.
 - Prefer the most recent matching record when the user asks about "latest",
   "currently", or "right now".
-{month_scope}
+{month_scope}{style_block}
 REFUSAL
 - Only say "I don't see that in your indexed data yet." if there are NO
   records at all that touch the topic. If there are partial matches, list what
@@ -430,6 +651,173 @@ def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
         return "", str(e)
 
 
+# --- Follow-up conversation ---------------------------------------------------
+#
+# A search is a one-shot RAG lookup. To let the user reply to the answer ("yes,
+# break it down") without re-searching for the literal words, we stash the last
+# search's retrieved records + Q/A here, and the follow-up chat reuses those same
+# records as context (no fresh retrieval) plus the running conversation history.
+_LAST_CONVO: dict[str, Any] = {"context": "", "turns": []}
+
+
+def _set_last_convo(context: str, question: str, answer: str) -> None:
+    _LAST_CONVO["context"] = context or ""
+    _LAST_CONVO["turns"] = [(question, answer)] if (question or answer) else []
+
+
+def _seed_chat_from_last() -> list:
+    """Seed the Chatbot (messages format) with the last search's Q/A."""
+    msgs: list[dict] = []
+    for u, a in (_LAST_CONVO.get("turns") or []):
+        msgs.append({"role": "user", "content": str(u)})
+        msgs.append({"role": "assistant", "content": str(a)})
+    return msgs
+
+
+def _chat_system_prompt(context: str) -> str:
+    return (
+        "You are having a running conversation with the user about their own "
+        "on-device personal index (their photos, OCR, captions, messages, email, "
+        "and notes).\n\n"
+        f"{_LOCAL_INDEX_POLICY}"
+        f"{_about_me_block()}{_today_note()}"
+        "GROUND RULES\n"
+        "- The indexed records below were retrieved as the MOST RELEVANT to the "
+        "user's latest message — treat them as the material to answer from. If a "
+        "brand, sender, or name in the records matches the user's wording even "
+        "with different spacing or capitalization (e.g. 'Been Verified' IS the "
+        "'BeenVerified' sender in the records), that is exactly what they are "
+        "asking about — describe what those records show, don't reinterpret the "
+        "question into something the records lack.\n"
+        "- Use ONLY the indexed records below plus what has already been said in "
+        "this conversation. Do not use outside general knowledge — EXCEPT to "
+        "recognize what a product, brand, or merchant IS (never to invent "
+        "transactions, amounts, dates, or events not in the records).\n"
+        "- Answer in a natural, conversational tone; refer to sources in-sentence "
+        "and never paste raw uuids or filenames.\n"
+        "- If the user asks for something the records and prior turns don't "
+        "support, say so briefly rather than inventing it.\n"
+        "- NEVER say you 'cannot access' the user's email, messages, photos, or "
+        "files, or that you lack access to external servers — these are the "
+        "user's OWN indexed records, already retrieved below. If they contain "
+        "the answer, use it; if they don't, just say you didn't find it in the "
+        "index.\n\n"
+        f"Indexed records:\n{context}\n"
+    )
+
+
+def _safe_chat_messages(*, model: str, messages: list[dict]) -> tuple[str, str | None]:
+    opts = inference_opts_for_model(model)
+    try:
+        return (
+            chat_completion_text(
+                model=model,
+                messages=messages,
+                timeout=float(opts["timeout"]),
+                max_tokens=int(opts["max_tokens"]),
+                stream=False,
+            ),
+            None,
+        )
+    except Exception as e:
+        return "", str(e)
+
+
+# Words that mark a follow-up as a meta-instruction / drill-down on the prior
+# answer rather than a new topic to search for. Includes affirmative openers
+# (answering the assistant's "want me to…?" offer) and generic "split it into
+# parts" words — so "yes, break down the ingredients" continues the current
+# conversation instead of literally searching for "ingredients" (which used to
+# jump to an unrelated recipe). A genuinely new entity in the reply (e.g.
+# "…what about BeenVerified?") still leaves a non-meta term and triggers a
+# fresh search.
+_FOLLOWUP_META = frozenset({
+    "summarize", "summarise", "summary", "shorter", "short", "brief", "briefly",
+    "rephrase", "reword", "condense", "expand", "elaborate", "list", "bullet",
+    "bullets", "sentence", "sentences", "tldr", "recap", "simplify", "clarify",
+    "explain", "detail", "details", "more", "less", "again", "instead",
+    # affirmative / continuation openers
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "go", "ahead",
+    "continue", "proceed", "do", "sounds", "great", "thanks",
+    # generic "break it into parts" / drill-down structure words
+    "break", "down", "breakdown", "walk", "through", "step", "steps", "part",
+    "parts", "piece", "pieces", "component", "components", "element", "elements",
+    "aspect", "aspects", "point", "points", "ingredient", "ingredients",
+    "factor", "factors", "reason", "reasons", "area", "areas", "item", "items",
+})
+
+
+def chat_follow_up(user_msg: str, history: list, model: str,
+                   db_path: Path | None = None, top_k: int = 15):
+    """Continue the conversation. History is in Gradio's messages format
+    (list of {role, content}). Returns (updated_history, cleared_input).
+
+    A follow-up that names a NEW topic ("what about Been Verified?") is no longer
+    confined to the previous search's records: we retrieve fresh records for it
+    and merge them with the prior context, so the model doesn't falsely deny
+    data that IS in the index just because the last search didn't surface it."""
+    user_msg = (user_msg or "").strip()
+    history = list(history or [])
+    if not user_msg:
+        return history, ""
+    # Retrieve fresh records only when the follow-up names a NEW topic — not for
+    # meta-instructions ("summarize that shorter") or references to the prior
+    # answer ("those", "them"), which must stay a drill-down over prior context.
+    ql = user_msg.lower()
+    _referential = any(
+        f" {w} " in f" {ql} "
+        for w in ("that", "those", "these", "them", "it", "this", "they")
+    )
+    _topic_terms = [t for t in _query_content_terms(ql) if t not in _FOLLOWUP_META]
+    fresh_rows: list = []
+    if db_path is not None and _topic_terms and not _referential:
+        try:
+            sort = SORT_RECENT if _wants_recency(user_msg) else SORT_RELEVANT
+            fresh_rows = _retrieve_rows(
+                db_path=db_path, question=user_msg, top_k=top_k,
+                sort_by=sort, restrict_finance=False,
+            )
+        except Exception:
+            fresh_rows = []
+
+    if fresh_rows:
+        # New-topic follow-up: answer with the SAME prompt the main search uses —
+        # records go in the USER turn, where this small model actually reads them
+        # (the chat structure buried them in the system message and the model
+        # denied records that were right in front of it). Refresh the stored
+        # context so later drill-down follow-ups work on this new topic.
+        prompt = _build_prompt(user_msg, fresh_rows, conversational=True)
+        reply, err = _safe_chat(model=model, prompt=prompt)
+        if reply:
+            cap = _prompt_field_cap_for_model(model)
+            new_ctx = "\n\n---\n\n".join(
+                row_to_prompt_block(r, field_char_cap=cap) for r in fresh_rows
+            )
+            _set_last_convo(new_ctx, user_msg, reply)
+    else:
+        # Pure drill-down over the previous search's records (pronouns, "shorter").
+        context = str(_LAST_CONVO.get("context") or "")
+        if not context:
+            history.append({"role": "user", "content": user_msg})
+            history.append({"role": "assistant", "content": "Run a search first — then "
+                            "I can answer follow-ups about that result."})
+            return history, ""
+        messages = [{"role": "system", "content": _chat_system_prompt(context)}]
+        for m in history:
+            role = m.get("role") if isinstance(m, dict) else None
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": str(m.get("content", ""))})
+        messages.append({"role": "user", "content": user_msg})
+        reply, err = _safe_chat_messages(model=model, messages=messages)
+
+    if not reply:
+        reply = f"(follow-up failed: {err})" if err else "(no response)"
+    _log_query(user_msg, status="error" if err else "followup", model=model)
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": reply})
+    return history, ""
+
+
 def _build_term_vocab(conn: sqlite3.Connection, limit_rows: int = 5000) -> set[str]:
     rows = conn.execute(
         """
@@ -496,11 +884,189 @@ SORT_RELEVANT = "Most Relevant"
 SORT_RECENT = "Most Recent"
 SORT_OPTIONS = (SORT_RELEVANT, SORT_RECENT)
 
+# Conversational message / email sources. The 'mail:' Apple-Mail ingest was added
+# AFTER the retrieval logic, which historically only checked imsg:/m365:; treat
+# all three as "message/mail" so email discovery, recency, and scoring include
+# Apple Mail (otherwise e.g. an "email from Walmart" query drops all mail: rows).
+_MSG_MAIL_PREFIXES = ("imsg:", "m365:", "mail:")
+_MSG_MAIL_SQL = "(uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')"
+
+# Words that signal the user wants results ordered by date rather than relevance.
+# Replaces the old manual "Most Recent" radio — recency is inferred from the query.
+_RECENCY_TERMS = (
+    "most recent", "latest", "newest", "recent", "recently", "lately",
+    "last email", "last message", "last text", "last photo", "last note",
+    "this week", "this month", "these days", "just got", "just received",
+)
+
+
+def _wants_recency(question: str) -> bool:
+    q = " ".join((question or "").strip().lower().split())
+    return any(t in q for t in _RECENCY_TERMS)
+
+
+# Words that ask about the FUTURE ("my next trip", "upcoming flight"). These
+# should order results future-first (soonest upcoming, then most-recent past),
+# instead of plain newest-received — so "when's my next X" finds the real one.
+_FUTURE_TERMS = (
+    "upcoming", "coming up", "next ", "future", "scheduled", "soon",
+    "this weekend", "next week", "next month", "days away", "yet to come",
+)
+
+
+def _wants_future(question: str) -> bool:
+    q = " " + " ".join((question or "").strip().lower().split()) + " "
+    return any(t in q for t in _FUTURE_TERMS)
+
+
+# --- Travel / booking / appointment recall -----------------------------------
+#
+# Generic "my next trip / flight / appointment" queries are drowned out by travel
+# MARKETING (fare sales, "book now"). Detect the intent, SEED real itinerary /
+# confirmation / appointment rows into the candidate pool (so recall is
+# guaranteed), and REWARD booking-signal rows in scoring so confirmations beat
+# sale blasts. Pairs with the future-date bonus to surface the *upcoming* one.
+_ITINERARY_TERMS = frozenset({
+    "trip", "trips", "flight", "flights", "flying", "travel", "traveling",
+    "itinerary", "itineraries", "reservation", "reservations", "booking",
+    "booked", "airfare", "layover", "boarding", "departure", "departures",
+    "vacation", "getaway", "hotel", "hotels", "appointment", "appointments",
+    "cruise", "flying", "airline",
+})
+
+
+def _is_itinerary_query(question: str) -> bool:
+    return bool(set(re.findall(r"[a-z]+", (question or "").lower())) & _ITINERARY_TERMS)
+
+
+# Calendar / schedule intent: the user is asking about their own agenda, not a
+# received email. These queries should surface the ingested iCal events
+# (uuid ``cal:``) rather than losing to recent marketing mail.
+_CALENDAR_TERMS = frozenset({
+    "calendar", "schedule", "scheduled", "agenda", "appointment", "appointments",
+    "meeting", "meetings", "event", "events", "reminder", "reminders", "plans",
+    "booked", "doctor", "dentist", "telemedicine", "telehealth",
+})
+# Phrases that, on their own, signal a schedule lookup ("what's on tomorrow").
+_CALENDAR_PHRASES = (
+    "what do i have", "what's on", "whats on", "what is on", "what's happening",
+    "whats happening", "on my calendar", "on the calendar", "coming up",
+    "due today", "do i have anything", "my day", "my week",
+)
+
+
+def _is_calendar_query(question: str) -> bool:
+    ql = (question or "").lower()
+    if set(re.findall(r"[a-z]+", ql)) & _CALENDAR_TERMS:
+        return True
+    if any(p in ql for p in _CALENDAR_PHRASES):
+        return True
+    # A relative date window ("next week", "tomorrow") also implies a schedule
+    # lookup even without an explicit calendar noun.
+    return _calendar_window(question) is not None
+
+
+def _calendar_window(question: str, today: date | None = None) -> tuple[str, str] | None:
+    """Return an inclusive (start_iso, end_iso) date window for relative phrases
+    like "today", "this week", "next weekend", or None if the query names no
+    window. Weeks are Monday-based."""
+    # Normalize punctuation to spaces so "next week?" still matches " next week ".
+    ql = " " + " ".join(re.sub(r"[^a-z0-9]+", " ", (question or "").lower()).split()) + " "
+    d = today or datetime.now().date()
+
+    def iso(a: date, b: date) -> tuple[str, str]:
+        return (a.isoformat(), b.isoformat())
+
+    monday = d - timedelta(days=d.weekday())  # Monday of the current week
+    # Saturday/Sunday of the current week.
+    sat = monday + timedelta(days=5)
+    sun = monday + timedelta(days=6)
+
+    m = re.search(r"\bnext (\d{1,2}) days\b", ql) or re.search(r"\bin the next (\d{1,2}) days\b", ql)
+    if m:
+        n = max(1, min(int(m.group(1)), 366))
+        return iso(d, d + timedelta(days=n))
+
+    if " day after tomorrow " in ql:
+        return iso(d + timedelta(days=2), d + timedelta(days=2))
+    if " tomorrow " in ql or " tomorrow's " in ql:
+        return iso(d + timedelta(days=1), d + timedelta(days=1))
+    if " today " in ql or " tonight " in ql or " due today " in ql:
+        return iso(d, d)
+    if " next weekend " in ql:
+        return iso(sat + timedelta(days=7), sun + timedelta(days=7))
+    if " this weekend " in ql or " the weekend " in ql or " weekend " in ql:
+        return iso(sat, sun)
+    if " next week " in ql:
+        nm = monday + timedelta(days=7)
+        return iso(nm, nm + timedelta(days=6))
+    if " this week " in ql or " the week " in ql:
+        return iso(d, sun)  # rest of the current week, from today
+    if " next month " in ql:
+        y, mo = (d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1)
+        start = date(y, mo, 1)
+        ny, nmo = (y + (1 if mo == 12 else 0), 1 if mo == 12 else mo + 1)
+        end = date(ny, nmo, 1) - timedelta(days=1)
+        return iso(start, end)
+    if " this month " in ql:
+        ny, nmo = (d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1)
+        end = date(ny, nmo, 1) - timedelta(days=1)
+        return iso(d, end)
+    return None
+
+
+# STRONG booking markers (transactional, rarely in marketing). Loose phrases
+# like "trip to" / "confirmed:" were dropped — they matched newsletters.
+_BOOKING_STRONG = (
+    "record locator", "boarding pass", "your itinerary", "itinerary for",
+    "e-ticket", "eticket", "flight confirmation", "confirmation number",
+    "confirmation code", "rapid rewards", "reservation confirmed",
+    "reservation number", "booking reference", "check in for your",
+    "checked in for", "your reservation is", "appointment confirmation",
+    "appointment reminder", "your appointment is", "you're checked in",
+)
+# Travel/booking senders — matched only in the FROM field, so a newsletter that
+# merely mentions "Delta" or "hotel" in its body doesn't count as a booking.
+_BOOKING_SENDERS = (
+    "southwest", "tripit", "tripcase", "united airlines", "delta air", "jetblue",
+    "alaska air", "american airlines", "expedia", "kayak", "priceline", "airbnb",
+    "vrbo", "booking.com", "hotels.com", "marriott", "hilton", "hyatt", "avis",
+    "hertz", "opentable", "amtrak", "aa.com", "flysouthwest",
+)
+
+
+def _sender_text(r: sqlite3.Row) -> str:
+    fn = str(r["filename"] or "")
+    sender = fn.rsplit("|", 1)[-1] if "|" in fn else ""
+    m = re.search(r"[Ff]rom:\s*([^\n]+)", str(r["ocr_text"] or ""))
+    if m:
+        sender += " " + m.group(1)[:150]
+    return sender.lower()
+
+
+# So distinctive they rarely appear outside a real booking — count on their own.
+_BOOKING_VERY_STRONG = ("boarding pass", "record locator", "e-ticket", "eticket")
+
+
+def _is_booking_row(r: sqlite3.Row) -> bool:
+    text = f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower()
+    if any(s in text for s in _BOOKING_VERY_STRONG):
+        return True
+    # Otherwise require BOTH a travel/booking sender AND a strong phrase — either
+    # alone is a false-positive magnet (airline marketing has the sender but no
+    # itinerary; a news digest may contain "itinerary for" in its body).
+    if any(s in _sender_text(r) for s in _BOOKING_SENDERS) and \
+       any(s in text for s in _BOOKING_STRONG):
+        return True
+    return False
+
 _BANK_ISSUERS = (
     "capital one", "chase", "wells fargo", "amex", "american express",
     "bank of america", "citi", "citibank", "discover", "venmo", "paypal",
     "apple cash", "apple card", "robinhood", "ally bank", "us bank",
     "synchrony", "barclays", "hsbc", "navy federal", "schwab", "fidelity",
+    # P2P / mobile payment apps — often the whole content of a payment screenshot.
+    "zelle", "cash app", "cashapp", "apple pay", "google pay", "samsung pay",
 )
 _TRANSACTION_WORDS = (
     "chrge", "charge", "charged", "hold ", "transaction", "placed on your",
@@ -536,14 +1102,16 @@ def _is_finance_query(question: str) -> bool:
 def _is_finance_hit_row(r: sqlite3.Row, *, restrict_finance: bool) -> bool:
     """Whether a row belongs in a finance/charge/payment query result set."""
     if restrict_finance:
+        # Narrowed: authoritative bank/credit-card transaction records only.
         return _is_transaction_row(r)
-    uid = str(r["uuid"] or "")
+    # Default (checkbox off): include a real charge/receipt from ANY source —
+    # messages, email, notes, OR a document/statement PDF (receipts, invoices,
+    # statements) — as long as it carries a real money amount plus a
+    # transaction/subscription/issuer signal. Requiring a '$' figure keeps
+    # ordinary text (a colonoscopy prep PDF, an article) from registering as a
+    # charge. Check the box to fall back to strict bank-statement matching.
     blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-    if uid.startswith(("imsg:", "m365:")):
-        return _is_transaction_text(blob)
-    # Documents/photos stay strict even when the checkbox is off — a colonoscopy
-    # prep PDF or ticket image is not a charge.
-    return _is_transaction_row(r)
+    return _is_transaction_text(blob)
 
 
 # Real money amount: must carry a '$' sign (or explicit USD). A bare "3.14" or
@@ -558,6 +1126,9 @@ _TXN_PHRASES = (
     "balance is", "new statement", "statement for", "posted", "purchase of",
     "you paid", "was placed on", "placed on your", "pay $", "due $",
     "charge on", "charged to", "bill of", "billed",
+    # P2P / payment-app screenshot phrasing (Venmo, Zelle, Apple Pay, Cash App…)
+    "you sent", "sent to", "paid to", "payment to", "you received",
+    "received from", "paid you", "sent you", "requested",
 )
 
 _SUBSCRIPTION_PHRASES = (
@@ -596,7 +1167,10 @@ def _is_transaction_row(r: sqlite3.Row) -> bool:
     so articles, summaries, and tax worksheets don't leak into a spending tally."""
     uid = str(r["uuid"] or "")
     blob = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}"
-    if uid.startswith(("imsg:", "m365:")):
+    # mail: (Apple Mail) belongs with the message-like sources — receipts and
+    # charge alerts arrive there. It was omitted (ingest postdates this code),
+    # which silently dropped ALL email receipts from strict finance retrieval.
+    if uid.startswith(_MSG_MAIL_PREFIXES):
         return _is_transaction_text(blob)
     if not _is_bank_source(blob):
         return False
@@ -623,6 +1197,166 @@ def _query_token_overlap(text: str, ql: str) -> int:
         if tok in t:
             n += 1
     return n
+
+
+# Generic discovery/source words that carry no entity meaning. Used to decide
+# whether a query names a specific thing ("walmart") vs. is a pure "show my
+# recent X" browse — which changes how Most Recent mode filters.
+_DISCOVERY_GENERIC = frozenset({
+    "email", "emails", "mail", "mails", "message", "messages", "text", "texts",
+    "msg", "msgs", "note", "notes", "doc", "docs", "document", "documents",
+    "photo", "photos", "pic", "pics", "picture", "pictures", "image", "images",
+    "find", "show", "list", "get", "see", "give", "recent", "recently", "latest",
+    "newest", "last", "mention", "mentions", "mentioning", "mentioned", "sent",
+    "send", "receive", "received", "about", "fashion", "thread", "threads",
+    "chat", "chats", "conversation", "file", "files", "anything", "everything",
+    # common browse residuals that would otherwise leak in as "entities"
+    "most", "more", "some", "please", "want", "need", "looking", "search",
+    "results", "result", "top", "regarding", "related", "any",
+})
+
+
+# Finance verbs / time words are query mechanics, not entities — anchoring on
+# "paying" or "2026" selects the wrong rows entirely.
+_CONTENT_TERM_SKIP = frozenset({
+    "pay", "pays", "paying", "paid", "payment", "payments", "spend", "spending",
+    "spent", "charge", "charged", "charges", "cost", "costs", "bill", "bills",
+    "billing", "fee", "fees", "subscription", "subscriptions", "owe", "due",
+    "price", "prices", "amount", "amounts", "money", "total", "sum",
+    "month", "months", "monthly", "week", "weeks", "weekly", "year", "years",
+    "yearly", "annual", "day", "days", "daily", "each", "every", "per",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    # auxiliaries/fillers — "been" anchored on Apple Card texts ("has been
+    # scheduled") and fed the model the wrong rows entirely
+    "been", "being", "will", "would", "could", "should", "shall", "might",
+    "must", "into", "onto", "over", "under", "there", "their", "them", "then",
+    "than", "when", "where", "which", "while", "who", "whom", "whose",
+    # ask-mechanics — "20 word summary of my..." made "word"/"summary" leak in
+    # as entities and anchor on marketing rows
+    "can", "cannot", "word", "words", "summary", "summarize", "summarise",
+    "brief", "briefly", "short", "quick",
+})
+
+
+def _title_phrases(question: str) -> list[str]:
+    """Multi-word Title-Case runs in the raw question, lowercased.
+
+    "my most recent SF Log Meeting" → ["sf log meeting"]. These are the user
+    naming a specific thing; token-level matching loses them ("SF" is dropped
+    by the <3-char filter, "log"/"meeting" are generic alone). A phrase is only
+    returned when at least one word isn't a stopword/filler, so sentence-start
+    pairs like "Can You" never qualify."""
+    out: list[str] = []
+    for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){1,5})\b",
+        question or "",
+    ):
+        words = m.group(1).split()
+        lowered = [w.lower().strip(".,'") for w in words]
+        if all(
+            w in _OVERLAP_STOP or w in _DISCOVERY_GENERIC or w in _CONTENT_TERM_SKIP
+            for w in lowered
+        ):
+            continue
+        out.append(" ".join(lowered))
+    return out
+
+
+def _query_content_terms(ql: str) -> list[str]:
+    """Meaningful entity tokens in a query (drop stopwords + generic browse words)."""
+    out: list[str] = []
+    for tok in re.findall(r"[a-z0-9'.-]+", (ql or "").lower()):
+        if len(tok) < 3 or tok in _OVERLAP_STOP or tok in _DISCOVERY_GENERIC:
+            continue
+        if tok in _CONTENT_TERM_SKIP or tok.isdigit():
+            continue
+        out.append(tok)
+    return out
+
+
+# --- Self-correcting retrieval (CRAG-lite) -----------------------------------
+#
+# The failure mode we kept hand-patching (SF Log, telemedicine, Walmart, …) is
+# always the same shape: the user NAMED a concrete thing and the first pass
+# didn't surface it. Rather than add a 14th intent detector each time, detect
+# that shape generically — a named anchor absent from the results — and let the
+# LLM rewrite the query once and retry. Frontier "corrective RAG" in miniature.
+_SELF_CORRECT_ON = os.environ.get("PHOTO_INDEX_SELF_CORRECT", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _query_anchors(question: str) -> tuple[list[str], list[str]]:
+    """Concrete things the user named: (title_phrases, distinctive_terms).
+
+    Distinctive = content terms of length >= 5 (short/generic words like "log"
+    or "note" don't count as a nameable anchor on their own)."""
+    phrases = _title_phrases(question)
+    terms = [t for t in _query_content_terms((question or "").lower()) if len(t) >= 5]
+    return phrases, terms
+
+
+def _rows_contain_anchor(rows: list, phrases: list[str], terms: list[str], top_n: int = 6) -> bool:
+    for r in rows[:top_n]:
+        txt = f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower()
+        if any(p in txt for p in phrases):
+            return True
+        if any(t in txt for t in terms):
+            return True
+    return False
+
+
+def _llm_rewrite_query(question: str, rows: list, model: str) -> str:
+    """Ask the local model for a better search query when the first pass missed.
+
+    Returns a cleaned keyword query, or "" on any failure (best-effort)."""
+    titles = "\n".join(f"- {str(r['filename'] or '')[:80]}" for r in rows[:6]) or "- (nothing)"
+    prompt = (
+        "You optimize search queries for a personal archive (emails, notes, "
+        "messages, documents, calendar).\n"
+        f"The user asked: {question!r}\n"
+        "A search returned these top results, which look off-topic or wrong:\n"
+        f"{titles}\n\n"
+        "Write ONE better search query to find what the user actually wants.\n"
+        "- Keep the distinctive names/entities, drop filler words.\n"
+        "- FIX likely typos and spelling ('Logg Meating' -> 'Log Meeting').\n"
+        "- Expand or contract obvious abbreviations if it helps ('SF' <-> "
+        "'San Francisco').\n"
+        "Output ONLY the query text — no quotes, no labels, no explanation."
+    )
+    try:
+        out = chat_user_prompt(model=model, prompt=prompt, max_tokens=40, stream=False)
+    except Exception:
+        return ""
+    line = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+    # Strip common wrappers the model adds despite instructions.
+    line = re.sub(r'^(search query|query|answer)\s*[:\-]\s*', "", line, flags=re.I)
+    line = line.strip().strip('"').strip("'").strip()
+    return line[:120]
+
+
+def _entity_focus_rows(question: str, rows: list) -> list:
+    """Rows matching the query's rarest content term (the distinctive entity).
+
+    Small models answer money questions correctly when given ONLY the relevant
+    records, but misattribute merchants/amounts when 3 relevant rows sit among
+    12 unrelated ones. Used to focus the LLM prompt for finance queries; the
+    on-screen hit list keeps the full row set. Falls back to all rows when the
+    query has no content terms or nothing matches."""
+    ql = " ".join((question or "").lower().split())
+    terms = _query_content_terms(ql)
+    if not terms:
+        return rows
+    pool = [
+        (r, f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower())
+        for r in rows
+    ]
+    counts = {t: sum(1 for _, txt in pool if t in txt) for t in terms}
+    present = {t: c for t, c in counts.items() if c > 0}
+    if not present:
+        return rows
+    anchor = min(present, key=present.get)
+    kept = [r for r, txt in pool if anchor in txt]
+    return kept or rows
 
 
 _MONTHS = {
@@ -766,7 +1500,7 @@ def _merge_imessage_like_tokens(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
                   AND (
                     lower(ocr_text) LIKE ?
                     OR lower(vlm_text) LIKE ?
@@ -915,7 +1649,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%')
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
                   AND (
                     ocr_text LIKE '%$%'
                     OR ocr_text LIKE '% chrge %'
@@ -939,6 +1673,97 @@ def _retrieve_rows(
                 if _money_re.search(blob):
                     merged[r["uuid"]] = r
 
+        # Booking / itinerary / appointment sweep: for travel-ish queries, pull
+        # real confirmation-type rows into the pool so they're candidates at all
+        # (generic "trip"/"flight" tokens otherwise retrieve only marketing).
+        if _is_itinerary_query(question):
+            markers = ["%confirmation%", "%itinerary%", "%reservation%", "%boarding%",
+                       "%your trip%", "%record locator%", "%appointment%",
+                       "%southwest%", "%tripit%", "%airbnb%", "%marriott%",
+                       "%expedia%", "%united airlines%", "%jetblue%",
+                       "%you're going to%", "%you’re going to%"]
+            where = " OR ".join(["lower(ocr_text) LIKE ?"] * len(markers))
+            booking_hits = conn.execute(
+                f"""
+                SELECT *, 0 AS rank FROM photo_meta
+                WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%')
+                  AND ({where})
+                ORDER BY date_iso DESC, ingested_at DESC
+                LIMIT ?
+                """,
+                (*markers, max(candidate_limit * 4, 400)),
+            ).fetchall()
+            for r in booking_hits:
+                if _is_booking_row(r):
+                    merged[r["uuid"]] = r
+
+        # Calendar / schedule sweep: for agenda queries ("what's on my calendar
+        # next week", "when is my next appointment"), pull the relevant iCal
+        # events (uuid cal:) directly so they're candidates. Generic FTS loses
+        # them to recent marketing mail otherwise.
+        if _is_calendar_query(question):
+            cal_win = _calendar_window(question)
+            if cal_win:
+                # Every event inside the named window (today, next week, …).
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%'
+                      AND substr(date_iso,1,10) >= ? AND substr(date_iso,1,10) <= ?
+                    ORDER BY date_iso ASC
+                    LIMIT ?
+                    """,
+                    (cal_win[0], cal_win[1], max(candidate_limit * 4, 200)),
+                ):
+                    merged[r["uuid"]] = r
+            # Content-term matches among events (e.g. "telemedicine", "dentist").
+            for term in _query_content_terms(ql):
+                if len(term) < 3:
+                    continue
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%' AND lower(ocr_text) LIKE ?
+                    ORDER BY date_iso DESC
+                    LIMIT ?
+                    """,
+                    (f"%{term}%", candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+            # "Next / upcoming" agenda with no explicit window: seed the soonest
+            # future events so the nearest appointment is in the pool.
+            if _wants_future(question) and not cal_win:
+                today_iso = datetime.now().strftime("%Y-%m-%d")
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'cal:%' AND substr(date_iso,1,10) >= ?
+                    ORDER BY date_iso ASC
+                    LIMIT ?
+                    """,
+                    (today_iso, candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+
+        # Title-phrase seeding: when the user names a specific titled thing
+        # ("SF Log Meeting"), guarantee rows containing the exact phrase are in
+        # the pool, newest first. Token-level FTS can drop the distinctive part
+        # ("SF" is under the 3-char floor) and rank generic matches above it.
+        q_phrases = _title_phrases(question)
+        if q_phrases:
+            for ph in q_phrases[:3]:
+                like = f"%{ph}%"  # SQLite LIKE is already case-insensitive
+                for r in conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE filename LIKE ? OR ocr_text LIKE ?
+                    ORDER BY date_iso DESC
+                    LIMIT ?
+                    """,
+                    (like, like, candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+
         # Message-discovery queries must always pull ``imsg:`` candidates: substring
         # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
         # ``Most Recent`` sorting used to float those above real texts.
@@ -948,7 +1773,7 @@ def _retrieve_rows(
                 """
                 SELECT *, 0 AS rank
                 FROM photo_meta
-                WHERE uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%'
+                WHERE uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'mail:%'
                 ORDER BY date_iso DESC, ingested_at DESC
                 LIMIT ?
                 """,
@@ -969,6 +1794,7 @@ def _retrieve_rows(
                 WHERE uuid NOT LIKE 'doc:%'
                   AND uuid NOT LIKE 'imsg:%'
                   AND uuid NOT LIKE 'm365:%'
+                  AND uuid NOT LIKE 'mail:%'
                 ORDER BY date_iso DESC, ingested_at DESC
                 LIMIT ?
                 """,
@@ -1012,6 +1838,18 @@ def _retrieve_rows(
                 ]
 
         wants_nyt = any(t in ql for t in ("ny times", "nytimes", "nyt", "new york times"))
+        # "upcoming/next": lift future-dated rows within the relevance ranking
+        # (not a pure date sort) so the nearest upcoming *relevant* item wins.
+        wants_future = _wants_future(question)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        # Travel/appointment queries: reward real booking/confirmation rows so
+        # they beat travel marketing that shares the same generic keywords.
+        wants_itinerary = _is_itinerary_query(question)
+        # Calendar / schedule intent: float ingested iCal events (cal:) and,
+        # for a named date window, the events that fall inside it.
+        wants_calendar = _is_calendar_query(question)
+        cal_window = _calendar_window(question) if wants_calendar else None
+        cal_future = wants_calendar and _wants_future(question)
 
         # Cross-encoder rerank (relevance mode only): re-score the surviving
         # candidates by reading each (question, row) pair jointly, then blend the
@@ -1046,7 +1884,7 @@ def _retrieve_rows(
             uid = str(r["uuid"] or "")
             is_imsg = uid.startswith("imsg:")
             is_m365 = uid.startswith("m365:")
-            is_chat_mail = is_imsg or is_m365
+            is_chat_mail = uid.startswith(_MSG_MAIL_PREFIXES)
             # bm25 rank (lower is better); fallback rows use 0
             rank = float(r["rank"]) if "rank" in r.keys() and r["rank"] is not None else 0.0
             text = f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower()
@@ -1057,6 +1895,11 @@ def _retrieve_rows(
                 if tok in text:
                     overlap += 1.0
             entity_bonus = 0.0
+            # Exact title-phrase match ("sf log meeting") is the strongest
+            # entity signal a row can carry — the user literally named it.
+            for _ph in q_phrases:
+                if _ph in text:
+                    entity_bonus += 12.0
             has_nyt = any(k in text for k in ("new york times", "nytimes", "nyt ", "ny times"))
             has_dollar_figure = bool(_CURRENCY_RE.search(text))
             has_currency = has_dollar_figure or any(
@@ -1097,17 +1940,94 @@ def _retrieve_rows(
             entity_bonus += sem_scores.get(uid, 0.0) * _SEMANTIC_WEIGHT
             # Cross-encoder rerank: highest-precision relevance signal when present.
             entity_bonus += rerank_map.get(uid, 0.0) * _RERANK_WEIGHT
+            # "upcoming/next" queries: reward rows dated today-or-later so the
+            # nearest upcoming item outranks equally-relevant past ones.
+            if wants_future and str(r["date_iso"] or "")[:10] >= today_str:
+                entity_bonus += 12.0
+            # Travel/appointment queries: real bookings/confirmations beat the
+            # sale blasts that share the same generic travel keywords.
+            if wants_itinerary and _is_booking_row(r):
+                entity_bonus += 14.0
+            # Calendar / schedule intent: the ingested iCal events are the
+            # authoritative answer; lift them above competing mail.
+            is_cal = uid.startswith("cal:")
+            row_day = str(r["date_iso"] or "")[:10]
+            # cal_pref is a TOP-priority sort key (like msg_pref): for a strong
+            # schedule query — a named window ("next week") or a "next/upcoming"
+            # lookup — the matching events must lead regardless of how the
+            # rerank/semantic weights score competing mail. Additive bonuses
+            # alone can't reliably outweigh those, so we gate at the tuple level.
+            cal_pref = 0
+            if wants_calendar and is_cal:
+                entity_bonus += 10.0
+                if cal_window:
+                    if cal_window[0] <= row_day <= cal_window[1]:
+                        cal_pref = 1
+                        entity_bonus += 30.0
+                    else:
+                        entity_bonus -= 20.0  # right kind, wrong dates
+                if cal_future and not cal_window and row_day >= today_str:
+                    cal_pref = 1
+                    # Soonest upcoming wins: decay the bonus with days away so the
+                    # very next appointment outranks later ones.
+                    try:
+                        days = (datetime.strptime(row_day, "%Y-%m-%d").date()
+                                - datetime.now().date()).days
+                        entity_bonus += max(0.0, 25.0 - 0.15 * days)
+                    except ValueError:
+                        pass
+                elif cal_future and row_day < today_str:
+                    entity_bonus -= 15.0  # past events aren't the "next" one
             msg_pref = 1 if (boost_messages and is_chat_mail) else 0
             date_key = str(r["date_iso"] or "")
-            # Tuple sorted desc: prefer chat/mail rows, then higher overlap+bonus,
-            # then better (lower) bm25 rank, then most-recent date_iso lex sort.
-            return (msg_pref, overlap + entity_bonus, -rank, date_key)
+            # Tuple sorted desc: schedule events first (for strong calendar
+            # queries), then chat/mail rows, then higher overlap+bonus, then
+            # better (lower) bm25 rank, then most-recent date_iso lex sort.
+            return (cal_pref, msg_pref, overlap + entity_bonus, -rank, date_key)
 
         if sort_by == SORT_RECENT:
             month_year = _query_month_year(question)
             month_prefix = (
                 f"{month_year[0]:04d}-{month_year[1]:02d}" if month_year else None
             )
+
+            # If the query names a specific entity ("walmart"), keep only rows
+            # actually about it before date-sorting — otherwise the globally-recent
+            # candidate seed drowns out "most recent email from Walmart". Pure
+            # browse queries ("show my recent emails") have no content terms, so
+            # this filter is skipped and all recent rows are kept.
+            _content = _query_content_terms(ql)
+            # A named title-phrase ("SF Log Meeting") supersedes single-token
+            # anchoring entirely: keep only rows containing the exact phrase.
+            # Anchor terms like "summary"/"log" alone let a book chunk or JSON
+            # blob with a newer file date bury the actual named item.
+            if q_phrases:
+                _ppool = [
+                    (r, f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower())
+                    for r in rows
+                ]
+                _pkept = [r for r, txt in _ppool if any(p in txt for p in q_phrases)]
+                if _pkept:
+                    rows = _pkept
+                    _content = []  # phrase matched; skip anchor filtering
+            if _content:
+                _pool = [
+                    (r, f"{r['filename'] or ''} {r['ocr_text'] or ''} {r['vlm_text'] or ''}".lower())
+                    for r in rows
+                ]
+                # Anchor on the RAREST content term — the distinctive entity
+                # ("walmart"), not a common one ("order") — so multi-word queries
+                # don't dilute with rows that only match the generic word.
+                _counts = {t: sum(1 for _, txt in _pool if t in txt) for t in _content}
+                _present = {t: c for t, c in _counts.items() if c > 0}
+                if _present:
+                    _anchor = min(_present, key=_present.get)
+                    _kept = [
+                        r for r, txt in _pool
+                        if _anchor in txt or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
+                    ]
+                    if _kept:
+                        rows = _kept
 
             def recency_tuple(r: sqlite3.Row) -> tuple[str, str]:
                 return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
@@ -1122,17 +2042,10 @@ def _retrieve_rows(
 
             if msg_disc:
                 msgs_only = [
-                    r
-                    for r in rows
-                    if str(r["uuid"]).startswith("imsg:") or str(r["uuid"]).startswith("m365:")
+                    r for r in rows if str(r["uuid"]).startswith(_MSG_MAIL_PREFIXES)
                 ]
                 non_msg = [
-                    r
-                    for r in rows
-                    if not (
-                        str(r["uuid"]).startswith("imsg:")
-                        or str(r["uuid"]).startswith("m365:")
-                    )
+                    r for r in rows if not str(r["uuid"]).startswith(_MSG_MAIL_PREFIXES)
                 ]
                 msgs_only.sort(key=recency_tuple, reverse=True)
                 non_msg.sort(key=recency_tuple, reverse=True)
@@ -1179,9 +2092,154 @@ def _retrieve_rows(
                     rows.extend(unmatched[: top_k - len(rows)])
         else:
             rows.sort(key=score, reverse=True)
+            if wants_future and (wants_itinerary or wants_calendar):
+                # The most recently RECEIVED booking is almost always the upcoming
+                # trip — a confirmation arrives before the trip, and the trip date
+                # lives in the email body, not date_iso. So float real bookings to
+                # the top, newest-received first; other rows keep relevance order.
+                # BUT for a schedule query ("next appointment") the ingested
+                # calendar events are the authoritative answer — keep them first
+                # (they are already soonest-first from score()), then bookings,
+                # then the rest. "appointment" lives in both term sets, so this
+                # ordering stops a travel confirmation from burying the real
+                # calendar appointment.
+                def _rk(r: sqlite3.Row) -> tuple[str, str]:
+                    return (str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
+                cal_rows = (
+                    [r for r in rows if str(r["uuid"] or "").startswith("cal:")]
+                    if wants_calendar else []
+                )
+                cal_ids = {str(r["uuid"]) for r in cal_rows}
+                booking = sorted(
+                    (r for r in rows
+                     if str(r["uuid"]) not in cal_ids and _is_booking_row(r)),
+                    key=_rk, reverse=True,
+                )
+                picked = cal_ids | {str(r["uuid"]) for r in booking}
+                rest = [r for r in rows if str(r["uuid"]) not in picked]
+                rows = cal_rows + booking + rest
+        # Windowed schedule query ("next week", "tomorrow"): the answer is the set
+        # of events inside that window. Drop everything else so the prompt isn't
+        # padded with far-future events the content-seed pulled in (every event's
+        # text contains the word "Calendar"). If nothing falls in the window, keep
+        # the ranked rows so the model can say the calendar is clear.
+        if wants_calendar and cal_window:
+            in_win = [
+                r for r in rows
+                if str(r["uuid"] or "").startswith("cal:")
+                and cal_window[0] <= str(r["date_iso"] or "")[:10] <= cal_window[1]
+            ]
+            if in_win:
+                rows = in_win
         return rows[:top_k]
     finally:
         conn.close()
+
+
+def _retrieve_rows_multi_doc(
+    db_path: Path, question: str, phrases: list[str], top_k: int,
+    sort_by: str, restrict_finance: bool,
+) -> list[sqlite3.Row]:
+    """Comparative / cross-document query ("in JP Memoir, per The Elements of
+    Style ..."). A single ranked list lets the stronger topic take every slot and
+    starve the other (Elements of Style took all 15, JP Memoir got 0). So
+    retrieve for EACH named document separately, guarantee each a share of the
+    slots, then fill the remainder from the full-question ranking."""
+    per_share = max(2, top_k // len(phrases))
+    picked: list[sqlite3.Row] = []
+    seen: set[str] = set()
+    for p in phrases:
+        pr = _retrieve_rows(
+            db_path=db_path, question=p, top_k=top_k,
+            sort_by=sort_by, restrict_finance=restrict_finance,
+        )
+        taken = 0
+        for r in pr:
+            u = str(r["uuid"])
+            if u in seen:
+                continue
+            seen.add(u)
+            picked.append(r)
+            taken += 1
+            if taken >= per_share:
+                break
+    # Fill any remaining slots from the natural full-question ranking.
+    full = _retrieve_rows(
+        db_path=db_path, question=question, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    for r in full:
+        if len(picked) >= top_k:
+            break
+        u = str(r["uuid"])
+        if u not in seen:
+            seen.add(u)
+            picked.append(r)
+    return picked[:top_k]
+
+
+def _retrieve_rows_corrected(
+    db_path: Path,
+    question: str,
+    top_k: int,
+    sort_by: str,
+    restrict_finance: bool,
+    model: str,
+) -> tuple[list[sqlite3.Row], str | None]:
+    """Retrieve, and if the user named something the first pass missed, let the
+    model rewrite the query once and retry. Returns (rows, correction_note)."""
+    # Multi-document query: the user named two+ distinct things ("in JP Memoir
+    # ... The Elements of Style"). Retrieve per document and merge so one can't
+    # starve the other — this supersedes single-anchor self-correction here
+    # (which passed as soon as EITHER named thing appeared).
+    _mphrases = list(dict.fromkeys(_title_phrases(question)))
+    if len(_mphrases) >= 2:
+        return _retrieve_rows_multi_doc(
+            db_path, question, _mphrases, top_k, sort_by, restrict_finance
+        ), None
+
+    rows = _retrieve_rows(
+        db_path=db_path, question=question, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    if not _SELF_CORRECT_ON:
+        return rows, None
+    phrases, terms = _query_anchors(question)
+    if not (phrases or terms):
+        return rows, None  # nothing concrete to verify — trust semantic match
+    if _rows_contain_anchor(rows, phrases, terms):
+        return rows, None  # the named thing is present — first pass was fine
+
+    # Named anchor absent from the results → one corrective rewrite + retry.
+    rewrite = _llm_rewrite_query(question, rows, model)
+    if not rewrite or rewrite.lower() == (question or "").strip().lower():
+        return rows, None
+    rows2 = _retrieve_rows(
+        db_path=db_path, question=rewrite, top_k=top_k,
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    # Accept the retry only if it surfaced a concrete anchor — but a rewrite that
+    # FIXES a misspelling ("SF Logg Meating" -> "SF Log Meeting") changes the
+    # anchor, so validate against the rewrite's OWN anchors too, not just the
+    # original query's. This keeps a garbage rewrite (finds nothing) from
+    # replacing decent original rows, while letting spelling/paraphrase fixes
+    # through.
+    r_phrases, r_terms = _query_anchors(rewrite)
+    recovered = rows2 and (
+        _rows_contain_anchor(rows2, phrases, terms)
+        or ((r_phrases or r_terms) and _rows_contain_anchor(rows2, r_phrases, r_terms))
+    )
+    if recovered:
+        seen: set[str] = set()
+        merged: list[sqlite3.Row] = []
+        for r in list(rows2) + list(rows):
+            u = str(r["uuid"])
+            if u in seen:
+                continue
+            seen.add(u)
+            merged.append(r)
+        return merged[:top_k], rewrite
+    return rows, None
 
 
 def _safe_https_browser_url(url: str) -> str | None:
@@ -1235,12 +2293,18 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         open_url = r[7] if len(r) > 7 else ""
         is_msg = str(uuid).startswith("imsg:")
         is_m365 = str(uuid).startswith("m365:")
+        is_mail = str(uuid).startswith("mail:")
+        is_evernote = str(uuid).startswith("evernote:")
         is_doc = str(uuid).startswith("doc:")
         source = (
             "Messages"
             if is_msg
             else "Outlook / Microsoft 365"
             if is_m365
+            else "Apple Mail"
+            if is_mail
+            else "Evernote"
+            if is_evernote
             else "Document"
             if is_doc
             else "Photos / Local file"
@@ -1253,7 +2317,7 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         web_open = _safe_https_browser_url(open_url)
         if image_path and not image_path.startswith("https://"):
             encoded = urllib.parse.quote(image_path, safe="")
-            req_path = f"/open-local-file?path={encoded}"
+            req_path = f"/open-local-file?path={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
             data_attr = html.escape(req_path, quote=True)
             link_md = (
                 '<button type="button" class="pi-open-local-file" '
@@ -1279,10 +2343,12 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         else:
             link_md = "(no local link)"
             ref = f"`{uuid}`"
+        # Escape indexed text (email subjects, note titles are external input)
+        # so it can't smuggle HTML into the rendered hit summary.
         parts.append(
-            f"**{i}. {title}**  \n"
+            f"**{i}. {html.escape(str(title))}**  \n"
             f"_{source} • {when}_  \n"
-            f"{snippet}  \n"
+            f"{html.escape(str(snippet))}  \n"
             f"{link_md} — ref: {ref}"
         )
     return "\n\n".join(parts)
@@ -1320,6 +2386,7 @@ def _cache_key(
     auto_route: bool,
     sort_by: str,
     restrict_finance: bool,
+    conversational: bool = False,
 ) -> str:
     q = " ".join((question or "").strip().lower().split())
     # Bind to UI version so any code change (which alters the file hash) auto-
@@ -1328,7 +2395,7 @@ def _cache_key(
     return (
         f"{q}|{db_path}|{top_k}|{qa_model}|{qa_model_small}"
         f"|auto={int(auto_route)}|sort={sort_by}"
-        f"|rf={int(restrict_finance)}|v={version}"
+        f"|rf={int(restrict_finance)}|conv={int(conversational)}|v={version}"
     )
 
 
@@ -1371,13 +2438,17 @@ def answer_question(
     auto_route: bool,
     auto_correct: bool,
     sort_by: str = SORT_RELEVANT,
-    restrict_finance: bool = True,
+    restrict_finance: bool = False,  # match the UI default (all sources)
+    conversational: bool = True,
 ) -> tuple[str, list[list[str]], str, str, list[Any], list[str]]:
     q = (question or "").strip()
     if not q:
         return "Enter a question to search your photo index.", [], "Last search: n/a", "No hits yet.", [], []
 
-    sort_by = sort_by if sort_by in SORT_OPTIONS else SORT_RELEVANT
+    # Recency is inferred from the question: date-order for recent/latest.
+    # "upcoming/next" stays on RELEVANCE (a future-date bonus in _retrieve_rows
+    # lifts upcoming items) so vague future queries don't collapse to newest-noise.
+    sort_by = SORT_RECENT if _wants_recency(q) else SORT_RELEVANT
     t0 = time.perf_counter()
     now = time.time()
     key = _cache_key(
@@ -1389,6 +2460,7 @@ def answer_question(
         auto_route=auto_route,
         sort_by=sort_by,
         restrict_finance=restrict_finance,
+        conversational=conversational,
     )
     cache = _prune_cache(_load_cache(_CACHE_PATH), now)
     cached = cache.get(key)
@@ -1407,6 +2479,9 @@ def answer_question(
             )
             hit_md = _rows_to_hit_summary(rows)
             gallery, gallery_paths = _rows_to_gallery(rows)
+            # Seed follow-up chat from the cached records too.
+            _set_last_convo(str(cached.get("context", "")), q, answer)
+            _log_query(q, status="cache", hits=len(rows), route=route, model=used_model)
             return answer, rows, stats, hit_md, gallery, gallery_paths
 
     aggregate_mode = _is_aggregate_finance_query(q)
@@ -1415,12 +2490,17 @@ def answer_question(
     # (often zero hits — skip sending 40 rows to a slow 32B model).
     effective_top_k = max(top_k, 40) if aggregate_mode and not scoped_my else top_k
 
-    rows = _retrieve_rows(
+    rows, _correction = _retrieve_rows_corrected(
         db_path=db_path, question=q, top_k=effective_top_k,
-        sort_by=sort_by, restrict_finance=restrict_finance,
+        sort_by=sort_by, restrict_finance=restrict_finance, model=qa_model,
     )
     effective_query = q
     autocorrect_note = ""
+    if _correction:
+        # The model rewrote the query to find a named thing the first pass
+        # missed; answer from the corrected rows, note it for transparency.
+        effective_query = _correction
+        autocorrect_note = f"_(refined your search to find: **{_correction}**)_"
     if not rows and auto_correct:
         suggested = _suggest_query(q, db_path=db_path)
         if suggested != q:
@@ -1441,6 +2521,7 @@ def answer_question(
             no_match_msg = _finance_empty_message(q, restrict_finance=restrict_finance)
         else:
             no_match_msg = "No matches in index yet. Keep ingest running, then try again."
+        _log_query(q, status="no_match", hits=0)
         return (
             no_match_msg,
             [],
@@ -1466,12 +2547,30 @@ def answer_question(
             first_model = qa_model
             route = "large_default"
 
+    # Money questions: focus the LLM on the entity-matching rows only (e.g. just
+    # the Walmart records for "dog food at walmart"). Verified: the model answers
+    # these correctly in isolation but misattributes merchants/amounts when the
+    # relevant rows sit among unrelated ones. Hit list below still shows all rows.
+    if _is_finance_query(q):
+        prompt_rows = _entity_focus_rows(effective_query, rows)
+    elif _is_itinerary_query(q) and _wants_future(q):
+        # "next/upcoming trip": show the model only real booking rows (already
+        # ordered newest-first), capped to the newest 5. Small models cherry-pick
+        # whichever old booking has the richest explicit details (flight numbers,
+        # times) over the newest one, so bookings from prior years must not enter
+        # the prompt at all.
+        _booking = [r for r in rows if _is_booking_row(r)][:5]
+        prompt_rows = _booking or rows
+    else:
+        prompt_rows = rows
+
     prompt = _build_prompt(
         effective_query,
-        rows,
+        prompt_rows,
         aggregate=aggregate_mode,
         scope_month=scoped_my,
         field_char_cap=_prompt_field_cap_for_model(first_model),
+        conversational=conversational,
     )
 
     answer, err = _safe_chat(model=first_model, prompt=prompt)
@@ -1481,6 +2580,7 @@ def answer_question(
             retry_text, retry_err = _safe_chat(model=qa_model, prompt=prompt)
             if retry_err:
                 elapsed = time.perf_counter() - t0
+                _log_query(q, status="error", hits=len(rows), route=route, model=qa_model)
                 return (
                     f"Search failed: small model `{first_model}` and fallback `{qa_model}` both errored.\n\n"
                     f"small error: {err}\n\nfallback error: {retry_err}",
@@ -1495,6 +2595,7 @@ def answer_question(
             route = f"{route}->large_fallback_on_error"
         else:
             elapsed = time.perf_counter() - t0
+            _log_query(q, status="error", hits=len(rows), route=route, model=qa_model)
             return (
                 f"Search failed with model `{qa_model}`: {err}",
                 [],
@@ -1521,12 +2622,19 @@ def answer_question(
         answer = f"{autocorrect_note}\n\n---\n\n{answer}"
     preview_rows = _rows_preview(rows)
 
+    # Stash the retrieved records + this Q/A so follow-up chat can continue
+    # without re-retrieving. Same field cap as the answer prompt used.
+    cap = _prompt_field_cap_for_model(first_model)
+    context_block = "\n\n---\n\n".join(row_to_prompt_block(r, field_char_cap=cap) for r in prompt_rows)
+    _set_last_convo(context_block, effective_query, answer)
+
     cache[key] = {
         "cached_at_unix": now,
         "answer": answer,
         "rows": preview_rows,
         "used_model": used_model,
         "route": route,
+        "context": context_block,
     }
     _save_cache(_CACHE_PATH, cache)
 
@@ -1538,6 +2646,9 @@ def answer_question(
     )
     hit_md = _rows_to_hit_summary(preview_rows)
     gallery, gallery_paths = _rows_to_gallery(preview_rows)
+    # "refusal" = the model punted despite having records (a failure worth review).
+    status = "refusal" if _policy_refusal_answer(answer) else "ok"
+    _log_query(effective_query, status=status, hits=len(preview_rows), route=route, model=used_model)
     return answer, preview_rows, stats, hit_md, gallery, gallery_paths
 
 
@@ -1710,6 +2821,116 @@ def save_alias_json(raw_json: str) -> str:
     return f"Saved aliases to `{_SYNONYMS_PATH}` (changes active immediately)."
 
 
+def load_about_me_text() -> tuple[str, str]:
+    if not _ABOUT_ME_PATH.exists():
+        return "", f"No profile yet — write facts and Save to create `{_ABOUT_ME_PATH}`."
+    try:
+        return _ABOUT_ME_PATH.read_text(encoding="utf-8"), f"Loaded profile from `{_ABOUT_ME_PATH}`"
+    except Exception as e:
+        return "", f"Failed to read profile: {e}"
+
+
+def save_about_me_text(text: str) -> str:
+    _ABOUT_ME_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ABOUT_ME_PATH.write_text((text or "").strip() + "\n", encoding="utf-8")
+    except Exception as e:
+        return f"Failed to save profile: {e}"
+    n = len([ln for ln in (text or "").splitlines() if ln.strip()])
+    return (f"Saved profile to `{_ABOUT_ME_PATH}` ({n} line(s)). "
+            "Applied to every answer from your next search.")
+
+
+# Pull nickname aliases out of about_me.md parentheticals, e.g.
+#   "- My dog is Bootsy (also called Boots)."  ->  bootsy: [boots]
+# Deterministic (no LLM): only treats a paren as nicknames when it has an
+# explicit cue ("aka", "also called", "nickname"…) OR is a short name-like token
+# like "(Kate)" / "(BK)". Descriptions such as "(a Siberian Husky)" are skipped.
+_ALIAS_CUE_RE = re.compile(
+    r"\b(?:a\.?k\.?a\.?|also known as|also called|also spelled|nicknamed|"
+    r"nickname[:d]?|goes by|short for|called)\b",
+    re.I,
+)
+
+
+def _split_alias_names(text: str) -> list[str]:
+    parts = re.split(r"\s*(?:,|/|;| and | or )\s*", text.strip().strip('".'))
+    out: list[str] = []
+    for p in parts:
+        p = p.strip().strip("\"'.,").strip()
+        if 2 <= len(p) <= 40 and re.search(r"[A-Za-z]", p):
+            out.append(p.lower())
+    return out
+
+
+def _paren_to_aliases(inner: str) -> list[str]:
+    inner = inner.strip()
+    if not inner:
+        return []
+    cue = _ALIAS_CUE_RE.search(inner)
+    if cue:
+        return _split_alias_names(inner[cue.end():].strip(" :\"'"))
+    # No cue word: accept only a short, name-like bare paren e.g. (Kate), (BK).
+    words = inner.split()
+    if not words or len(words) > 2 or words[0].lower() in ("a", "an", "the"):
+        return []
+    if not inner[:1].isupper() or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.'\- ]*", inner):
+        return []
+    return _split_alias_names(inner)
+
+
+def _extract_alias_pairs(about_text: str) -> list[tuple[str, list[str]]]:
+    pairs: list[tuple[str, list[str]]] = []
+    for line in about_text.splitlines():
+        s = line.strip()
+        if not s.startswith("-") or "___" in s:
+            continue
+        for m in re.finditer(r"([A-Z][A-Za-z0-9.'\-]+)\s*\(([^)]*)\)", s):
+            canon = m.group(1).strip().lower()
+            aliases = [a for a in _paren_to_aliases(m.group(2)) if a and a != canon]
+            if aliases:
+                pairs.append((canon, aliases))
+    return pairs
+
+
+def sync_about_me_aliases() -> tuple[str, str]:
+    """Merge nickname parentheticals from about_me.md into synonyms.json.
+    Returns (refreshed_alias_json_text, status). Never removes existing aliases."""
+    try:
+        about = _ABOUT_ME_PATH.read_text(encoding="utf-8")
+    except OSError:
+        text, _ = load_alias_json()
+        return text, "No about_me.md yet — add facts with nicknames first."
+    pairs = _extract_alias_pairs(about)
+    existing: dict = {}
+    if _SYNONYMS_PATH.exists():
+        try:
+            obj = json.loads(_SYNONYMS_PATH.read_text(encoding="utf-8"))
+            existing = obj if isinstance(obj, dict) else {}
+        except Exception:
+            existing = {}
+    added: list[str] = []
+    for canon, aliases in pairs:
+        cur = {str(x).strip().lower() for x in existing.get(canon, []) if isinstance(existing.get(canon), list)}
+        want = {canon, *aliases}
+        new = want - cur
+        if new:
+            existing[canon] = [canon] + sorted(x for x in (cur | want) if x != canon)
+            added.append(f"{canon} → {sorted(new - {canon})}")
+    if not added:
+        text, _ = load_alias_json()
+        return text, ("No new nicknames found in your profile "
+                      "(descriptions like '(a Siberian Husky)' are skipped).")
+    try:
+        _SYNONYMS_PATH.write_text(json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as e:
+        text, _ = load_alias_json()
+        return text, f"Failed to write aliases: {e}"
+    reset_synonym_cache()
+    text, _ = load_alias_json()
+    return text, "Added from profile: " + "; ".join(added) + ". Active now."
+
+
 def _parse_alias_json(raw_json: str) -> tuple[dict, str | None]:
     text = (raw_json or "").strip() or "{}"
     try:
@@ -1767,52 +2988,78 @@ def remove_alias_entry(raw_json: str, canonical: str) -> tuple[str, str]:
 _UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "32000"))
 
 
-def analyze_uploaded_file(file_path: str | None, question: str, qa_model: str) -> str:
-    """Extract text from an uploaded document and answer/summarize it with the LLM.
+def analyze_uploaded_file(file_paths, question: str, qa_model: str) -> str:
+    """Extract text from one or more uploaded documents and answer/summarize them.
 
-    Separate from index search: this works only on the one uploaded file, not the
-    SQLite corpus. Text documents only (the answer model has no vision/OCR).
+    Separate from index search: works only on the uploaded files, not the SQLite
+    corpus. Text documents only (the answer model has no vision/OCR). Accepts a
+    single path (str) or a list of paths (multi-file upload); the total text is
+    budgeted across the files so the combined prompt fits the model context.
     """
-    if not file_path:
-        return "Drop or browse a document first (PDF, Word, PowerPoint, Excel, text…)."
+    if not file_paths:
+        return "Drop or browse one or more documents first (PDF, Word, PowerPoint, Excel, text…)."
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
     from photo_index.documents_ingest import extract_auto
 
-    path = Path(file_path)
-    ext = path.suffix.lower()
-    try:
-        text, method, err = extract_auto(path, ext)
-    except Exception as e:  # noqa: BLE001
-        return f"Could not read **{path.name}**: {e}"
-    if err or not text or not text.strip():
-        return (
-            f"No extractable text in **{path.name}** ({err or 'empty'}). "
-            "Scanned / image-only PDFs need OCR, which this text model can't do."
-        )
-    text = text.strip()
-    truncated = len(text) > _UPLOAD_TEXT_CHAR_CAP
-    if truncated:
-        text = text[:_UPLOAD_TEXT_CHAR_CAP]
-    task = (question or "").strip() or "Summarize this document concisely, capturing the key points."
-    prompt = f"""You are analyzing a single document the user uploaded.
-Use ONLY the document text below. Do not use outside knowledge.
+    docs: list[tuple[str, str, str]] = []  # (name, text, method)
+    skipped: list[str] = []
+    for fp in file_paths:
+        if not fp:
+            continue
+        path = Path(fp)
+        try:
+            text, method, err = extract_auto(path, path.suffix.lower())
+        except Exception as e:  # noqa: BLE001
+            skipped.append(f"- **{path.name}**: could not read ({e})")
+            continue
+        if err or not text or not text.strip():
+            skipped.append(f"- **{path.name}**: no extractable text ({err or 'empty'} — scanned/image PDFs need OCR)")
+            continue
+        docs.append((path.name, text.strip(), method))
 
-Document: {path.name}
+    if not docs:
+        return "No extractable text found.\n\n" + "\n".join(skipped)
 
---- DOCUMENT START ---
-{text}
---- DOCUMENT END ---
+    # Budget the TOTAL text across all files to fit the model context, sharing
+    # it evenly so one long file can't crowd out the others.
+    per_doc_cap = max(1500, _UPLOAD_TEXT_CHAR_CAP // len(docs))
+    truncated_any = False
+    blocks = []
+    for name, text, method in docs:
+        if len(text) > per_doc_cap:
+            text = text[:per_doc_cap]
+            truncated_any = True
+        blocks.append(f"--- DOCUMENT: {name} (extracted via {method}) ---\n{text}\n--- END: {name} ---")
+
+    multi = len(docs) > 1
+    default_task = (
+        "Summarize each document briefly, then note the key similarities, "
+        "differences, or how they relate."
+        if multi else
+        "Summarize this document concisely, capturing the key points."
+    )
+    task = (question or "").strip() or default_task
+    prompt = f"""You are analyzing {len(docs)} document(s) the user uploaded.
+Use ONLY the document text below. Do not use outside knowledge. Refer to each
+document by its filename when it helps.
+
+{chr(10).join(blocks)}
 
 Task: {task}
 """
     answer, chat_err = _safe_chat(model=qa_model, prompt=prompt)
     if chat_err:
-        return f"Model error analyzing **{path.name}**: {chat_err}"
-    note = (
-        f"\n\n*(Document truncated to {_UPLOAD_TEXT_CHAR_CAP:,} chars to fit the model context.)*"
-        if truncated
-        else ""
-    )
-    return f"**{path.name}** · extracted via `{method}`\n\n{answer}{note}"
+        return f"Model error analyzing the document(s): {chat_err}"
+
+    header = " · ".join(name for name, _, _ in docs)
+    notes = []
+    if truncated_any:
+        notes.append(f"*(Each document capped at ~{per_doc_cap:,} chars to fit the model context.)*")
+    if skipped:
+        notes.append("**Skipped:**\n" + "\n".join(skipped))
+    note_str = ("\n\n" + "\n\n".join(notes)) if notes else ""
+    return f"**Analyzed {len(docs)} file(s):** {header}\n\n{answer}{note_str}"
 
 
 def build_app(
@@ -1855,28 +3102,46 @@ def build_app(
       display: inline;
     }
     button.pi-open-local-file:hover { color: #1d4ed8; }
+
+    /* Mobile (iPhone etc.): the search + follow-up controls sit in horizontal
+       Rows that overflow a narrow screen, pushing the Search button off to the
+       right. Below a phone-width breakpoint, stack those Rows vertically and let
+       every control fill the width, so the button is always reachable without
+       sideways scrolling. Desktop layout is unaffected (media query). */
+    @media (max-width: 640px) {
+      .gradio-container { max-width: 100% !important; padding-left: 6px !important; padding-right: 6px !important; }
+      .pi-row-mobile { flex-direction: column !important; align-items: stretch !important; }
+      .pi-row-mobile > * { width: 100% !important; min-width: 0 !important; }
+      #photo-search-btn, #photo-stop-search-btn { width: 100% !important; }
+      body { overflow-x: hidden; }
+    }
     """
-    with gr.Blocks(title="Personal Index Search", css=custom_css) as demo:
+    # Inject CSS via a <style> element rather than Blocks(css=...): Gradio 6 moved
+    # that param to launch(), but we mount the app instead of launching it, so a
+    # style tag in the layout is the version-proof way to apply custom CSS.
+    with gr.Blocks(title="Personal Index Search") as demo:
+        gr.HTML(f"<style>{custom_css}</style>")
         gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
-        with gr.Accordion("📄 Summarize / query an uploaded document", open=False):
+        with gr.Accordion("📄 Summarize / query uploaded documents", open=False):
             gr.Markdown(
-                "Drop a file (PDF, Word, PowerPoint, Excel, text) to summarize or ask "
-                "about it directly — this is separate from your index. Text documents "
-                "only (no scanned/image OCR)."
+                "Drop **one or more files** (PDF, Word, PowerPoint, Excel, text) to "
+                "summarize, compare, or ask about them directly — this is separate "
+                "from your index. Text documents only (no scanned/image OCR)."
             )
             upload_file = gr.File(
-                label="Drop a document here or browse",
+                label="Drop documents here or browse (multiple allowed)",
+                file_count="multiple",
                 file_types=[".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".rtf", ".csv"],
                 type="filepath",
             )
             upload_question = gr.Textbox(
-                label="What should I do with it?",
-                placeholder="Leave blank to summarize, or ask e.g. 'What are the payment terms?'",
+                label="What should I do with them?",
+                placeholder="Leave blank to summarize each, or ask e.g. 'Compare these two contracts' / 'What are the payment terms?'",
                 lines=2,
             )
-            upload_btn = gr.Button("Analyze document", variant="primary")
-            upload_answer = gr.Markdown("No document analyzed yet.", elem_id="pi-answer", sanitize_html=False)
+            upload_btn = gr.Button("Analyze document(s)", variant="primary")
+            upload_answer = gr.Markdown("No documents analyzed yet.", elem_id="pi-answer", sanitize_html=False)
         with gr.Accordion("App config / model info", open=False):
             gr.Markdown(
                 f"Using DB: `{db_path}`  \nAnswer model: `{qa_model}`  \nTop-K retrieval: `{top_k}`  \nAuto-correct: `{auto_correct}`  \nRerank (cross-encoder): `{'on' if _RERANK_ENABLED else 'off'}`"
@@ -1888,6 +3153,29 @@ def build_app(
                 "Vision ingest still uses Ollama. Answers use PHOTO_INDEX_LLM_BACKEND "
                 "(ollama or openai for LM Studio)."
             )
+        with gr.Accordion("🧠 About me — persistent facts the LLM always knows", open=False):
+            gr.Markdown(
+                "Durable facts about you, applied to **every** answer and follow-up "
+                "(even when the records don't restate them). One fact per line.  \n"
+                "_Examples: `Zumy is my dog (Siberian Husky).` · `My dogs are Zumy "
+                "and Bella.` · `I live in Brooklyn.`_"
+            )
+            about_me_box = gr.Textbox(
+                label="About me",
+                lines=8,
+                placeholder="- Zumy is my dog (Siberian Husky).\n- My dogs are Zumy and ___.\n- I live in ___.",
+            )
+            about_me_status = gr.Markdown("Write facts, then Save.")
+            with gr.Row():
+                about_me_load_btn = gr.Button("Load")
+                about_me_save_btn = gr.Button("Save", variant="primary")
+                about_me_sync_btn = gr.Button("🔗 Sync nicknames → aliases")
+            gr.Markdown(
+                "_Sync reads your profile and adds nicknames in parentheses "
+                "(e.g. `Bootsy (also called Boots)`) to the alias list so searches "
+                "bridge both names. Descriptions like `(a Siberian Husky)` are ignored._"
+            )
+
         with gr.Accordion("Alias Manager (synonyms.json)", open=False):
             canonical = gr.Textbox(
                 label="Canonical term",
@@ -1917,12 +3205,16 @@ def build_app(
             lines=2,
             elem_id="photo-query-input",
         )
-        with gr.Row():
-            sort_choice = gr.Radio(
-                choices=list(SORT_OPTIONS),
-                value=SORT_RELEVANT,
-                label="Sort hits by",
-                info="Most Relevant uses entity/keyword scoring. Most Recent ignores ranking and sorts by date.",
+        with gr.Row(elem_classes=["pi-row-mobile"]):
+            answer_style = gr.Radio(
+                choices=["Conversational", "Precise (citations)"],
+                value="Conversational",
+                label="Answer style",
+                info=(
+                    "Conversational reads like a chat reply — sources woven into "
+                    "sentences, no raw uuids. Precise keeps audit-style inline "
+                    "citations (best for double-checking money questions)."
+                ),
             )
             with gr.Column(scale=0, min_width=140):
                 ask = gr.Button("Search", elem_id="photo-search-btn")
@@ -1932,25 +3224,48 @@ def build_app(
                     variant="stop",
                     size="md",
                 )
+        # Recency is auto-detected from the question ("latest/recent/newest") — no
+        # manual sort control. Finance defaults to searching ALL sources (email,
+        # notes, messages, docs); check this only to narrow to bank/credit-card
+        # transaction records when a money question pulls in too much chatter.
         restrict_finance_cb = gr.Checkbox(
-            value=True,
-            label="Restrict finance answers to bank/credit-card statements",
-            info=(
-                "When ON, money/subscription queries ignore casual chat and only use "
-                "bank or credit-card transaction messages. When you name a month "
-                "(e.g. May 2026), results are always scoped to that month regardless "
-                "of this setting."
-            ),
-        )
-        always_fresh_cb = gr.Checkbox(
             value=False,
-            label="Always run fresh (clear cache on every new search)",
-            info="When ON, each new search wipes the 24h cache before running so you always see fresh retrieval. Slower for repeat queries. Does NOT affect chat context (each search is independent). The manual 'Clear search cache' button is still available.",
+            label="Narrow money questions to bank/credit-card records only",
+            info=(
+                "Off by default — money questions search every source (email "
+                "receipts, notes, messages, statements). Check to filter down to "
+                "authoritative bank/credit-card transaction records if a query is "
+                "too noisy. Naming a month (e.g. May 2026) always scopes to it."
+            ),
         )
 
         answer = gr.Markdown(
             label="Answer", elem_id="pi-answer", sanitize_html=False
         )
+
+        # Follow-up chat: continue the conversation about the answer above without
+        # re-searching. Reuses the records the last search already retrieved.
+        with gr.Accordion("Continue the conversation (follow-up questions)", open=True):
+            # This Gradio version's Chatbot uses the messages format (role/content
+            # dicts) by default and rejects a `type=` arg — hence the dict-format
+            # data in _seed_chat_from_last / chat_follow_up.
+            followup_chat = gr.Chatbot(
+                label="Follow-up chat", elem_id="pi-followup", height=280,
+            )
+            with gr.Row(elem_classes=["pi-row-mobile"]):
+                followup_box = gr.Textbox(
+                    placeholder='Reply to the answer above — e.g. "yes, break down the ingredients"',
+                    label="Your follow-up", scale=5, lines=1,
+                )
+                with gr.Column(scale=0, min_width=110):
+                    followup_send = gr.Button("Send", variant="primary")
+                    followup_clear = gr.Button("New topic", size="sm")
+            gr.Markdown(
+                "_Follow-ups reuse the records from your last search. For a brand-new "
+                "topic, use the Search box above._",
+                elem_id="pi-followup-note",
+            )
+
         hit_summary = gr.Markdown(
             "No hits yet.", elem_id="pi-hits", sanitize_html=False
         )
@@ -1982,16 +3297,11 @@ def build_app(
             clear_cache_btn = gr.Button("Clear search cache")
 
         search_event = ask.click(
-            fn=_maybe_wipe_cache,
-            inputs=[always_fresh_cb],
-            outputs=[],
-            queue=False,
-        ).then(
             fn=clear_search_outputs,
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf: answer_question(
+            fn=lambda q, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -1999,24 +3309,20 @@ def build_app(
                 qa_model_small=qa_model_small,
                 auto_route=auto_route,
                 auto_correct=auto_correct,
-                sort_by=s,
                 restrict_finance=bool(rf),
+                conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb],
+            inputs=[question, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
+        search_event.then(fn=_seed_chat_from_last, outputs=[followup_chat], queue=False)
         submit_event = question.submit(
-            fn=_maybe_wipe_cache,
-            inputs=[always_fresh_cb],
-            outputs=[],
-            queue=False,
-        ).then(
             fn=clear_search_outputs,
             outputs=[answer, hits, preview, preview_note, selected_path, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=False,
         ).then(
-            fn=lambda q, s, rf: answer_question(
+            fn=lambda q, rf, style: answer_question(
                 q,
                 db_path=db_path,
                 top_k=top_k,
@@ -2024,13 +3330,14 @@ def build_app(
                 qa_model_small=qa_model_small,
                 auto_route=auto_route,
                 auto_correct=auto_correct,
-                sort_by=s,
                 restrict_finance=bool(rf),
+                conversational=(style == "Conversational"),
             ),
-            inputs=[question, sort_choice, restrict_finance_cb],
+            inputs=[question, restrict_finance_cb, answer_style],
             outputs=[answer, hits, stats, hit_summary, hit_gallery, hit_gallery_paths],
             queue=True,
         )
+        submit_event.then(fn=_seed_chat_from_last, outputs=[followup_chat], queue=False)
         stop_search.click(
             fn=None,
             inputs=None,
@@ -2038,6 +3345,19 @@ def build_app(
             cancels=[search_event, submit_event],
             queue=False,
         )
+        followup_send.click(
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model, db_path, top_k),
+            inputs=[followup_box, followup_chat],
+            outputs=[followup_chat, followup_box],
+            queue=True,
+        )
+        followup_box.submit(
+            fn=lambda msg, hist: chat_follow_up(msg, hist, qa_model, db_path, top_k),
+            inputs=[followup_box, followup_chat],
+            outputs=[followup_chat, followup_box],
+            queue=True,
+        )
+        followup_clear.click(fn=lambda: [], outputs=[followup_chat], queue=False)
         hits.select(
             fn=preview_selected,
             inputs=[hits],
@@ -2070,6 +3390,15 @@ def build_app(
         alias_load_btn.click(fn=load_alias_json, outputs=[alias_json, alias_status])
         alias_save_btn.click(fn=save_alias_json, inputs=[alias_json], outputs=[alias_status])
 
+        about_me_load_btn.click(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
+        about_me_save_btn.click(fn=save_about_me_text, inputs=[about_me_box], outputs=[about_me_status])
+        # Save the profile first (so parens are on disk), then extract nicknames.
+        about_me_sync_btn.click(
+            fn=save_about_me_text, inputs=[about_me_box], outputs=[about_me_status]
+        ).then(fn=sync_about_me_aliases, outputs=[alias_json, about_me_status])
+        # Show the current profile in the box when the page opens.
+        demo.load(fn=load_about_me_text, outputs=[about_me_box, about_me_status])
+
         # Inject Enter-to-search and delegated "open local file" clicks on load.
         demo.load(fn=lambda: None, js=_PAGE_LOAD_JS)
 
@@ -2101,16 +3430,72 @@ def _spawn_open_default_app(path: Path) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-def _open_local_file_handler(path: str) -> Response:
+# CSRF token for /open-local-file. Without it, any web page the user visits
+# could fire a simple GET at 127.0.0.1:7860 (no CORS preflight applies) and
+# make this process `open` arbitrary local files. The token is embedded in the
+# served page's links, so only our own UI can construct valid requests.
+# Persisted to disk so server restarts don't invalidate links already rendered
+# in open browser tabs (a per-run token 403'd every on-screen link after each
+# restart). Still secret from other origins — that's all CSRF needs.
+
+
+def _load_or_create_open_token() -> str:
+    tok_path = Path(__file__).resolve().parent.parent / "data" / ".open_local_file_token"
+    try:
+        tok = tok_path.read_text(encoding="utf-8").strip()
+        if len(tok) >= 16:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(16)
+    try:
+        tok_path.parent.mkdir(parents=True, exist_ok=True)
+        tok_path.write_text(tok, encoding="utf-8")
+        os.chmod(tok_path, 0o600)
+    except OSError:
+        pass  # fall back to per-run token if data/ is unwritable
+    return tok
+
+
+_OPEN_LOCAL_FILE_TOKEN = _load_or_create_open_token()
+# Set in main(); used to verify requested paths are actually indexed files.
+_OPEN_LOCAL_FILE_DB: Path | None = None
+
+
+def _path_is_indexed(path: str) -> bool:
+    """True if ``path`` is stored as an indexed file (image_path_used) in the DB."""
+    if _OPEN_LOCAL_FILE_DB is None:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{_OPEN_LOCAL_FILE_DB}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM photo_meta WHERE image_path_used = ? LIMIT 1", (path,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _open_local_file_handler(path: str, t: str = "") -> Response:
     """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
 
     Invoked via ``fetch()`` from hit-summary controls (delegated click handler in
     ``_PAGE_LOAD_JS``) so the Gradio SPA never navigates. The handler returns
     immediately after scheduling ``open`` so proxies/tunnels finish the request
     before any foreground UI churn.
+
+    Security: requires the per-run token AND the path to be a file this index
+    actually ingested — both checks stop cross-site "open anything" requests.
     """
+    if not secrets.compare_digest(t or "", _OPEN_LOCAL_FILE_TOKEN):
+        raise HTTPException(status_code=403, detail="bad or missing token")
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
+    if not _path_is_indexed(path):
+        raise HTTPException(status_code=403, detail="path is not an indexed file")
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail=f"not a regular file: {path}")
@@ -2164,6 +3549,8 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     db_path = Path(os.path.abspath(args.db))
+    global _OPEN_LOCAL_FILE_DB
+    _OPEN_LOCAL_FILE_DB = db_path  # lets /open-local-file verify requested paths
     installed_models = list_llm_models()
     blocks = build_app(
         db_path=db_path,
@@ -2186,7 +3573,19 @@ def main(argv: list[str] | None = None) -> None:
         include_in_schema=False,
     )
     port = _find_free_port(args.host, args.port, attempts=10)
-    gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host, server_port=port)
+    # Optional app login (defense-in-depth for remote access over Tailscale).
+    # PHOTO_INDEX_AUTH="user:pass" enables a Gradio login gate; unset = no gate
+    # (unchanged local behaviour). The credential is supplied via a local,
+    # gitignored env file — never hard-coded here.
+    auth = None
+    _auth_env = os.environ.get("PHOTO_INDEX_AUTH", "").strip()
+    if _auth_env and ":" in _auth_env:
+        _u, _pw = _auth_env.split(":", 1)
+        if _u and _pw:
+            auth = (_u, _pw)
+            print(f"[gradio] app login enabled for user {_u!r}", flush=True)
+    gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host,
+                        server_port=port, auth=auth)
     uvicorn.run(api_app, host=args.host, port=port, log_level="info")
 
 

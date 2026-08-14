@@ -52,9 +52,20 @@ def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    # Wait up to 2 minutes for our index DB if another process holds a write lock
+    # Set busy_timeout BEFORE any other pragma: switching/confirming WAL mode
+    # briefly wants a lock, and with the default 0 timeout it fails instantly
+    # ("database is locked") whenever another connection (e.g. the live Gradio
+    # app) is mid-query. With the timeout set first, we wait instead of failing.
     conn.execute("PRAGMA busy_timeout=120000")
+    # Only *set* WAL if not already WAL. Re-issuing `journal_mode=WAL` on a DB
+    # that is already in WAL still asks for an exclusive lock to rewrite the
+    # header, and that request does not reliably wait on busy_timeout — so it
+    # fails instantly ("database is locked") whenever the live Gradio app is
+    # mid-query. Reading the current mode needs no write lock.
+    cur = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = (cur[0] if cur else "").lower()
+    if mode != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -219,6 +230,20 @@ def delete_index_row(conn: sqlite3.Connection, uuid: str, *, commit: bool = True
 def commit_ingest(conn: sqlite3.Connection) -> None:
     """Flush a batched ingest (call at checkpoints and end of run)."""
     conn.commit()
+
+
+def optimize(conn: sqlite3.Connection) -> None:
+    """Refresh query-planner statistics after bulk writes (cheap, incremental).
+
+    SQLite's `PRAGMA optimize` re-ANALYZEs only tables whose contents changed
+    enough to matter, keeping FTS/BM25 and index scans on good query plans as
+    the corpus grows. Safe to call at the end of every ingest/embed pass.
+    """
+    try:
+        conn.execute("PRAGMA optimize")
+        conn.commit()
+    except sqlite3.Error:
+        pass  # advisory only — never fail an ingest over stats
 
 
 def search_meta(conn: sqlite3.Connection, fts_query: str, limit: int = 25) -> list[sqlite3.Row]:
