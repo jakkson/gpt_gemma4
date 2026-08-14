@@ -227,11 +227,14 @@ class DropperApp:
         root = (TkinterDnD.Tk() if _DND else tk.Tk())
         self.root = root
         root.title("Mail Rule Dropper")
-        root.geometry("520x420")
-        root.attributes("-topmost", True)
+        root.geometry("520x470")
+        # (No always-on-top: the window behaves like a normal window so it can go
+        # behind others without needing to be minimized.)
 
         self.addr = tk.StringVar(value="")
         self.action = tk.StringVar(value="trash")
+        self.rule_status_var = tk.StringVar(value="")
+        self._name = ""
         self.status = tk.StringVar(
             value=("Drop an email here, or use the button below."
                    if _DND else "Drag-drop unavailable — use the button below."))
@@ -254,6 +257,10 @@ class DropperApp:
 
         tk.Button(root, text="Grab sender from email selected in Mail",
                   command=self.on_grab).pack(pady=4)
+        # Shows, right below the Grab button, whether the captured sender is
+        # already covered by a trash keyword or a folder route.
+        tk.Label(root, textvariable=self.rule_status_var, wraplength=490,
+                 justify="left", fg="#555").pack(fill="x", padx=14, pady=(0, 2))
 
         sf = tk.LabelFrame(root, text="Sender", padx=10, pady=6)
         sf.pack(fill="x", padx=14, pady=6)
@@ -340,20 +347,65 @@ class DropperApp:
         self.status.set("Couldn't read that drop. Use the Grab button, or tell "
                         f"me what this shows: {data[:120]!r}")
 
+    def _rule_membership(self, addr: str, name: str = "") -> str:
+        """Is this sender already covered by a trash keyword or a folder route?
+        Uses the SAME matching the enforcement (data/mail_rule.py) uses:
+        trash = normalized (alnum-only) keyword as a substring of the full sender
+        field; routes = lowercase substring of the sender."""
+        addr = (addr or "").strip()
+        if not addr:
+            return ""
+        sender = f"{name} <{addr}>".strip() if name else addr
+        low = sender.lower()
+        norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
+        nsender = norm(sender)
+
+        hits = []
+        # Trash keyword list.
+        if KEYWORDS_TXT.exists():
+            for line in KEYWORDS_TXT.read_text(encoding="utf-8").splitlines():
+                kw = line.strip()
+                if not kw or kw.startswith("#"):
+                    continue
+                nk = norm(kw)
+                if nk and nk in nsender:
+                    hits.append(f"🗑  on the TRASH list (matches “{kw}”)")
+                    break
+        # Folder routes.
+        if ROUTES_JSON.exists():
+            try:
+                routes = json.loads(ROUTES_JSON.read_text(encoding="utf-8"))
+            except ValueError:
+                routes = {}
+            for needle, folder in routes.items():
+                n = str(needle).strip().lower()
+                if n and n in low:
+                    hits.append(f"📁  routes to “{folder}” (matches “{needle}”)")
+                    break
+
+        if not hits:
+            return "✓ Not on any rule list yet — this sender is new."
+        return "Already in rules:\n    " + "\n    ".join(hits)
+
     def _set_sender(self, addr: str, name: str, how: str = ""):
         addr = (addr or "").strip()
         self._addr = addr
+        self._name = (name or "").strip()
         self.addr.set(addr + (f"   ({name})" if name else ""))
         self.status.set(f"Sender captured {how} — choose a rule and Apply.".strip())
+        self.rule_status_var.set(self._rule_membership(addr, name))
 
     def on_grab(self):
         try:
             addr, name = sender_from_mail_selection()
             self.addr.set(f"{addr}" + (f"   ({name})" if name else ""))
             self._addr = addr
+            self._name = (name or "").strip()
             self.status.set("Sender captured — choose the rule and Apply.")
+            self.rule_status_var.set(self._rule_membership(addr, name))
         except Exception as e:
             self.status.set(str(e))
+            self.rule_status_var.set("")
 
     def on_apply(self):
         addr = getattr(self, "_addr", "").strip()
