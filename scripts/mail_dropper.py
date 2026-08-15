@@ -237,8 +237,9 @@ class DropperApp:
         self.root = root
         root.title("Mail Rule Dropper")
         root.geometry("520x470")
-        # (No always-on-top: the window behaves like a normal window so it can go
-        # behind others without needing to be minimized.)
+        # Always-on-top: keeps the dropper visible over Mail for easy side-by-side
+        # selection of an email and grabbing/dropping its sender.
+        root.attributes("-topmost", True)
 
         self.addr = tk.StringVar(value="")
         self.action = tk.StringVar(value="trash")
