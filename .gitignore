@@ -21,6 +21,7 @@ data/about_me.md
 data/query_log.jsonl
 data/.open_local_file_token
 data/mail_routes.json
+data/trash_keywords.txt
 data/mail_dropper.log
 
 # Retrieval eval suite embeds real personal query examples — keep local
