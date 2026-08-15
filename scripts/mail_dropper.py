@@ -211,10 +211,19 @@ def add_folder_rule(addr: str, folder: str) -> str:
 
 
 def apply_now(mode: str) -> str:
-    """Run one immediate enforcement pass (full unread scan)."""
+    """Run one immediate, RETROACTIVE enforcement pass over the whole Inbox —
+    read AND unread. This is a one-shot on-demand apply (not the per-minute job),
+    so it deliberately scans everything: when you add a rule, mail from that
+    sender that's already in the Inbox — even if you've already opened it — gets
+    moved right now. A huge --recent-minutes makes the rule's read-mail OR-clause
+    (`date received > recentCutoff`) match the entire mailbox, so read status no
+    longer hides matches. Sender/subject matching only, so a full scan stays fast.
+    """
+    full_lookback = ["--recent-minutes", "5256000"]  # ~10 years = read+unread, all
     args = [str(PYTHON), str(MAIL_RULE)]
     args += (["delete", "--keyword-file", str(KEYWORDS_TXT)] if mode == "trash"
              else ["route"])
+    args += full_lookback
     p = subprocess.run(args, capture_output=True, text=True, timeout=1800)
     out = (p.stdout or p.stderr or "").strip().splitlines()
     return out[-1] if out else "(no output)"

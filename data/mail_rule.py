@@ -69,7 +69,8 @@ def _write_watermark(since_file: str, ts: float) -> None:
         pass
 
 
-def _unread_filter(since_offset: int | None, recent_offset: int | None = None) -> tuple[str, str]:
+def _unread_filter(since_offset: int | None, recent_offset: int | None = None,
+                   last_n: int | None = None) -> tuple[str, str]:
     """(cutoff_lines, whose_clause) for the message query.
 
     - Base set is unread mail.
@@ -79,6 +80,10 @@ def _unread_filter(since_offset: int | None, recent_offset: int | None = None) -
     - since_offset (seconds): performance floor for the incremental (Trump) job so
       it doesn't re-scan every unread body each minute. Callers ensure since_offset
       is at least as wide as recent_offset so the recent window is never clipped.
+    - last_n (count): ALSO include the newest N messages regardless of read status —
+      a count-based safety sweep so a keyword match that was already marked read still
+      gets caught. Added as a top-level OR that is deliberately NOT clipped by
+      since_offset, so the incremental floor never hides the last-N window.
     """
     lines = ""
     conds = "read status is false"
@@ -88,15 +93,29 @@ def _unread_filter(since_offset: int | None, recent_offset: int | None = None) -
     if since_offset is not None:
         lines += f"  set sinceCutoff to (current date) - {int(since_offset)}\n"
         conds = f"{conds} and date received > sinceCutoff"
+    if last_n is not None and last_n > 0:
+        # Newest N by received-date (Mail indexes message 1 = most recent). Take the
+        # Nth message's date as a floor so the whose-clause stays index-friendly.
+        lines += (
+            f"  set lastN to {int(last_n)}\n"
+            f"  set msgTotal to (count of messages of mb)\n"
+            f"  if msgTotal < lastN then set lastN to msgTotal\n"
+            f"  if lastN > 0 then\n"
+            f"    set nthDate to (date received of message lastN of mb) - 1\n"
+            f"  else\n"
+            f"    set nthDate to (current date)\n"
+            f"  end if\n")
+        conds = f"({conds}) or (date received > nthDate)"
     return lines, conds
 
 
 def build_script(keyword: str, mode: str, list_subjects: bool,
-                 since_offset: int | None = None, recent_offset: int | None = None) -> str:
+                 since_offset: int | None = None, recent_offset: int | None = None,
+                 last_n: int | None = None) -> str:
     kw = as_quote(keyword)
     acct = as_quote(ACCT)
     folder = as_quote(FOLDER)
-    cutoff_line, unread_where = _unread_filter(since_offset, recent_offset)
+    cutoff_line, unread_where = _unread_filter(since_offset, recent_offset, last_n)
     # Gather unread messages first (fast, indexed), then test subject/body. This
     # avoids Mail fetching the body of every message in a large mailbox.
     if mode == "delete":
@@ -148,8 +167,9 @@ end timeout'''
 
 
 def run(keyword: str, mode: str, list_subjects: bool,
-        since_offset: int | None = None, recent_offset: int | None = None):
-    script = build_script(keyword, mode, list_subjects, since_offset, recent_offset)
+        since_offset: int | None = None, recent_offset: int | None = None,
+        last_n: int | None = None):
+    script = build_script(keyword, mode, list_subjects, since_offset, recent_offset, last_n)
     t0 = time.time()
     p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     dt = time.time() - t0
@@ -188,11 +208,12 @@ def load_keywords(path: str) -> list[str]:
     return kws
 
 
-def _fetch_unread_sender_subject(since_offset: int | None = None, recent_offset: int | None = None):
+def _fetch_unread_sender_subject(since_offset: int | None = None, recent_offset: int | None = None,
+                                 last_n: int | None = None):
     """Return (rows, ok). rows = [(id, sender, subject), ...] for the query set."""
     acct = as_quote(ACCT)
     folder = as_quote(FOLDER)
-    cutoff_line, unread_where = _unread_filter(since_offset, recent_offset)
+    cutoff_line, unread_where = _unread_filter(since_offset, recent_offset, last_n)
     script = f'''with timeout of 1800 seconds
 tell application "Mail"
   set fs to (ASCII character 31)
@@ -222,6 +243,54 @@ end timeout'''
 def _matches(sender: str, subject: str, keywords: list[str]) -> bool:
     ns, nsub = _normalize(sender), _normalize(subject)
     return any((kw in ns) or (kw in nsub) for kw in keywords)
+
+
+def _is_routed(sender: str, routes: dict) -> bool:
+    """True if this sender matches any folder route (same rule as run_routes):
+    a route key is a case-insensitive substring of the full sender field. Used so
+    a folder rule ALWAYS wins over a trash rule — routed senders are never trashed.
+    """
+    s = (sender or "").lower()
+    return any(needle in s for needle in routes)
+
+
+def _fetch_kw_matches_with_sender(keyword: str, since_offset: int | None = None,
+                                  recent_offset: int | None = None,
+                                  last_n: int | None = None):
+    """[(id, sender)] for msgs whose SUBJECT or BODY contains `keyword`
+    (the single-keyword / Trump rule). Returning the sender lets us spare senders
+    that have a folder route before trashing."""
+    kw = as_quote(keyword)
+    acct = as_quote(ACCT)
+    folder = as_quote(FOLDER)
+    cutoff_line, unread_where = _unread_filter(since_offset, recent_offset, last_n)
+    script = f'''with timeout of 1800 seconds
+tell application "Mail"
+  set fs to (ASCII character 31)
+  set rs to (ASCII character 30)
+  set kw to "{kw}"
+  set acct to first account whose name is "{acct}"
+  set mb to (first mailbox of acct whose name is "{folder}")
+{cutoff_line}  set uMsgs to (messages of mb whose {unread_where})
+  set out to ""
+  repeat with m in uMsgs
+    if ((subject of m) contains kw) or ((content of m) contains kw) then
+      set out to out & (id of m) & fs & (sender of m) & rs
+    end if
+  end repeat
+  return out
+end tell
+end timeout'''
+    p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    out = p.stdout or ""
+    pairs: list[tuple[str, str]] = []
+    for rec in out.split(_RS):
+        if not rec.strip():
+            continue
+        parts = rec.split(_FS)
+        if len(parts) >= 2:
+            pairs.append((parts[0].strip(), parts[1]))
+    return pairs, (p.returncode == 0)
 
 
 def _delete_ids(ids: list[str]) -> int:
@@ -302,13 +371,19 @@ end timeout'''
         return 0
 
 
-def run_routes(routes_path: str, mode: str, recent_offset: int | None = None):
-    """Apply sender->folder routes to Inbox. Returns (routes, per_folder, dt, ok)."""
+def run_routes(routes_path: str, mode: str, recent_offset: int | None = None,
+               last_n: int | None = None):
+    """Apply sender->folder routes to Inbox. Returns (routes, per_folder, dt, ok).
+
+    last_n (like the trash jobs): also scan the newest N messages regardless of
+    read status, so a routed sender's message that's already been read still gets
+    filed by the per-minute job instead of waiting for the manual apply.
+    """
     routes = load_routes(routes_path)
     t0 = time.time()
     if not routes:
         return routes, {}, time.time() - t0, True
-    rows, ok = _fetch_unread_sender_subject(None, recent_offset)
+    rows, ok = _fetch_unread_sender_subject(None, recent_offset, last_n)
     plan: dict[str, list[str]] = {}   # folder -> [msg ids]
     for mid, sender, _subject in rows:
         s = (sender or "").lower()
@@ -326,18 +401,29 @@ def run_routes(routes_path: str, mode: str, recent_offset: int | None = None):
 
 
 def run_keyword_file(path: str, mode: str, list_subjects: bool,
-                     since_offset: int | None = None, recent_offset: int | None = None):
+                     since_offset: int | None = None, recent_offset: int | None = None,
+                     routes: dict | None = None, last_n: int | None = None):
     keywords = load_keywords(path)
     t0 = time.time()
-    rows, ok = _fetch_unread_sender_subject(since_offset, recent_offset)
+    rows, ok = _fetch_unread_sender_subject(since_offset, recent_offset, last_n)
     matched = [(mid, sender, subject) for (mid, sender, subject) in rows
                if _matches(sender, subject, keywords)]
+    # Folder routes win over trash: never trash a sender that has a folder rule.
+    spared = 0
+    if routes:
+        kept = []
+        for mid, sender, subject in matched:
+            if _is_routed(sender, routes):
+                spared += 1
+            else:
+                kept.append((mid, sender, subject))
+        matched = kept
     if mode == "delete":
         moved = _delete_ids([m[0] for m in matched])
     else:
         moved = len(matched)
     dt = time.time() - t0
-    return keywords, matched, moved, dt, ok
+    return keywords, matched, moved, dt, ok, spared
 
 
 def main():
@@ -351,15 +437,27 @@ def main():
     ap.add_argument("--since-file", help="watermark file for incremental scans (only unread mail received since last run)")
     ap.add_argument("--recent-minutes", type=int, default=0,
                     help="also catch mail received in the last N minutes even if already READ (0=off)")
+    ap.add_argument("--last", type=int, default=0,
+                    help="also scan the newest N messages regardless of read status "
+                         "(count-based safety sweep; catches matches already marked read; 0=off)")
+    ap.add_argument("--no-route-precedence", action="store_true",
+                    help="don't spare senders that have a folder route (default: folder routes WIN over trash)")
     ap.add_argument("--list", action="store_true", help="in count mode, also print matching subjects")
     args = ap.parse_args()
 
+    # Folder routes take precedence over trash: a sender with a folder rule is
+    # never trashed. Load them once for the delete paths (skip if disabled).
+    trash_routes = ({} if args.no_route_precedence
+                    else load_routes(args.routes_file) if args.mode in ("count", "delete")
+                    else {})
+
     since_offset, now = _since_offset_seconds(args.since_file)
     recent_offset = args.recent_minutes * 60 if args.recent_minutes and args.recent_minutes > 0 else None
+    last_n = args.last if args.last and args.last > 0 else None
 
     # Sender -> folder routing path.
     if args.mode in ("route", "route-count"):
-        routes, per_folder, dt, ok = run_routes(args.routes_file, args.mode, recent_offset)
+        routes, per_folder, dt, ok = run_routes(args.routes_file, args.mode, recent_offset, last_n)
         verb = "moved" if args.mode == "route" else "would move"
         print(f"[mail_rule] account={ACCT} folder={FOLDER} routes-file={args.routes_file} "
               f"({len(routes)} routes)  ({dt:.0f}s)")
@@ -381,16 +479,20 @@ def main():
         parts.append("since-last-run" if args.since_file else "all-unread")
         if recent_offset is not None:
             parts.append(f"+read≤{args.recent_minutes}min")
+        if last_n is not None:
+            parts.append(f"+last{args.last}")
         return " ".join(parts)
 
     # Sender/subject keyword-list path (space+punctuation-insensitive adjacency).
     if args.keyword_file:
-        keywords, matched, moved, dt, ok = run_keyword_file(
-            args.keyword_file, args.mode, args.list, since_offset, recent_offset)
+        keywords, matched, moved, dt, ok, spared = run_keyword_file(
+            args.keyword_file, args.mode, args.list, since_offset, recent_offset,
+            trash_routes, last_n)
         verb = "would move" if args.mode == "count" else "moved to Trash"
         print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword-file={args.keyword_file} "
               f"({len(keywords)} keywords, sender/subject, {_scope()})  ({dt:.0f}s)")
-        print(f"[mail_rule] {moved} message(s) {verb}.")
+        extra = f"  ({spared} spared — has a folder rule)" if spared else ""
+        print(f"[mail_rule] {moved} message(s) {verb}.{extra}")
         if args.list and matched:
             for _mid, sender, subject in matched:
                 print(f"  - {subject}   [from: {sender}]")
@@ -398,19 +500,33 @@ def main():
             _write_watermark(args.since_file, now)
         return
 
-    # Single-keyword subject/body path (the Trump rule).
-    out, dt, ok = run(args.keyword, args.mode, args.list, since_offset, recent_offset)
-    verb = "would move" if args.mode == "count" else "moved to Trash"
-    # First line of AppleScript output is the count.
+    # Single-keyword subject/body path (the Trump rule). Route-aware on delete:
+    # fetch matches WITH sender, spare any that have a folder rule, trash the rest.
+    if args.mode == "delete":
+        t0 = time.time()
+        pairs, ok = _fetch_kw_matches_with_sender(
+            args.keyword, since_offset, recent_offset, last_n)
+        to_delete = [mid for mid, sender in pairs if not _is_routed(sender, trash_routes)]
+        spared = len(pairs) - len(to_delete)
+        moved = _delete_ids(to_delete)
+        dt = time.time() - t0
+        print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword={args.keyword!r} "
+              f"{_scope()}  ({dt:.0f}s)")
+        extra = f"  ({spared} spared — has a folder rule)" if spared else ""
+        print(f"[mail_rule] {moved} message(s) moved to Trash.{extra}")
+        if advance and ok:
+            _write_watermark(args.since_file, now)
+        return
+
+    # count mode (dry run): existing subject/body count via AppleScript.
+    out, dt, ok = run(args.keyword, args.mode, args.list, since_offset, recent_offset, last_n)
     lines = out.splitlines()
     count = lines[0] if lines else "0"
     print(f"[mail_rule] account={ACCT} folder={FOLDER} keyword={args.keyword!r} "
           f"{_scope()}  ({dt:.0f}s)")
-    print(f"[mail_rule] {count} message(s) {verb}.")
+    print(f"[mail_rule] {count} message(s) would move.")
     if args.list and len(lines) > 1:
         print("\n".join(lines[1:]))
-    if advance and ok:
-        _write_watermark(args.since_file, now)
 
 
 if __name__ == "__main__":
