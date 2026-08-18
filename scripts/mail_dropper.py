@@ -210,23 +210,13 @@ def add_folder_rule(addr: str, folder: str) -> str:
     return f"Added: {addr} files to “{folder}” from now on."
 
 
-def apply_now(mode: str) -> str:
-    """Run one immediate, RETROACTIVE enforcement pass over the whole Inbox —
-    read AND unread. This is a one-shot on-demand apply (not the per-minute job),
-    so it deliberately scans everything: when you add a rule, mail from that
-    sender that's already in the Inbox — even if you've already opened it — gets
-    moved right now. A huge --recent-minutes makes the rule's read-mail OR-clause
-    (`date received > recentCutoff`) match the entire mailbox, so read status no
-    longer hides matches. Sender/subject matching only, so a full scan stays fast.
-    """
-    full_lookback = ["--recent-minutes", "5256000"]  # ~10 years = read+unread, all
-    args = [str(PYTHON), str(MAIL_RULE)]
-    args += (["delete", "--keyword-file", str(KEYWORDS_TXT)] if mode == "trash"
-             else ["route"])
-    args += full_lookback
-    p = subprocess.run(args, capture_output=True, text=True, timeout=1800)
-    out = (p.stdout or p.stderr or "").strip().splitlines()
-    return out[-1] if out else "(no output)"
+# NOTE: The dropper deliberately does NOT run an enforcement pass when a rule is
+# added — that would drive Mail.app synchronously and freeze the user's Mail. The
+# per-minute launchd jobs (mail_rule.py, with --last 50) do the moving in the
+# background. For a one-off retroactive sweep of the WHOLE Inbox (e.g. to catch
+# older buried read mail beyond the newest 50), run manually:
+#   .venv/bin/python data/mail_rule.py route   --recent-minutes 5256000
+#   .venv/bin/python data/mail_rule.py delete  --keyword-file data/trash_keywords.txt --recent-minutes 5256000
 
 
 # --- UI --------------------------------------------------------------------------
@@ -431,15 +421,13 @@ class DropperApp:
             msg = add_folder_rule(addr, folder)
         else:
             msg = add_trash_rule(addr)
-        self.status.set(msg + "  Applying to current Inbox…")
-
-        def _bg():
-            try:
-                result = apply_now("trash" if mode == "trash" else "route")
-            except Exception as e:
-                result = f"apply failed: {e}"
-            self.root.after(0, lambda: self.status.set(f"{msg}\n{result}"))
-        threading.Thread(target=_bg, daemon=True).start()
+        # Rule is written instantly — no blocking enforcement pass here. The old
+        # apply_now drove Mail.app through a full-Inbox scan synchronously, which
+        # froze Mail for ~30s+. Instead, the per-minute launchd job scans the newest
+        # ~50 Inbox messages (read or unread) and files matches within a minute, so
+        # adding a rule stays instant and never interrupts your Mail use.
+        self.status.set(msg + "  The 1-min background scan will file matching Inbox mail (newest ~50).")
+        self.rule_status_var.set(self._rule_membership(addr, self._name))
 
     def run(self):
         self.root.mainloop()
