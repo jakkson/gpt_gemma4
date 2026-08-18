@@ -210,6 +210,44 @@ def add_folder_rule(addr: str, folder: str) -> str:
     return f"Added: {addr} files to “{folder}” from now on."
 
 
+def remove_trash_keywords(keywords) -> int:
+    """Delete the given keyword lines from trash_keywords.txt. Match is exact
+    (case-insensitive) against the stored line, so only the rules shown are
+    removed. Returns how many lines were removed."""
+    if not KEYWORDS_TXT.exists() or not keywords:
+        return 0
+    targets = {str(k).strip().lower() for k in keywords}
+    kept, removed = [], 0
+    for line in KEYWORDS_TXT.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and s.lower() in targets:
+            removed += 1
+            continue
+        kept.append(line)
+    KEYWORDS_TXT.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+    return removed
+
+
+def remove_routes(needles) -> int:
+    """Delete the given route keys from mail_routes.json (case-insensitive on the
+    key). Returns how many routes were removed."""
+    if not ROUTES_JSON.exists() or not needles:
+        return 0
+    try:
+        routes = json.loads(ROUTES_JSON.read_text(encoding="utf-8"))
+    except ValueError:
+        return 0
+    targets = {str(n).strip().lower() for n in needles}
+    removed = 0
+    for key in list(routes.keys()):
+        if str(key).strip().lower() in targets:
+            del routes[key]
+            removed += 1
+    ROUTES_JSON.write_text(json.dumps(routes, indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    return removed
+
+
 # NOTE: The dropper deliberately does NOT run an enforcement pass when a rule is
 # added — that would drive Mail.app synchronously and freeze the user's Mail. The
 # per-minute launchd jobs (mail_rule.py, with --last 50) do the moving in the
@@ -226,14 +264,13 @@ class DropperApp:
         root = (TkinterDnD.Tk() if _DND else tk.Tk())
         self.root = root
         root.title("Mail Rule Dropper")
-        root.geometry("520x470")
+        root.geometry("520x560")
         # Always-on-top: keeps the dropper visible over Mail for easy side-by-side
         # selection of an email and grabbing/dropping its sender.
         root.attributes("-topmost", True)
 
         self.addr = tk.StringVar(value="")
         self.action = tk.StringVar(value="trash")
-        self.rule_status_var = tk.StringVar(value="")
         self._name = ""
         self.status = tk.StringVar(
             value=("Drop an email here, or use the button below."
@@ -257,10 +294,12 @@ class DropperApp:
 
         tk.Button(root, text="Grab sender from email selected in Mail",
                   command=self.on_grab).pack(pady=4)
-        # Shows, right below the Grab button, whether the captured sender is
-        # already covered by a trash keyword or a folder route.
-        tk.Label(root, textvariable=self.rule_status_var, wraplength=490,
-                 justify="left", fg="#555").pack(fill="x", padx=14, pady=(0, 2))
+        # Right below the Grab button: shows whether the captured sender is already
+        # covered by trash keyword(s) or folder route(s), with a Delete button per
+        # rule (and Delete ALL when there's more than one) so a "double rule" can be
+        # cleaned up before re-applying. Rebuilt on each capture via _refresh_rule_ui.
+        self.rules_frame = tk.Frame(root)
+        self.rules_frame.pack(fill="x", padx=14, pady=(0, 2))
 
         sf = tk.LabelFrame(root, text="Sender", padx=10, pady=6)
         sf.pack(fill="x", padx=14, pady=6)
@@ -347,21 +386,20 @@ class DropperApp:
         self.status.set("Couldn't read that drop. Use the Grab button, or tell "
                         f"me what this shows: {data[:120]!r}")
 
-    def _rule_membership(self, addr: str, name: str = "") -> str:
-        """Is this sender already covered by a trash keyword or a folder route?
-        Uses the SAME matching the enforcement (data/mail_rule.py) uses:
-        trash = normalized (alnum-only) keyword as a substring of the full sender
-        field; routes = lowercase substring of the sender."""
+    def _matching_rules(self, addr: str, name: str = ""):
+        """All rules this sender already matches, using the SAME matching the
+        enforcement (data/mail_rule.py) uses: trash = normalized (alnum-only)
+        keyword as a substring of the full sender field; routes = lowercase
+        substring of the sender. Returns (trash_keywords, [(needle, folder), ...])
+        — ALL hits, not just the first, so each can be deleted individually."""
         addr = (addr or "").strip()
+        trash, routes_hit = [], []
         if not addr:
-            return ""
+            return trash, routes_hit
         sender = f"{name} <{addr}>".strip() if name else addr
         low = sender.lower()
         norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
         nsender = norm(sender)
-
-        hits = []
-        # Trash keyword list.
         if KEYWORDS_TXT.exists():
             for line in KEYWORDS_TXT.read_text(encoding="utf-8").splitlines():
                 kw = line.strip()
@@ -369,9 +407,7 @@ class DropperApp:
                     continue
                 nk = norm(kw)
                 if nk and nk in nsender:
-                    hits.append(f"🗑  on the TRASH list (matches “{kw}”)")
-                    break
-        # Folder routes.
+                    trash.append(kw)
         if ROUTES_JSON.exists():
             try:
                 routes = json.loads(ROUTES_JSON.read_text(encoding="utf-8"))
@@ -380,12 +416,47 @@ class DropperApp:
             for needle, folder in routes.items():
                 n = str(needle).strip().lower()
                 if n and n in low:
-                    hits.append(f"📁  routes to “{folder}” (matches “{needle}”)")
-                    break
+                    routes_hit.append((str(needle), str(folder)))
+        return trash, routes_hit
 
-        if not hits:
-            return "✓ Not on any rule list yet — this sender is new."
-        return "Already in rules:\n    " + "\n    ".join(hits)
+    def _refresh_rule_ui(self, addr: str = "", name: str = ""):
+        """Rebuild the rules panel: one Delete button per existing rule, plus a
+        Delete-ALL when the sender matches more than one (the 'double rule' case)."""
+        frame = self.rules_frame
+        for w in frame.winfo_children():
+            w.destroy()
+        addr = (addr or "").strip()
+        if not addr:
+            return
+        trash, routes_hit = self._matching_rules(addr, name)
+        if not trash and not routes_hit:
+            tk.Label(frame, text="✓ Not on any rule list yet — this sender is new.",
+                     fg="#15803d", justify="left").pack(anchor="w")
+            return
+        tk.Label(frame, text="Already in rules — Delete any you want to change:",
+                 fg="#b45309", justify="left").pack(anchor="w")
+        for kw in trash:
+            r = tk.Frame(frame); r.pack(anchor="w", fill="x", pady=1)
+            tk.Button(r, text="Delete", fg="#b91c1c",
+                      command=lambda k=kw: self._delete_rules([k], [])).pack(side="left")
+            tk.Label(r, text=f"  🗑  TRASH  (matches “{kw}”)", fg="#555").pack(side="left")
+        for needle, folder in routes_hit:
+            r = tk.Frame(frame); r.pack(anchor="w", fill="x", pady=1)
+            tk.Button(r, text="Delete", fg="#b91c1c",
+                      command=lambda n=needle: self._delete_rules([], [n])).pack(side="left")
+            tk.Label(r, text=f"  📁  → “{folder}”  (matches “{needle}”)",
+                     fg="#555").pack(side="left")
+        if len(trash) + len(routes_hit) >= 2:
+            tk.Button(frame, text="Delete ALL rules for this sender", fg="#b91c1c",
+                      command=lambda: self._delete_rules(
+                          list(trash), [n for n, _ in routes_hit])
+                      ).pack(anchor="w", pady=(3, 0))
+
+    def _delete_rules(self, keywords, needles):
+        n = remove_trash_keywords(keywords) + remove_routes(needles)
+        self.status.set(f"Removed {n} rule(s). The background jobs stop applying "
+                        f"them within a minute.")
+        self._refresh_rule_ui(getattr(self, "_addr", ""), self._name)
 
     def _set_sender(self, addr: str, name: str, how: str = ""):
         addr = (addr or "").strip()
@@ -393,7 +464,7 @@ class DropperApp:
         self._name = (name or "").strip()
         self.addr.set(addr + (f"   ({name})" if name else ""))
         self.status.set(f"Sender captured {how} — choose a rule and Apply.".strip())
-        self.rule_status_var.set(self._rule_membership(addr, name))
+        self._refresh_rule_ui(addr, name)
 
     def on_grab(self):
         try:
@@ -402,10 +473,10 @@ class DropperApp:
             self._addr = addr
             self._name = (name or "").strip()
             self.status.set("Sender captured — choose the rule and Apply.")
-            self.rule_status_var.set(self._rule_membership(addr, name))
+            self._refresh_rule_ui(addr, name)
         except Exception as e:
             self.status.set(str(e))
-            self.rule_status_var.set("")
+            self._refresh_rule_ui("")
 
     def on_apply(self):
         addr = getattr(self, "_addr", "").strip()
@@ -427,7 +498,7 @@ class DropperApp:
         # ~50 Inbox messages (read or unread) and files matches within a minute, so
         # adding a rule stays instant and never interrupts your Mail use.
         self.status.set(msg + "  The 1-min background scan will file matching Inbox mail (newest ~50).")
-        self.rule_status_var.set(self._rule_membership(addr, self._name))
+        self._refresh_rule_ui(addr, self._name)
 
     def run(self):
         self.root.mainloop()
