@@ -1275,6 +1275,69 @@ def _query_content_terms(ql: str) -> list[str]:
     return out
 
 
+def _query_years(question: str) -> list[str]:
+    """Distinct 4-digit years named in the query (e.g. '2016'). Used to surface a
+    document ABOUT a year even when its file date is later — e.g. a DISC assessment
+    taken in 2016 whose file was saved/exported in 2018 or 2026. Complements
+    _query_month_year (which requires a month too, so 'from 2016' returns None there)."""
+    seen: list[str] = []
+    for y in re.findall(r"\b(19\d{2}|20[0-4]\d)\b", question or ""):
+        if y not in seen:
+            seen.append(y)
+    return seen
+
+
+_SENDER_STOPWORDS = frozenset({
+    "the", "my", "a", "an", "this", "that", "these", "those", "last", "past",
+    "recent", "your", "me", "them", "him", "her", "us", "all", "any", "some",
+    "work", "home", "here", "there", "which", "what", "who", "when", "about",
+})
+
+
+def _named_email_sender(question: str) -> str | None:
+    """For mail-oriented queries ('emails from abc7news'), return the sender token
+    so retrieval can SCOPE to that sender instead of doing a generic semantic top-K
+    (which lets other newsletters outrank the one the user named). None when no mail
+    sender is named. Matched later as a substring of the mail row's From:/text."""
+    ql = (question or "").lower()
+    if not any(w in ql for w in (
+        "email", "emails", "e-mail", "e-mails", "newsletter", "newsletters",
+        "mail", "inbox", "sender",
+    )):
+        return None
+    m = re.search(
+        r"(?:emails?|e-mails?|newsletters?|mail|messages?)\s+"
+        r"(?:from|by|sent by|of)\s+([a-z0-9][\w.\-]{2,})", ql)
+    cand = m.group(1) if m else None
+    if not cand:
+        for mm in re.finditer(r"\bfrom\s+([a-z0-9][\w.\-]{2,})", ql):
+            tok = mm.group(1)
+            if tok not in _SENDER_STOPWORDS:
+                cand = tok
+                break
+    if not cand:
+        return None
+    cand = cand.strip(".-")
+    if not cand or cand in _SENDER_STOPWORDS or len(cand) < 3:
+        return None
+    return cand
+
+
+def _recent_window_start(question: str) -> str | None:
+    """ISO start date for a 'last/past N days/weeks/months/years' window, else None."""
+    ql = (question or "").lower()
+    m = re.search(r"(?:last|past|previous)\s+(\d+)\s+(day|week|month|year)s?", ql)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+    else:
+        m2 = re.search(r"(?:last|past|this)\s+(day|week|month|year)\b", ql)
+        if not m2:
+            return None
+        n, unit = 1, m2.group(1)
+    days = {"day": 1, "week": 7, "month": 30, "year": 365}[unit] * max(1, n)
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
 # --- Self-correcting retrieval (CRAG-lite) -----------------------------------
 #
 # The failure mode we kept hand-patching (SF Log, telemedicine, Walmart, …) is
@@ -1764,6 +1827,63 @@ def _retrieve_rows(
                 ):
                     merged[r["uuid"]] = r
 
+        # Sender-scoped mail sweep: when the user names an email sender ("emails
+        # from abc7news"), pull that sender's mail directly (optionally within a
+        # "last N months" window) so an aggregate ("analyze the last 4 months of
+        # emails from X") sees ALL of them, not a semantic top-K that other
+        # newsletters can crowd out.
+        _sender = _named_email_sender(question)
+        if _sender:
+            like = f"%{_sender.lower()}%"
+            win = _recent_window_start(question)
+            lim = max(candidate_limit * 6, 300)
+            if win:
+                sender_rows = conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'mail:%' AND lower(ocr_text) LIKE ?
+                      AND substr(date_iso,1,10) >= ?
+                    ORDER BY date_iso DESC LIMIT ?
+                    """,
+                    (like, win, lim),
+                ).fetchall()
+            else:
+                sender_rows = conn.execute(
+                    """
+                    SELECT *, 0 AS rank FROM photo_meta
+                    WHERE uuid LIKE 'mail:%' AND lower(ocr_text) LIKE ?
+                    ORDER BY date_iso DESC LIMIT ?
+                    """,
+                    (like, lim),
+                ).fetchall()
+            for r in sender_rows:
+                merged[r["uuid"]] = r
+
+        # Year-in-name/text sweep: when a year is named ("...from 2016"), seed rows
+        # whose FILENAME carries that year (a doc explicitly about that year, e.g.
+        # "DISC ASSESSMENT 2016.docx") plus rows where the year co-occurs with a
+        # distinctive content term — so a document ABOUT 2016 surfaces even though
+        # its file date is 2018/2026. The year is a SOFT signal, never a hard filter.
+        _years = _query_years(question)
+        if _years:
+            _cterms = [t for t in _query_content_terms(ql) if len(t) >= 4][:4]
+            for yr in _years:
+                for r in conn.execute(
+                    "SELECT *, 0 AS rank FROM photo_meta WHERE filename LIKE ? "
+                    "ORDER BY date_iso DESC LIMIT ?",
+                    (f"%{yr}%", candidate_limit),
+                ):
+                    merged[r["uuid"]] = r
+                for term in _cterms:
+                    for r in conn.execute(
+                        "SELECT *, 0 AS rank FROM photo_meta "
+                        "WHERE (filename LIKE ? OR ocr_text LIKE ?) "
+                        "AND lower(coalesce(filename,'')||' '||coalesce(ocr_text,'')) LIKE ? "
+                        "ORDER BY date_iso DESC LIMIT ?",
+                        (f"%{yr}%", f"%{yr}%", f"%{term}%", candidate_limit),
+                    ):
+                        merged[r["uuid"]] = r
+
         # Message-discovery queries must always pull ``imsg:`` candidates: substring
         # FTS matches words like "text" inside OCR blobs from unrelated PDFs, and
         # ``Most Recent`` sorting used to float those above real texts.
@@ -1850,6 +1970,9 @@ def _retrieve_rows(
         wants_calendar = _is_calendar_query(question)
         cal_window = _calendar_window(question) if wants_calendar else None
         cal_future = wants_calendar and _wants_future(question)
+        # Sender/year scoping signals for the two sweeps above (used in score()).
+        named_sender = _named_email_sender(question)
+        query_years = _query_years(question)
 
         # Cross-encoder rerank (relevance mode only): re-score the surviving
         # candidates by reading each (question, row) pair jointly, then blend the
@@ -1918,6 +2041,14 @@ def _retrieve_rows(
                 entity_bonus -= 5.0
             if wants_nyt and has_nyt:
                 entity_bonus += 6.0
+            # Named email sender: rows from that sender ARE the answer to an
+            # "emails from X" query — lift them above other newsletters.
+            if named_sender and named_sender in text:
+                entity_bonus += 20.0
+            # Named year in the row's name/text (soft signal): a record ABOUT that
+            # year surfaces even when its file date is a different year.
+            if query_years and any(yr in text for yr in query_years):
+                entity_bonus += 8.0
             if "subscription" in ql and "subscription" in text:
                 entity_bonus += 2.0
             if wants_money and has_currency:
@@ -2485,10 +2616,21 @@ def answer_question(
             return answer, rows, stats, hit_md, gallery, gallery_paths
 
     aggregate_mode = _is_aggregate_finance_query(q)
+    # A named-sender "analyze the last N months of emails from X" is also an
+    # aggregate: it needs many of that sender's rows, not a top-15 sample.
+    _sender_aggregate = bool(_named_email_sender(q)) and any(
+        w in q.lower() for w in (
+            "analyze", "analysis", "summar", "overview", "strateg", "trend",
+            "theme", "pattern", "all ", "every ", "recap", "review",
+        ))
     scoped_my = _query_month_year(q)
     # Broad aggregate pulls need more rows; month-scoped queries stay at top_k
     # (often zero hits — skip sending 40 rows to a slow 32B model).
-    effective_top_k = max(top_k, 40) if aggregate_mode and not scoped_my else top_k
+    effective_top_k = (
+        max(top_k, 40)
+        if (aggregate_mode or _sender_aggregate) and not scoped_my
+        else top_k
+    )
 
     rows, _correction = _retrieve_rows_corrected(
         db_path=db_path, question=q, top_k=effective_top_k,
