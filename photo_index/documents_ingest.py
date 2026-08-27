@@ -302,22 +302,61 @@ def extract_pptx(path: Path) -> str:
 
 
 def extract_xlsx(path: Path) -> str:
+    """Extract a spreadsheet as HEADER-RESOLVED text: each data cell is emitted
+    with its column header (and the row's label) inline — e.g. "05:00 PM — Mon
+    09-15: America's Funniest Videos" — instead of a raw flattened grid. This
+    spares the LLM the 2-D lookup (mapping a cell back to a far-away header row +
+    header column) that makes grid data like a TV schedule unanswerable when
+    flattened. Falls back to tab-flattening for sheets with no detectable header."""
     from openpyxl import load_workbook
+    from datetime import datetime as _dt, date as _date
+
+    def fmt(c) -> str:
+        if c is None:
+            return ""
+        if isinstance(c, _dt):
+            return (c.strftime("%a %m-%d") if (c.hour == 0 and c.minute == 0)
+                    else c.strftime("%a %m-%d %H:%M"))
+        if isinstance(c, _date):
+            return c.strftime("%a %m-%d")
+        return str(c).strip()
 
     wb = load_workbook(path, read_only=True, data_only=True)
     parts: list[str] = []
     try:
         for sheet in wb.worksheets:
             parts.append(f"## Sheet: {sheet.title}")
-            for row in sheet.iter_rows(max_row=5000, values_only=True):
-                cells = []
-                for c in row:
-                    if c is None:
-                        cells.append("")
-                    else:
-                        cells.append(str(c).strip())
-                if any(x for x in cells):
-                    parts.append("\t".join(cells))
+            rows = [[fmt(c) for c in r]
+                    for r in sheet.iter_rows(max_row=5000, values_only=True)]
+            # Header row = the first of the first 6 rows with >=2 DISTINCT
+            # non-empty cells (skips repeated banner rows like "KPYX KPYX ...").
+            header: list[str] | None = None
+            header_idx = -1
+            for i, r in enumerate(rows[:6]):
+                ne = [v for v in r if v]
+                if len(ne) >= 2 and len(set(ne)) >= 2:
+                    header, header_idx = r, i
+                    break
+            for i, r in enumerate(rows):
+                if not any(r):
+                    continue
+                if header is None or i <= header_idx:
+                    parts.append("\t".join(v for v in r if v))
+                    continue
+                label = r[0]
+                frags = []
+                for c in range(1, len(r)):
+                    v = r[c]
+                    if not v:
+                        continue
+                    col = header[c] if c < len(header) else ""
+                    frags.append(f"{col}: {v}" if col else v)
+                if not frags:
+                    if label:
+                        parts.append(label)
+                    continue
+                body = "; ".join(frags)
+                parts.append(f"{label} — {body}" if label else body)
     finally:
         wb.close()
     return "\n".join(parts)

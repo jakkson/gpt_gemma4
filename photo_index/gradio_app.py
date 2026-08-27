@@ -3127,7 +3127,7 @@ def remove_alias_entry(raw_json: str, canonical: str) -> tuple[str, str]:
 
 
 # Ad-hoc document analysis (upload box), independent of the indexed corpus.
-_UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "32000"))
+_UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "60000"))
 
 
 def analyze_uploaded_file(file_paths, question: str, qa_model: str) -> str:
@@ -3197,7 +3197,10 @@ Task: {task}
     header = " · ".join(name for name, _, _ in docs)
     notes = []
     if truncated_any:
-        notes.append(f"*(Each document capped at ~{per_doc_cap:,} chars to fit the model context.)*")
+        notes.append(
+            f"*(Each document capped at ~{per_doc_cap:,} chars to fit the model "
+            f"context. For a large file, raise `PHOTO_INDEX_UPLOAD_CHAR_CAP` and "
+            f"use a high-context model — e.g. the 80B loaded at 64K.)*")
     if skipped:
         notes.append("**Skipped:**\n" + "\n".join(skipped))
     note_str = ("\n\n" + "\n\n".join(notes)) if notes else ""
