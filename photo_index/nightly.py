@@ -156,6 +156,9 @@ def main(argv: list[str] | None = None) -> None:
             doc_root,
             "--progress-every",
             str(args.documents_progress_every),
+            # Video/audio: index by filename only (searchable by name, no content
+            # extraction / transcription / VLM).
+            "--index-media-filenames",
         ]
         rc = max(rc, _run_module("photo_index.documents_ingest", doc_args))
     else:

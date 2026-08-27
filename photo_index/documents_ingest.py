@@ -473,6 +473,7 @@ def run_documents_ingest(
     skip_audio: bool,
     max_chars_per_file: int,
     exclude: tuple[str, ...] = (),
+    index_media_filenames: bool = False,
 ) -> dict[str, int | float]:
     root = Path(os.path.abspath(root)).resolve()
     if not root.is_dir():
@@ -610,11 +611,12 @@ def run_documents_ingest(
             skipped_temp += 1
             continue
         ext = p.suffix.lower()
-        if ext in _VIDEO_EXT:
+        is_media = ext in _VIDEO_EXT or ext in _AUDIO_EXT
+        # Video/audio: index the FILENAME only (searchable by name, no content
+        # extraction / transcription / VLM) when enabled; else skip entirely.
+        media_only = index_media_filenames and is_media
+        if is_media and not media_only:
             skipped_video += 1
-            continue
-        if skip_audio and ext in _AUDIO_EXT:
-            skipped_media += 1
             continue
         if skip_images and ext in _RASTER_IMAGE_EXT:
             skipped_media += 1
@@ -667,6 +669,42 @@ def run_documents_ingest(
 
         if _should_skip_unchanged(conn, uuid, mtime_ns, size_i, force):
             skipped_dup += 1
+            continue
+
+        if media_only:
+            # Filename-only index for video/audio: one row, searchable by name
+            # and relative path, with NO content extraction (no transcription or
+            # VLM). Lets "the interview mp4 from the parade" be found by name.
+            rel = rel_for(path)
+            iso = None
+            _mt = getattr(st, "st_mtime", 0)
+            if _mt > 0:
+                iso = datetime.fromtimestamp(_mt, tz=timezone.utc).isoformat()
+            meta = _meta_line(mtime_ns, size_i, rel, root_display)
+            try:
+                conn.execute(
+                    "DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
+                    (uuid, uuid + "#%"),
+                )
+            except Exception:
+                pass
+            try:
+                upsert_photo(
+                    conn,
+                    uuid=uuid,
+                    filename=rel,
+                    date_iso=iso,
+                    ocr_text=f"{p.name}\n{rel}",
+                    vlm_text=f"{meta}\nextractor=filename-only ({ext.lstrip('.')})",
+                    image_path_used=str(path),
+                    commit=False,
+                )
+                indexed += 1
+                if commit_every <= 1 or indexed % commit_every == 0:
+                    commit_ingest(conn)
+            except Exception as e:
+                errors += 1
+                _log(f"[documents warn] {path} filename-only: {e}")
             continue
 
         text_raw, how, extract_err = extract_auto(path, ext)
@@ -816,6 +854,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Include audio extensions (normally skipped — little extractable text).",
     )
     p.add_argument(
+        "--index-media-filenames",
+        action="store_true",
+        help="Index video/audio files by FILENAME only (searchable by name; no "
+             "content extraction, transcription, or VLM). Overrides the normal "
+             "video/audio skip.",
+    )
+    p.add_argument(
         "--max-chars-per-file",
         type=int,
         default=400_000,
@@ -862,6 +907,7 @@ def main(argv: list[str] | None = None) -> None:
             skip_audio=not args.include_audio,
             max_chars_per_file=max(10_000, args.max_chars_per_file),
             exclude=tuple(args.exclude),
+            index_media_filenames=args.index_media_filenames,
         )
 
     if args.no_global_ingest_lock:

@@ -112,11 +112,13 @@ if ! past_deadline && [[ -d "$BOOKS_ROOT" ]]; then
   echo "[nightly] ingesting offline library: $BOOKS_ROOT"
   "$PYTHON_BIN" -m photo_index.documents_ingest \
     --db "$ROOT/data/photo_index.sqlite" --root "$BOOKS_ROOT" --progress-every 50 \
+    --index-media-filenames \
     || echo "[nightly warn] library ingest failed"
 fi
 
-# Extra document folders outside ~/Dropbox/Documents (text extraction only, same
-# as the library step — images/video/audio are not captioned here). Add more
+# Extra document folders outside ~/Dropbox/Documents (docs get full text/OCR;
+# images captioned by the later VLM pass; video/audio indexed by FILENAME only
+# via --index-media-filenames — searchable by name, no transcription). Add more
 # paths to the array as needed.
 EXTRA_DOC_ROOTS=(
   "$HOME/Dropbox/KPIX"
@@ -134,6 +136,7 @@ for extra in "${EXTRA_DOC_ROOTS[@]}"; do
     for ex in "${EXTRA_DOC_EXCLUDES[@]}"; do excl_args+=(--exclude "$ex"); done
     "$PYTHON_BIN" -m photo_index.documents_ingest \
       --db "$ROOT/data/photo_index.sqlite" --root "$extra" --progress-every 50 \
+      --index-media-filenames \
       "${excl_args[@]}" \
       || echo "[nightly warn] extra folder ingest failed: $extra"
   fi
