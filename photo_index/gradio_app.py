@@ -3130,7 +3130,8 @@ def remove_alias_entry(raw_json: str, canonical: str) -> tuple[str, str]:
 _UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "60000"))
 
 
-def analyze_uploaded_file(file_paths, question: str, qa_model: str) -> str:
+def analyze_uploaded_file(file_paths, question: str, qa_model: str,
+                          char_cap: int | None = None) -> str:
     """Extract text from one or more uploaded documents and answer/summarize them.
 
     Separate from index search: works only on the uploaded files, not the SQLite
@@ -3165,7 +3166,8 @@ def analyze_uploaded_file(file_paths, question: str, qa_model: str) -> str:
 
     # Budget the TOTAL text across all files to fit the model context, sharing
     # it evenly so one long file can't crowd out the others.
-    per_doc_cap = max(1500, _UPLOAD_TEXT_CHAR_CAP // len(docs))
+    cap = int(char_cap) if char_cap else _UPLOAD_TEXT_CHAR_CAP
+    per_doc_cap = max(1500, cap // len(docs))
     truncated_any = False
     blocks = []
     for name, text, method in docs:
@@ -3284,6 +3286,12 @@ def build_app(
                 label="What should I do with them?",
                 placeholder="Leave blank to summarize each, or ask e.g. 'Compare these two contracts' / 'What are the payment terms?'",
                 lines=2,
+            )
+            upload_cap = gr.Slider(
+                label="Max characters per document (raise for large files — needs a "
+                      "high-context model, e.g. the 80B at 64K; lower on the 30B mini)",
+                minimum=8000, maximum=200000, step=4000,
+                value=_UPLOAD_TEXT_CHAR_CAP,
             )
             upload_btn = gr.Button("Analyze document(s)", variant="primary")
             upload_answer = gr.Markdown("No documents analyzed yet.", elem_id="pi-answer", sanitize_html=False)
@@ -3512,8 +3520,8 @@ def build_app(
         open_messages_btn.click(fn=open_messages_app, outputs=[preview_note])
         clear_cache_btn.click(fn=clear_search_cache, outputs=[stats])
         upload_btn.click(
-            fn=lambda f, q: analyze_uploaded_file(f, q, qa_model),
-            inputs=[upload_file, upload_question],
+            fn=lambda f, q, cap: analyze_uploaded_file(f, q, qa_model, cap),
+            inputs=[upload_file, upload_question, upload_cap],
             outputs=[upload_answer],
             queue=True,
         )
