@@ -126,8 +126,35 @@ def _today_note() -> str:
         "- Partial dates like '08/06' in a recently received email mean the next "
         "upcoming occurrence (e.g. August 6 of this year), not a past year.\n"
         "- An old record (received years ago) describes a PAST event even if its "
-        "text says 'upcoming' — it was upcoming back then, not now.\n\n"
+        "text says 'upcoming' — it was upcoming back then, not now.\n"
+        "- Each record is labeled 'DATE: 2026-08-24 (Sun, 2 days ago)'. Trust that "
+        "label for ordering: a SMALLER 'days ago' is MORE RECENT. When you mention "
+        "two dated items, order them correctly and NEVER say a more-recent date "
+        "happened 'before' an older one — e.g. Aug 24 is AFTER Aug 17, not before.\n\n"
     )
+
+
+def _date_age_label(date_iso) -> str:
+    """Human + relative date label so the model never has to compute recency from a
+    raw ISO timestamp buried in JSON — small models misorder those (e.g. calling
+    Aug 24 'before' Aug 17). Returns e.g. '2026-08-17 (Sat, 9 days ago)'."""
+    s = str(date_iso or "")[:10]
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return s or "unknown date"
+    days = (datetime.now().date() - d).days
+    if days == 0:
+        rel = "today"
+    elif days == 1:
+        rel = "yesterday"
+    elif days > 1:
+        rel = f"{days} days ago"
+    elif days == -1:
+        rel = "tomorrow"
+    else:
+        rel = f"in {-days} days"
+    return f"{s} ({d.strftime('%a')}, {rel})"
 
 
 def _about_me_block() -> str:
@@ -373,6 +400,9 @@ def _build_prompt(
             # Zero-width/preheader junk eats context — strip it.
             block = re.sub(r"[​‌‍⁠﻿\xa0]+", " ", block)
             block = re.sub(r" {3,}", "  ", block)
+            # Explicit, pre-computed date + age so the model orders records by date
+            # instead of parsing raw ISO from JSON (which it misorders).
+            block = f"DATE: {_date_age_label(r['date_iso'])}\n{block}"
             blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
     about_me = _about_me_block() + _today_note()
