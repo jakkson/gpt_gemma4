@@ -245,8 +245,53 @@ _PAGE_LOAD_JS = """
       true
     );
   }
+
+  // --- Survive iOS Safari tab reloads (backgrounding the tab evicts it) ---
+  // Persist the query + last answer in localStorage and restore them on load,
+  // so minimizing/switching apps never drops you back to a blank page.
+  try {
+    const qWrap = document.querySelector("#photo-query-input");
+    const qBox = qWrap && qWrap.querySelector("textarea");
+    if (qBox && !window.__photoQueryPersist) {
+      window.__photoQueryPersist = true;
+      const saved = localStorage.getItem("pi_last_query");
+      if (saved && !qBox.value) {
+        qBox.value = saved;
+        qBox.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      qBox.addEventListener("input", () => {
+        try { localStorage.setItem("pi_last_query", qBox.value); } catch (e) {}
+      });
+    }
+    const ans = document.querySelector("#pi-answer");
+    if (ans && !window.__photoAnswerPersist) {
+      window.__photoAnswerPersist = true;
+      const savedAns = localStorage.getItem("pi_last_answer");
+      const cur = (ans.textContent || "").trim().toLowerCase();
+      if (savedAns && (cur.length < 3 || cur.startsWith("enter a question"))) {
+        ans.innerHTML = savedAns;
+      }
+      new MutationObserver(() => {
+        try {
+          const html = ans.innerHTML || "";
+          if (html && html.length > 60) localStorage.setItem("pi_last_answer", html);
+        } catch (e) {}
+      }).observe(ans, { childList: true, subtree: true, characterData: true });
+    }
+  } catch (e) {}
 }
 """
+
+
+# iOS "Add to Home Screen" runs the page as a standalone web app that the OS
+# keeps alive far longer than a backgrounded Safari tab (the main cause of the
+# reload-to-blank-page). Injected into <head> on the Blocks below.
+_HEAD_TAGS = (
+    '<meta name="apple-mobile-web-app-capable" content="yes">'
+    '<meta name="mobile-web-app-capable" content="yes">'
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+    '<meta name="apple-mobile-web-app-title" content="Index Search">'
+)
 
 
 def _format_local_dt(iso_str: str) -> str:
@@ -3767,8 +3812,12 @@ def main(argv: list[str] | None = None) -> None:
         if _u and _pw:
             auth = (_u, _pw)
             print(f"[gradio] app login enabled for user {_u!r}", flush=True)
+    # pwa=True generates a manifest + service worker so iPhone "Add to Home
+    # Screen" runs it as a standalone app the OS keeps alive far longer than a
+    # backgrounded Safari tab (the cause of the reload-to-blank-page). head adds
+    # the iOS web-app meta tags for a clean full-screen launch.
     gr.mount_gradio_app(api_app, blocks, path="", server_name=args.host,
-                        server_port=port, auth=auth)
+                        server_port=port, auth=auth, pwa=True, head=_HEAD_TAGS)
     uvicorn.run(api_app, host=args.host, port=port, log_level="info")
 
 
