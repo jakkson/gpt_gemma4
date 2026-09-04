@@ -246,12 +246,17 @@ _PAGE_LOAD_JS = """
     );
   }
 
-  // --- Survive iOS Safari tab reloads (backgrounding the tab evicts it) ---
-  // Persist the query + last answer in localStorage and restore them on load,
-  // so minimizing/switching apps never drops you back to a blank page.
+  // --- Survive iOS tab reloads AND screen-lock kills ---
+  // Persist query + last answer, keep the screen awake during a search, and
+  // AUTO-RESUME a search that was in-flight when the tab was killed (locking the
+  // phone mid-search). Answers are cached server-side, so a resumed search that
+  // had already finished returns instantly; otherwise it simply re-runs.
   try {
     const qWrap = document.querySelector("#photo-query-input");
     const qBox = qWrap && qWrap.querySelector("textarea");
+    const ans = document.querySelector("#pi-answer");
+    const searchBtn = document.querySelector("#photo-search-btn button");
+
     if (qBox && !window.__photoQueryPersist) {
       window.__photoQueryPersist = true;
       const saved = localStorage.getItem("pi_last_query");
@@ -263,7 +268,22 @@ _PAGE_LOAD_JS = """
         try { localStorage.setItem("pi_last_query", qBox.value); } catch (e) {}
       });
     }
-    const ans = document.querySelector("#pi-answer");
+
+    // Mark a search pending the instant it launches (so a reload can resume it),
+    // and hold a screen wake-lock so auto-lock can't kill it mid-run.
+    if (searchBtn && !window.__photoPendingBound) {
+      window.__photoPendingBound = true;
+      searchBtn.addEventListener("click", async () => {
+        try {
+          const q = (qBox && qBox.value) || localStorage.getItem("pi_last_query") || "";
+          if (q.trim()) localStorage.setItem("pi_pending", JSON.stringify({ q: q, t: Date.now() }));
+        } catch (e) {}
+        try {
+          if ("wakeLock" in navigator) window.__photoWakeLock = await navigator.wakeLock.request("screen");
+        } catch (e) {}
+      }, true);
+    }
+
     if (ans && !window.__photoAnswerPersist) {
       window.__photoAnswerPersist = true;
       const savedAns = localStorage.getItem("pi_last_answer");
@@ -273,10 +293,30 @@ _PAGE_LOAD_JS = """
       }
       new MutationObserver(() => {
         try {
-          const html = ans.innerHTML || "";
-          if (html && html.length > 60) localStorage.setItem("pi_last_answer", html);
+          const txt = (ans.textContent || "").trim();
+          if (txt.length > 40 && !txt.toLowerCase().startsWith("enter a question")) {
+            localStorage.setItem("pi_last_answer", ans.innerHTML || "");
+            localStorage.removeItem("pi_pending");   // answer arrived
+            try { window.__photoWakeLock && window.__photoWakeLock.release(); window.__photoWakeLock = null; } catch (e) {}
+          }
         } catch (e) {}
       }).observe(ans, { childList: true, subtree: true, characterData: true });
+    }
+
+    // Auto-resume: a search was in-flight when the tab died (screen lock) and no
+    // answer is showing — restore the query and re-run it once.
+    if (!window.__photoAutoResumed) {
+      window.__photoAutoResumed = true;
+      const pend = JSON.parse(localStorage.getItem("pi_pending") || "null");
+      const ansTxt = ((ans && ans.textContent) || "").trim();
+      if (pend && pend.q && searchBtn && qBox &&
+          (Date.now() - (pend.t || 0)) < 15 * 60 * 1000 && ansTxt.length < 40) {
+        if (!qBox.value) {
+          qBox.value = pend.q;
+          qBox.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        setTimeout(() => { try { searchBtn.click(); } catch (e) {} }, 1000);
+      }
     }
   } catch (e) {}
 }
