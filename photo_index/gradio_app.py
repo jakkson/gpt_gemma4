@@ -247,25 +247,44 @@ _PAGE_LOAD_JS = """
   }
 
   // --- Survive iOS tab reloads AND screen-lock kills ---
-  // Persist query + last answer, keep the screen awake during a search, and
-  // AUTO-RESUME a search that was in-flight when the tab was killed (locking the
-  // phone mid-search). Answers are cached server-side, so a resumed search that
-  // had already finished returns instantly; otherwise it simply re-runs.
+  // Persist query + last answer (TIME-BOXED to 20 min) and auto-resume an
+  // in-flight search killed by a screen lock. A restored (stale) answer is
+  // cleared the instant you start typing a new query, and expires after 20 min,
+  // so a deliberate fresh refresh isn't stuck showing your last result — while a
+  // quick come-back after lock/minimize still shows it.
   try {
     const qWrap = document.querySelector("#photo-query-input");
     const qBox = qWrap && qWrap.querySelector("textarea");
     const ans = document.querySelector("#pi-answer");
     const searchBtn = document.querySelector("#photo-search-btn button");
+    const WINDOW_MS = 20 * 60 * 1000;
+    const savedAt = parseInt(localStorage.getItem("pi_saved_at") || "0", 10);
+    const fresh = savedAt && (Date.now() - savedAt) < WINDOW_MS;
+    if (!fresh) {
+      try { localStorage.removeItem("pi_last_query"); localStorage.removeItem("pi_last_answer"); } catch (e) {}
+    }
 
     if (qBox && !window.__photoQueryPersist) {
       window.__photoQueryPersist = true;
       const saved = localStorage.getItem("pi_last_query");
-      if (saved && !qBox.value) {
+      if (fresh && saved && !qBox.value) {
         qBox.value = saved;
         qBox.dispatchEvent(new Event("input", { bubbles: true }));
       }
       qBox.addEventListener("input", () => {
-        try { localStorage.setItem("pi_last_query", qBox.value); } catch (e) {}
+        try {
+          localStorage.setItem("pi_last_query", qBox.value);
+          localStorage.setItem("pi_saved_at", String(Date.now()));
+        } catch (e) {}
+      });
+      // A real keystroke = new-search intent → drop a stale RESTORED answer
+      // (a live result from this session is left alone).
+      qBox.addEventListener("keydown", () => {
+        if (window.__photoAnswerIsStale && ans) {
+          ans.innerHTML = "";
+          window.__photoAnswerIsStale = false;
+          try { localStorage.removeItem("pi_last_answer"); localStorage.removeItem("pi_pending"); } catch (e) {}
+        }
       });
     }
 
@@ -288,15 +307,19 @@ _PAGE_LOAD_JS = """
       window.__photoAnswerPersist = true;
       const savedAns = localStorage.getItem("pi_last_answer");
       const cur = (ans.textContent || "").trim().toLowerCase();
-      if (savedAns && (cur.length < 3 || cur.startsWith("enter a question"))) {
+      if (fresh && savedAns && (cur.length < 3 || cur.startsWith("enter a question"))) {
         ans.innerHTML = savedAns;
+        window.__photoAnswerIsStale = true;   // restored, not a live result
       }
+      // Observe AFTER the restore so the restore's own mutation isn't recorded.
       new MutationObserver(() => {
         try {
           const txt = (ans.textContent || "").trim();
           if (txt.length > 40 && !txt.toLowerCase().startsWith("enter a question")) {
             localStorage.setItem("pi_last_answer", ans.innerHTML || "");
+            localStorage.setItem("pi_saved_at", String(Date.now()));
             localStorage.removeItem("pi_pending");   // answer arrived
+            window.__photoAnswerIsStale = false;     // this is a live result
             try { window.__photoWakeLock && window.__photoWakeLock.release(); window.__photoWakeLock = null; } catch (e) {}
           }
         } catch (e) {}
