@@ -3246,18 +3246,20 @@ _UPLOAD_TEXT_CHAR_CAP = int(os.environ.get("PHOTO_INDEX_UPLOAD_CHAR_CAP", "60000
 
 
 def analyze_uploaded_file(file_paths, question: str, qa_model: str,
-                          char_cap: int | None = None) -> str:
-    """Extract text from one or more uploaded documents and answer/summarize them.
+                          char_cap: int | None = None, pasted_text: str = "") -> str:
+    """Summarize/answer over uploaded documents AND/OR raw pasted text.
 
-    Separate from index search: works only on the uploaded files, not the SQLite
+    Separate from index search: works only on what's provided here, not the SQLite
     corpus. Text documents only (the answer model has no vision/OCR). Accepts a
-    single path (str) or a list of paths (multi-file upload); the total text is
-    budgeted across the files so the combined prompt fits the model context.
+    single path (str) or a list of paths, plus optional pasted text; the total
+    text is budgeted across all items so the combined prompt fits the model context.
     """
-    if not file_paths:
-        return "Drop or browse one or more documents first (PDF, Word, PowerPoint, Excel, text…)."
     if isinstance(file_paths, str):
         file_paths = [file_paths]
+    file_paths = file_paths or []
+    pasted = (pasted_text or "").strip()
+    if not file_paths and not pasted:
+        return "Drop/browse one or more documents, or paste text below, then Analyze."
     from photo_index.documents_ingest import extract_auto
 
     docs: list[tuple[str, str, str]] = []  # (name, text, method)
@@ -3276,6 +3278,9 @@ def analyze_uploaded_file(file_paths, question: str, qa_model: str,
             continue
         docs.append((path.name, text.strip(), method))
 
+    if pasted:
+        docs.append(("Pasted text", pasted, "pasted"))
+
     if not docs:
         return "No extractable text found.\n\n" + "\n".join(skipped)
 
@@ -3289,19 +3294,22 @@ def analyze_uploaded_file(file_paths, question: str, qa_model: str,
         if len(text) > per_doc_cap:
             text = text[:per_doc_cap]
             truncated_any = True
-        blocks.append(f"--- DOCUMENT: {name} (extracted via {method}) ---\n{text}\n--- END: {name} ---")
+        if method == "pasted":
+            blocks.append(f"--- PASTED TEXT ---\n{text}\n--- END PASTED TEXT ---")
+        else:
+            blocks.append(f"--- DOCUMENT: {name} (extracted via {method}) ---\n{text}\n--- END: {name} ---")
 
     multi = len(docs) > 1
     default_task = (
-        "Summarize each document briefly, then note the key similarities, "
+        "Summarize each item briefly, then note the key similarities, "
         "differences, or how they relate."
         if multi else
-        "Summarize this document concisely, capturing the key points."
+        "Summarize this concisely, capturing the key points."
     )
     task = (question or "").strip() or default_task
-    prompt = f"""You are analyzing {len(docs)} document(s) the user uploaded.
-Use ONLY the document text below. Do not use outside knowledge. Refer to each
-document by its filename when it helps.
+    prompt = f"""You are analyzing {len(docs)} item(s) the user provided (uploaded
+files and/or pasted text). Use ONLY the text below. Do not use outside knowledge.
+Refer to each item by its filename (or "the pasted text") when it helps.
 
 {chr(10).join(blocks)}
 
@@ -3321,7 +3329,7 @@ Task: {task}
     if skipped:
         notes.append("**Skipped:**\n" + "\n".join(skipped))
     note_str = ("\n\n" + "\n\n".join(notes)) if notes else ""
-    return f"**Analyzed {len(docs)} file(s):** {header}\n\n{answer}{note_str}"
+    return f"**Analyzed {len(docs)} item(s):** {header}\n\n{answer}{note_str}"
 
 
 def build_app(
@@ -3385,17 +3393,24 @@ def build_app(
         gr.HTML(f"<style>{custom_css}</style>")
         gr.Markdown("## Personal Index Search (local LLM + SQLite FTS)")
         gr.Markdown(f"UI version: `{version}`")
-        with gr.Accordion("📄 Summarize / query uploaded documents", open=False):
+        with gr.Accordion("📄 Summarize / query uploaded documents or pasted text", open=False):
             gr.Markdown(
-                "Drop **one or more files** (PDF, Word, PowerPoint, Excel, text) to "
-                "summarize, compare, or ask about them directly — this is separate "
-                "from your index. Text documents only (no scanned/image OCR)."
+                "Drop **one or more files** (PDF, Word, PowerPoint, Excel, text) "
+                "**and/or paste raw text** to summarize, compare, or ask about "
+                "directly — this is separate from your index. Text only (no "
+                "scanned/image OCR)."
             )
             upload_file = gr.File(
-                label="Drop documents here or browse (multiple allowed)",
+                label="Drop documents here or browse (multiple allowed) — optional",
                 file_count="multiple",
                 file_types=[".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".rtf", ".csv"],
                 type="filepath",
+            )
+            upload_text = gr.Textbox(
+                label="…or paste text here to summarize (no file needed)",
+                placeholder="Paste an article, transcript, email thread, notes… "
+                            "then click Analyze.",
+                lines=8,
             )
             upload_question = gr.Textbox(
                 label="What should I do with them?",
@@ -3635,8 +3650,8 @@ def build_app(
         open_messages_btn.click(fn=open_messages_app, outputs=[preview_note])
         clear_cache_btn.click(fn=clear_search_cache, outputs=[stats])
         upload_btn.click(
-            fn=lambda f, q, cap: analyze_uploaded_file(f, q, qa_model, cap),
-            inputs=[upload_file, upload_question, upload_cap],
+            fn=lambda f, q, cap, txt: analyze_uploaded_file(f, q, qa_model, cap, txt),
+            inputs=[upload_file, upload_question, upload_cap, upload_text],
             outputs=[upload_answer],
             queue=True,
         )
