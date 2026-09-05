@@ -246,55 +246,35 @@ _PAGE_LOAD_JS = """
     );
   }
 
-  // --- Survive iOS tab reloads AND screen-lock kills ---
-  // Persist query + last answer (TIME-BOXED to 20 min) and auto-resume an
-  // in-flight search killed by a screen lock. A restored (stale) answer is
-  // cleared the instant you start typing a new query, and expires after 20 min,
-  // so a deliberate fresh refresh isn't stuck showing your last result — while a
-  // quick come-back after lock/minimize still shows it.
+  // --- Keep an IN-FLIGHT search from dying when iOS backgrounds/locks the tab ---
+  // Narrow by design: we do NOT restore old answers or queries into the page
+  // (that fought Gradio's own rendering and stacked the previous result above the
+  // new one). Instead we only mark a search "pending" when it launches; if the
+  // tab gets reloaded (screen lock / minimize) while that search is still
+  // running, we re-run just that query once on load. Server-side caching makes a
+  // finished search return instantly; otherwise it simply re-runs. A COMPLETED
+  // search leaves no marker, so a fresh open is a clean page and a brand-new
+  // question returns all-new results.
   try {
     const qWrap = document.querySelector("#photo-query-input");
     const qBox = qWrap && qWrap.querySelector("textarea");
     const ans = document.querySelector("#pi-answer");
     const searchBtn = document.querySelector("#photo-search-btn button");
-    const WINDOW_MS = 20 * 60 * 1000;
-    const savedAt = parseInt(localStorage.getItem("pi_saved_at") || "0", 10);
-    const fresh = savedAt && (Date.now() - savedAt) < WINDOW_MS;
-    if (!fresh) {
-      try { localStorage.removeItem("pi_last_query"); localStorage.removeItem("pi_last_answer"); } catch (e) {}
-    }
 
-    if (qBox && !window.__photoQueryPersist) {
-      window.__photoQueryPersist = true;
-      const saved = localStorage.getItem("pi_last_query");
-      if (fresh && saved && !qBox.value) {
-        qBox.value = saved;
-        qBox.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      qBox.addEventListener("input", () => {
-        try {
-          localStorage.setItem("pi_last_query", qBox.value);
-          localStorage.setItem("pi_saved_at", String(Date.now()));
-        } catch (e) {}
-      });
-      // A real keystroke = new-search intent → drop a stale RESTORED answer
-      // (a live result from this session is left alone).
-      qBox.addEventListener("keydown", () => {
-        if (window.__photoAnswerIsStale && ans) {
-          ans.innerHTML = "";
-          window.__photoAnswerIsStale = false;
-          try { localStorage.removeItem("pi_last_answer"); localStorage.removeItem("pi_pending"); } catch (e) {}
-        }
-      });
-    }
+    // Clean up keys used by an earlier, more aggressive version of this feature.
+    try {
+      localStorage.removeItem("pi_last_answer");
+      localStorage.removeItem("pi_last_query");
+      localStorage.removeItem("pi_saved_at");
+    } catch (e) {}
 
-    // Mark a search pending the instant it launches (so a reload can resume it),
-    // and hold a screen wake-lock so auto-lock can't kill it mid-run.
+    // Mark a search pending the instant it launches, and hold a screen wake-lock
+    // so auto-lock can't kill it mid-run (wake-lock needs HTTPS; a no-op on HTTP).
     if (searchBtn && !window.__photoPendingBound) {
       window.__photoPendingBound = true;
       searchBtn.addEventListener("click", async () => {
         try {
-          const q = (qBox && qBox.value) || localStorage.getItem("pi_last_query") || "";
+          const q = (qBox && qBox.value) || "";
           if (q.trim()) localStorage.setItem("pi_pending", JSON.stringify({ q: q, t: Date.now() }));
         } catch (e) {}
         try {
@@ -303,31 +283,23 @@ _PAGE_LOAD_JS = """
       }, true);
     }
 
-    if (ans && !window.__photoAnswerPersist) {
-      window.__photoAnswerPersist = true;
-      const savedAns = localStorage.getItem("pi_last_answer");
-      const cur = (ans.textContent || "").trim().toLowerCase();
-      if (fresh && savedAns && (cur.length < 3 || cur.startsWith("enter a question"))) {
-        ans.innerHTML = savedAns;
-        window.__photoAnswerIsStale = true;   // restored, not a live result
-      }
-      // Observe AFTER the restore so the restore's own mutation isn't recorded.
+    // When a real answer appears the search is done: clear the pending marker and
+    // release the wake-lock. Nothing is written to storage or injected into the DOM.
+    if (ans && !window.__photoAnswerWatch) {
+      window.__photoAnswerWatch = true;
       new MutationObserver(() => {
         try {
           const txt = (ans.textContent || "").trim();
           if (txt.length > 40 && !txt.toLowerCase().startsWith("enter a question")) {
-            localStorage.setItem("pi_last_answer", ans.innerHTML || "");
-            localStorage.setItem("pi_saved_at", String(Date.now()));
-            localStorage.removeItem("pi_pending");   // answer arrived
-            window.__photoAnswerIsStale = false;     // this is a live result
+            localStorage.removeItem("pi_pending");
             try { window.__photoWakeLock && window.__photoWakeLock.release(); window.__photoWakeLock = null; } catch (e) {}
           }
         } catch (e) {}
       }).observe(ans, { childList: true, subtree: true, characterData: true });
     }
 
-    // Auto-resume: a search was in-flight when the tab died (screen lock) and no
-    // answer is showing — restore the query and re-run it once.
+    // Auto-resume: a search was in-flight when the tab was killed and no answer is
+    // showing — restore just the query and re-run it once.
     if (!window.__photoAutoResumed) {
       window.__photoAutoResumed = true;
       const pend = JSON.parse(localStorage.getItem("pi_pending") || "null");
