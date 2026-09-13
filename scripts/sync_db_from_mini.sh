@@ -49,7 +49,10 @@ say "snapshot ready on mini: $rows_remote rows."
 
 # 3. Transfer.
 say "transferring to the MacBook ..."
-rsync -ah --info=progress2 "$MINI_SSH:$SNAP_REMOTE" "$INCOMING"
+# macOS ships openrsync, which rejects rsync's --info=progress2 (and rsync↔rsync
+# protocol interop can be flaky). scp is universal over SSH, and the snapshot is a
+# fresh VACUUM-INTO file each run, so a delta transfer wouldn't help anyway.
+scp -C "$MINI_SSH:$SNAP_REMOTE" "$INCOMING"
 
 # 4. Verify BEFORE touching the live DB.
 say "verifying transferred DB ..."
