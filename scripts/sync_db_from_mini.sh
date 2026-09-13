@@ -84,13 +84,27 @@ say "swapped in the new DB (previous kept as $DB.bak)."
 ssh "$MINI_SSH" "rm -f '$SNAP_REMOTE'" || true
 
 # 8. Bring the search app back if we stopped it.
-LAUNCHER="$HOME/Desktop/Start LLM Search.command"
+# Find the app launcher in ~/Launchers (this MacBook's launcher folder), then the
+# Desktop. Prefer the "loaded model" launcher so we don't force a model choice.
+# Override with SYNC_RESTART_LAUNCHER=/full/path if yours is named differently.
+LAUNCHER="${SYNC_RESTART_LAUNCHER:-}"
+if [[ -z "$LAUNCHER" ]]; then
+  for cand in \
+    "$HOME/Launchers/Start LLM (loaded model).command" \
+    "$HOME/Launchers/Start LLM Search (30B).command" \
+    "$HOME/Launchers/Start LLM Search.command" \
+    "$HOME/Desktop/Start LLM Search.command"; do
+    [[ -f "$cand" ]] && { LAUNCHER="$cand"; break; }
+  done
+  # Last resort: the first "Start LLM*.command" in ~/Launchers.
+  [[ -z "$LAUNCHER" ]] && LAUNCHER=$(ls "$HOME"/Launchers/Start\ LLM*.command 2>/dev/null | head -1)
+fi
 if [[ "$app_was_up" == "1" ]]; then
-  if [[ -f "$LAUNCHER" ]]; then
-    say "restarting the search app ..."
+  if [[ -n "$LAUNCHER" && -f "$LAUNCHER" ]]; then
+    say "restarting the search app ($(basename "$LAUNCHER")) ..."
     nohup bash "$LAUNCHER" </dev/null >"$LOCAL_REPO/data/search_app.log" 2>&1 &
   else
-    say "restart your search app to load the new DB."
+    say "restart your search app to load the new DB (no launcher found in ~/Launchers)."
   fi
 fi
 
