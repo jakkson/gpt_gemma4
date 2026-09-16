@@ -1433,6 +1433,21 @@ def _named_email_sender(question: str) -> str | None:
     return cand
 
 
+def _named_source(question: str) -> str | None:
+    """The sender/merchant a query is scoped to via 'from X' / 'by X' — for MESSAGES
+    as well as mail (unlike _named_email_sender, which needs a mail keyword). Used to
+    anchor a recency query on the ENTITY ('CVS') rather than a rarer topic word
+    ('prescriptions', 4 rows), which would wrongly filter out that entity's other
+    messages that use a synonym ('Rx… ready for pickup'). Matched as a substring of
+    the row text."""
+    ql = (question or "").lower()
+    for m in re.finditer(r"\b(?:from|by|sent by)\s+([a-z0-9][\w.\-&']{2,})", ql):
+        tok = m.group(1).strip(".-'")
+        if tok and tok not in _SENDER_STOPWORDS and len(tok) >= 3:
+            return tok
+    return None
+
+
 def _recent_window_start(question: str) -> str | None:
     """ISO start date for a 'last/past N days/weeks/months/years' window, else None."""
     ql = (question or "").lower()
@@ -1969,6 +1984,22 @@ def _retrieve_rows(
             for r in sender_rows:
                 merged[r["uuid"]] = r
 
+        # Named-source sweep (messages OR mail): when the query is scoped to a
+        # sender/merchant ("...from CVS"), seed the most RECENT messages/emails whose
+        # text matches it, newest first. This guarantees the entity's latest items are
+        # candidates even when they use different wording than the topic term — e.g.
+        # "prescriptions from CVS" would otherwise miss "Rx ready for pickup @ CVS".
+        _source = _named_source(question)
+        if _source:
+            like = f"%{_source.lower()}%"
+            for r in conn.execute(
+                "SELECT *, 0 AS rank FROM photo_meta "
+                "WHERE (uuid LIKE 'imsg:%' OR uuid LIKE 'mail:%' OR uuid LIKE 'm365:%') "
+                "AND lower(ocr_text) LIKE ? ORDER BY date_iso DESC LIMIT ?",
+                (like, max(candidate_limit * 6, 300)),
+            ):
+                merged[r["uuid"]] = r
+
         # Year-in-name/text sweep: when a year is named ("...from 2016"), seed rows
         # whose FILENAME carries that year (a doc explicitly about that year, e.g.
         # "DISC ASSESSMENT 2016.docx") plus rows where the year co-occurs with a
@@ -2262,7 +2293,15 @@ def _retrieve_rows(
                 _counts = {t: sum(1 for _, txt in _pool if t in txt) for t in _content}
                 _present = {t: c for t, c in _counts.items() if c > 0}
                 if _present:
-                    _anchor = min(_present, key=_present.get)
+                    # If the query is scoped to a source ("...from CVS"), anchor on
+                    # THAT entity rather than the rarest term — otherwise a rare topic
+                    # word ("prescriptions", 4 rows) filters out the entity's newer
+                    # messages that use a synonym ("Rx ready for pickup").
+                    _src = _named_source(question)
+                    if _src and _src in _present:
+                        _anchor = _src
+                    else:
+                        _anchor = min(_present, key=_present.get)
                     _kept = [
                         r for r, txt in _pool
                         if _anchor in txt or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
