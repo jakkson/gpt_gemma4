@@ -2574,6 +2574,7 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         is_msg = str(uuid).startswith("imsg:")
         is_m365 = str(uuid).startswith("m365:")
         is_mail = str(uuid).startswith("mail:")
+        is_notes = str(uuid).startswith("notes:")
         is_evernote = str(uuid).startswith("evernote:")
         is_doc = str(uuid).startswith("doc:")
         source = (
@@ -2583,6 +2584,8 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
             if is_m365
             else "Apple Mail"
             if is_mail
+            else "Apple Notes"
+            if is_notes
             else "Evernote"
             if is_evernote
             else "Document"

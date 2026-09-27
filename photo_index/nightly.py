@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--skip-photos", action="store_true", help="Skip photo_index.ingest.")
     p.add_argument("--skip-messages", action="store_true", help="Skip photo_index.messages_ingest.")
     p.add_argument("--skip-mail", action="store_true", help="Skip photo_index.mail_ingest.")
-    p.add_argument("--skip-evernote", action="store_true", help="Skip photo_index.evernote_ingest.")
+    p.add_argument("--skip-notes", action="store_true", help="Skip photo_index.notes_ingest.")
     p.add_argument("--skip-documents", action="store_true", help="Skip photo_index.documents_ingest.")
     p.add_argument(
         "--skip-documents-vlm",
@@ -141,11 +141,11 @@ def main(argv: list[str] | None = None) -> None:
     else:
         _log("[nightly] skipping photo_index.mail_ingest")
 
-    if not args.skip_evernote:
-        evernote_args = ["--db", db, "--progress-every", "1000"]
-        rc = max(rc, _run_module("photo_index.evernote_ingest", evernote_args))
+    if not args.skip_notes:
+        notes_args = ["--db", db, "--progress-every", "1000"]
+        rc = max(rc, _run_module("photo_index.notes_ingest", notes_args))
     else:
-        _log("[nightly] skipping photo_index.evernote_ingest")
+        _log("[nightly] skipping photo_index.notes_ingest")
 
     if not args.skip_documents:
         doc_root = str(Path(args.documents_root).expanduser().resolve())

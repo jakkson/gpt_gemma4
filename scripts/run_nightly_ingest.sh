@@ -71,7 +71,7 @@ past_deadline() { [ "$(date +%s)" -ge "$HARD_STOP" ]; }
   echo "[nightly] hard stop ($(date -r "$HARD_STOP" '+%H:%M')) — ending ingest"
   for _ in 1 2 3; do
     for m in nightly documents_ingest documents_vlm_ingest messages_ingest \
-             mail_ingest evernote_ingest calendar_ingest history_ingest embed_index; do
+             mail_ingest notes_ingest calendar_ingest history_ingest embed_index; do
       pkill -f "photo_index.$m" 2>/dev/null
     done
     sleep 3
@@ -85,15 +85,10 @@ if [[ -n "$CAFFEINATE" ]]; then
 fi
 
 # --- ingest steps (each skipped if we've passed the 04:30 deadline) -----------
-# Refresh the Evernote backup (incremental) before the python ingest reads it.
-# evernote-backup lives in the system Python (homebrew), NOT the venv — its
-# click pin conflicts with gradio's typer. Do not install it in .venv.
-EN_BACKUP="${EVERNOTE_BACKUP_BIN:-$(command -v evernote-backup || echo /opt/homebrew/bin/evernote-backup)}"
-EN_DB="$ROOT/data/evernote/en_backup.db"
-if ! past_deadline && [[ -x "$EN_BACKUP" && -f "$EN_DB" ]]; then
-  echo "[nightly] evernote-backup sync ..."
-  "$EN_BACKUP" sync --database "$EN_DB" || echo "[nightly warn] evernote-backup sync incomplete; resumes next run"
-fi
+# Notes now come from Apple Notes (photo_index.notes_ingest), which reads the
+# live NoteStore directly — no pre-sync step. Evernote is frozen; its retained
+# data/evernote/en_backup.db is still read by notes_ingest as the authoritative
+# original-date oracle for imported notes, but we no longer sync it.
 
 ARGS=(
   -m photo_index.nightly
