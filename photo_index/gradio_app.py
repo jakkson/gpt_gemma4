@@ -1125,6 +1125,51 @@ def _calendar_window(question: str, today: date | None = None) -> tuple[str, str
     return None
 
 
+def _recency_window_past(question: str, today: date | None = None) -> tuple[str, str] | None:
+    """Inclusive (start_iso, end_iso) for a BACKWARD-looking time window the user
+    named — "today", "yesterday", "this week", "last month", "last 10 days", etc.
+    Unlike _calendar_window (which looks forward for upcoming events), this scopes
+    PAST-dated content (notes, docs, mail) so e.g. "what's due this week" doesn't
+    surface a years-old note that merely matches the topic.
+
+    Deliberately does NOT fire on vague "recent"/"latest"/"most recent" — those
+    mean "the newest matching one" (handled by recency SORT), not "within N days",
+    and a hard window there would wrongly hide an item whose newest instance is
+    older than the window."""
+    ql = " " + " ".join(re.sub(r"[^a-z0-9]+", " ", (question or "").lower()).split()) + " "
+    d = today or datetime.now().date()
+
+    def iso(a: date, b: date) -> tuple[str, str]:
+        return (a.isoformat(), b.isoformat())
+
+    monday = d - timedelta(days=d.weekday())  # Monday of the current week
+
+    m = (re.search(r"\b(?:last|past|previous) (\d{1,2}) days\b", ql)
+         or re.search(r"\bin the (?:last|past) (\d{1,2}) days\b", ql))
+    if m:
+        return iso(d - timedelta(days=max(1, min(int(m.group(1)), 366))), d)
+    if " day before yesterday " in ql:
+        return iso(d - timedelta(days=2), d - timedelta(days=2))
+    if " yesterday " in ql:
+        return iso(d - timedelta(days=1), d - timedelta(days=1))
+    if " today " in ql or " tonight " in ql or " so far today " in ql:
+        return iso(d, d)
+    if " last week " in ql:
+        lm = monday - timedelta(days=7)
+        return iso(lm, lm + timedelta(days=6))
+    if " this week " in ql or " the week " in ql or " past week " in ql or " past few days " in ql:
+        return iso(monday, d)
+    if " last month " in ql:
+        first_this = d.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return iso(last_prev.replace(day=1), last_prev)
+    if " this month " in ql or " past month " in ql:
+        return iso(d.replace(day=1), d)
+    if " this year " in ql:
+        return iso(date(d.year, 1, 1), d)
+    return None
+
+
 # STRONG booking markers (transactional, rarely in marketing). Loose phrases
 # like "trip to" / "confirmed:" were dropped — they matched newsletters.
 _BOOKING_STRONG = (
@@ -2411,6 +2456,23 @@ def _retrieve_rows(
             ]
             if in_win:
                 rows = in_win
+        # Backward-looking window ("this week", "yesterday", "last month"): scope
+        # PAST-dated content (notes/docs/mail/messages) to that window so an old
+        # note that merely matches the topic can't masquerade as recent. Calendar
+        # rows are kept (they're handled above). Only applied when the window
+        # actually contains content — otherwise fall back to the ranked rows so a
+        # genuinely empty week still returns something for the model to report on.
+        past_win = _recency_window_past(question)
+        if past_win:
+            lo, hi = past_win
+            cal_rows = [r for r in rows if str(r["uuid"] or "").startswith("cal:")]
+            content_in_win = [
+                r for r in rows
+                if not str(r["uuid"] or "").startswith("cal:")
+                and lo <= str(r["date_iso"] or "")[:10] <= hi
+            ]
+            if content_in_win:
+                rows = cal_rows + content_in_win
         return rows[:top_k]
     finally:
         conn.close()
