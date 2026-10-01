@@ -2344,13 +2344,32 @@ def _retrieve_rows(
                     # messages that use a synonym ("Rx ready for pickup").
                     _src = _named_source(question)
                     if _src and _src in _present:
-                        _anchor = _src
+                        # Scope to the named source, but don't keep EVERY row that
+                        # mentions it: recent marketing mail that namedrops "cvs"
+                        # (a coupon roundup) would then bury the real CVS messages
+                        # under pure recency sort. Among source rows, keep the ones
+                        # that are on-topic — semantically relevant to the query, or
+                        # carrying another query term — and only fall back to all
+                        # source rows when none are (a bare "most recent from X").
+                        _topic = [t for t in _present if t != _src]
+                        _src_rows = [(r, txt) for r, txt in _pool if _src in txt]
+                        if _topic:
+                            _kept = [
+                                r for r, txt in _src_rows
+                                if sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.40
+                                or any(t in txt for t in _topic)
+                            ]
+                            if not _kept:
+                                _kept = [r for r, _ in _src_rows]
+                        else:
+                            _kept = [r for r, _ in _src_rows]
                     else:
                         _anchor = min(_present, key=_present.get)
-                    _kept = [
-                        r for r, txt in _pool
-                        if _anchor in txt or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
-                    ]
+                        _kept = [
+                            r for r, txt in _pool
+                            if _anchor in txt
+                            or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
+                        ]
                     if _kept:
                         rows = _kept
 
