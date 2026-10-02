@@ -1170,6 +1170,77 @@ def _recency_window_past(question: str, today: date | None = None) -> tuple[str,
     return None
 
 
+def _base_uuid(uuid) -> str:
+    """The note/doc id without its ``#<chunk>`` suffix, so all chunks of one note
+    share a base (used to diversify results across notes, not across chunks)."""
+    u = str(uuid or "")
+    i = u.find("#")
+    return u[:i] if i >= 0 else u
+
+
+_SOURCE_PREFIXES = ("notes:", "doc:", "mail:", "m365:", "imsg:",
+                    "cal:", "hist:", "web:", "evernote:")
+
+
+def _uuid_source(uuid) -> str:
+    u = str(uuid or "")
+    for p in _SOURCE_PREFIXES:
+        if u.startswith(p):
+            return p
+    return "photo"  # raw Photos UUID / local image
+
+
+def _source_restriction(question: str) -> set[str] | None:
+    """When the user restricts the sources EXCLUSIVELY ("using only my notes and
+    documents", "search just my emails"), return the allowed uuid-source set so
+    results from other sources are dropped. None = no restriction."""
+    ql = " " + " ".join((question or "").lower().split()) + " "
+    if not any(w in ql for w in (" only ", " just ", " exclusively ",
+                                 " nothing but ", " solely ")):
+        return None
+    allowed: set[str] = set()
+    if "note" in ql:
+        allowed.add("notes:")
+        allowed.add("evernote:")
+    if "document" in ql or "docs" in ql or " doc " in ql or "pdf" in ql or " file" in ql:
+        allowed.add("doc:")
+    if "email" in ql or "mail" in ql or "inbox" in ql:
+        allowed.update(("mail:", "m365:"))
+    if "message" in ql or "text" in ql or "imessage" in ql:
+        allowed.add("imsg:")
+    if "photo" in ql or "picture" in ql or "image" in ql or "screenshot" in ql:
+        allowed.add("photo")
+    if "calendar" in ql or " event" in ql or "schedule" in ql:
+        allowed.add("cal:")
+    if "web" in ql or "browsing" in ql or "history" in ql:
+        allowed.update(("web:", "hist:"))
+    return allowed or None
+
+
+def _diversify_by_base(rows: list, top_k: int, sem_scores: dict,
+                       per_base_cap: int) -> list:
+    """Spread the pick across distinct notes/docs instead of letting one big
+    multi-chunk note fill every slot. Breadth-first round-robin: take each note's
+    most query-relevant chunk first, then second, up to per_base_cap — so a
+    "what happened this week" synthesis sees many notes, a few chunks each. Bases
+    keep the input order (recency), chunks within a base are ordered by semantic
+    relevance so the chunk shown is the one that matches the question."""
+    from collections import OrderedDict
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for r in rows:
+        groups.setdefault(_base_uuid(r["uuid"]), []).append(r)
+    for rs in groups.values():
+        rs.sort(key=lambda r: sem_scores.get(str(r["uuid"] or ""), 0.0), reverse=True)
+    picked: list = []
+    for depth in range(max(1, per_base_cap)):
+        for rs in groups.values():
+            if depth < len(rs):
+                picked.append(rs[depth])
+                if len(picked) >= top_k:
+                    return picked
+    return picked
+
+
 # STRONG booking markers (transactional, rarely in marketing). Loose phrases
 # like "trip to" / "confirmed:" were dropped — they matched newsletters.
 _BOOKING_STRONG = (
@@ -1850,6 +1921,9 @@ def _retrieve_rows(
 
         merged: dict[str, sqlite3.Row] = {}
         candidate_limit = max(top_k * 4, 40)
+        # Backward time window ("this week", "yesterday"): used both to seed the
+        # period's content for breadth and to scope/diversify the final rows.
+        past_win = _recency_window_past(question)
         for expanded in expand_query_terms(rq):
             try:
                 hits = search_meta(conn, expanded, limit=candidate_limit)
@@ -2045,6 +2119,23 @@ def _retrieve_rows(
             ):
                 merged[r["uuid"]] = r
 
+        # Period-window seed: for a backward window ("this week", "last month"),
+        # pull EVERY content row dated inside it so a synthesis ("what was worked
+        # on this week") sees all the period's notes/docs — not just whichever one
+        # FTS happened to rank. Without this, a single big multi-chunk note starves
+        # the candidate pool and the answer reflects only that note. Photos are
+        # excluded (no text to synthesize); capped so a huge note can't dominate.
+        if past_win:
+            for r in conn.execute(
+                "SELECT *, 0 AS rank FROM photo_meta "
+                "WHERE substr(date_iso,1,10) BETWEEN ? AND ? "
+                "AND (uuid LIKE 'notes:%' OR uuid LIKE 'doc:%' OR uuid LIKE 'mail:%' "
+                "     OR uuid LIKE 'imsg:%' OR uuid LIKE 'm365:%' OR uuid LIKE 'evernote:%') "
+                "ORDER BY date_iso DESC LIMIT ?",
+                (past_win[0], past_win[1], max(candidate_limit * 20, 800)),
+            ):
+                merged[r["uuid"]] = r
+
         # Year-in-name/text sweep: when a year is named ("...from 2016"), seed rows
         # whose FILENAME carries that year (a doc explicitly about that year, e.g.
         # "DISC ASSESSMENT 2016.docx") plus rows where the year co-occurs with a
@@ -2127,6 +2218,12 @@ def _retrieve_rows(
                 merged[r["uuid"]] = r
 
         rows = list(merged.values())
+
+        # Explicit source restriction ("using only my notes and documents"): drop
+        # rows from other sources so the answer stays within what the user asked for.
+        _src_allow = _source_restriction(question)
+        if _src_allow is not None:
+            rows = [r for r in rows if _uuid_source(r["uuid"]) in _src_allow]
 
         query_my = _query_month_year(question)
         query_month_prefix = f"{query_my[0]:04d}-{query_my[1]:02d}" if query_my else None
@@ -2431,9 +2528,24 @@ def _retrieve_rows(
                 unmatched = [r for r in rows if str(r["uuid"]) not in matched_ids]
                 matched.sort(key=month_recency_key, reverse=True)
                 unmatched.sort(key=recency_tuple, reverse=True)
-                rows = matched[:top_k]
-                if len(rows) < top_k:
-                    rows.extend(unmatched[: top_k - len(rows)])
+                if past_win:
+                    # Period synthesis ("what was worked on this week"): scope to the
+                    # window and spread across its notes/docs so one big multi-chunk
+                    # note can't fill every slot and hide the rest of the week.
+                    lo, hi = past_win
+                    in_win = [r for r in matched
+                              if lo <= str(r["date_iso"] or "")[:10] <= hi]
+                    pool = in_win if in_win else matched
+                    rows = _diversify_by_base(pool, top_k, sem_scores,
+                                              per_base_cap=max(2, top_k // 4))
+                    if len(rows) < top_k:
+                        have = {id(r) for r in rows}
+                        rows.extend(r for r in pool if id(r) not in have)
+                        rows = rows[:top_k]
+                else:
+                    rows = matched[:top_k]
+                    if len(rows) < top_k:
+                        rows.extend(unmatched[: top_k - len(rows)])
         else:
             rows.sort(key=score, reverse=True)
             if wants_future and (wants_itinerary or wants_calendar):
@@ -2481,7 +2593,8 @@ def _retrieve_rows(
         # rows are kept (they're handled above). Only applied when the window
         # actually contains content — otherwise fall back to the ranked rows so a
         # genuinely empty week still returns something for the model to report on.
-        past_win = _recency_window_past(question)
+        # (The recency else-branch already diversified in-window content; this also
+        # scopes the relevance branch and the msg/photo/finance paths.)
         if past_win:
             lo, hi = past_win
             cal_rows = [r for r in rows if str(r["uuid"] or "").startswith("cal:")]

@@ -28,6 +28,12 @@ Date resolution — two opposite Apple-Notes traps to dodge:
          and correctly recent when a template is edited;
       3. ZCREATIONDATE3 (last resort, only if modification is missing).
 
+Living-note split: a note you edit daily (current items on top, old backlog
+below) is split at a BACKLOG/ARCHIVE divider line (or a horizontal rule) — the
+part above is dated as CURRENT (modification), the part below as ARCHIVED
+(creation), so old backlog stops masquerading as this-week work while staying
+topic-searchable. See _split_at_backlog_divider.
+
 Change detection: a note is (re)ingested when new, or when its modification
 time is newer than the row's ``ingested_at`` (edited since last indexed).
 
@@ -44,6 +50,7 @@ import gzip
 import io
 import lzma
 import pickle
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -71,6 +78,36 @@ _CF_EPOCH = 978_307_200
 # Long notes are chunked into passages; this cap only guards pathological notes.
 _BODY_MAX_CHARS = 200_000
 _COMMIT_EVERY = 200
+
+# Living-note divider: in a note you edit daily (current items on top, old
+# backlog sinking below), put ONE line reading BACKLOG / ARCHIVE / OLD / DONE
+# (optionally wrapped in dashes), or a horizontal rule of 5+ dashes/equals, where
+# current work ends. Everything above is indexed as CURRENT (dated by last edit,
+# so it shows for "this week"); everything below is archived (dated by creation,
+# so it never masquerades as recent but stays fully topic-searchable).
+_BACKLOG_KEYWORDS = ("backlog", "archive", "archived", "old items", "old to",
+                     "done:", "completed", "parking lot", "someday")
+_BACKLOG_RULE = re.compile(r"^[\-=_*•·—–\s]{5,}$")
+
+
+def _split_at_backlog_divider(body: str) -> tuple[str, str]:
+    """Split note text at the first BACKLOG divider line. Returns (current_text,
+    archived_text); archived_text is "" when no divider is present."""
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        core = low.strip("-=_*•·—– ").strip()
+        if _BACKLOG_RULE.match(s) or core in ("backlog", "archive", "archived",
+                                              "old", "old items", "done",
+                                              "completed", "parking lot", "someday"):
+            return "\n".join(lines[:i]), "\n".join(lines[i + 1:])
+        # also catch a header line like "--- BACKLOG ---" or "BACKLOG (old)"
+        if any(low.startswith(k) or f" {k}" in low for k in _BACKLOG_KEYWORDS) and len(s) <= 40:
+            return "\n".join(lines[:i]), "\n".join(lines[i + 1:])
+    return body, ""
 # U+FFFC OBJECT REPLACEMENT CHARACTER — Apple Notes uses it for every inline
 # attachment/image; a note can be hundreds of them, so collapse to nothing.
 _ATTACHMENT_MARK = "￼"
@@ -260,7 +297,13 @@ def _resolve_date_iso(title: str, created_iso: str | None, modified_iso: str | N
 
     Note we use Evernote ``created``, not ``updated``: the migration bumped the
     *updated* date on both sides (Apple modification AND Evernote updated landed
-    on the import day), but ``created`` survived clean on both."""
+    on the import day), but ``created`` survived clean on both.
+
+    A long-running "living" note (created years ago, edited daily) that mixes
+    current work with old backlog is NOT dated by creation here — that would hide
+    its current items too. Instead the ingest splits such notes at a BACKLOG
+    divider (see _split_at_backlog_divider): the current part is dated by
+    modification, the archived part by creation."""
     cands = en_index.get((title or "").strip())
     if cands:
         if len(cands) == 1 or not created_iso:
@@ -340,7 +383,8 @@ def _existing_ingested_map(conn: sqlite3.Connection) -> dict[str, float]:
 
 def ingest(conn: sqlite3.Connection, note_store: Path, *, en_index: dict,
            force: bool = False, include_trashed: bool = False,
-           dry_run: bool = False, progress_every: int = 500) -> tuple[int, int, int, int]:
+           dry_run: bool = False, dates_only: bool = False,
+           progress_every: int = 500) -> tuple[int, int, int, int]:
     """Return (indexed_new, reindexed_edited, skipped, errors)."""
     copy = _copy_store(note_store)
     if not copy:
@@ -394,7 +438,7 @@ def ingest(conn: sqlite3.Connection, note_store: Path, *, en_index: dict,
         updated_unix = _cf_to_unix(row["ZMODIFICATIONDATE1"])
 
         prev = ingested_map.get(uuid) or ingested_map.get(f"{uuid}#0")
-        if prev is not None and not force:
+        if prev is not None and not force and not dates_only:
             if updated_unix <= prev:
                 skipped += 1
                 continue
@@ -404,22 +448,40 @@ def ingest(conn: sqlite3.Connection, note_store: Path, *, en_index: dict,
 
         title = (row["ZTITLE1"] or "(untitled)").strip()
         folder = folders.get(row["ZFOLDER"], "")
+        date_iso = _resolve_date_iso(title, created_iso, modified_iso, en_index)
+
+        # Fast path: recompute only date_iso (and the filename's date prefix) for
+        # already-indexed notes, without re-decoding bodies or re-embedding. Used
+        # to apply a date-resolution change to the existing rows cheaply.
+        if dates_only:
+            new_prefix = (date_iso or "unknown-date")[:10]
+            cur = conn.execute(
+                "UPDATE photo_meta SET date_iso = ?, "
+                "filename = ? || substr(filename, 11) "
+                "WHERE uuid = ? OR uuid LIKE ?",
+                (date_iso, new_prefix, uuid, f"{uuid}#%"),
+            )
+            if cur.rowcount:
+                edited += 1
+            else:
+                skipped += 1
+            batch += 1
+            if batch >= _COMMIT_EVERY:
+                commit_ingest(conn)
+                batch = 0
+            if progress_every and seen % progress_every == 0:
+                _log(f"  {seen:,} notes | {edited:,} dates updated | {skipped:,} absent")
+            continue
+
         body = _clean_note_text(_note_text_from_blob(zdata))
         if not body and title == "(untitled)":
             skipped += 1
             continue
 
-        date_iso = _resolve_date_iso(title, created_iso, modified_iso, en_index)
-
         header_bits = [f"Title: {title}"]
         if folder:
             header_bits.append(f"Folder: {folder}")
         header = "\n".join(header_bits)
-
-        filename_bits = [(date_iso or "unknown-date")[:10], title]
-        if folder:
-            filename_bits.append(f"[{folder}]")
-        filename = " | ".join(filename_bits)
 
         if dry_run:
             new += 1 if not is_edit else 0
@@ -432,13 +494,33 @@ def ingest(conn: sqlite3.Connection, note_store: Path, *, en_index: dict,
         conn.execute("DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
                      (uuid, f"{uuid}#%"))
 
-        body_chunks = _chunk_text(body) if body else [""]
-        n_chunks = len(body_chunks)
-        for ci, chunk in enumerate(body_chunks):
+        # Living-note split: content above a BACKLOG divider is CURRENT (dated by
+        # last edit), content below is ARCHIVED (dated by creation). No divider =>
+        # one part at the resolved date (unchanged behavior).
+        cur_text, bak_text = _split_at_backlog_divider(body) if body else ("", "")
+        if bak_text.strip():
+            parts = [(cur_text, modified_iso or date_iso),
+                     (bak_text, created_iso or date_iso)]
+        else:
+            parts = [(cur_text or body, date_iso)]
+
+        pieces: list[tuple[str, str | None]] = []   # (chunk_text, chunk_date)
+        for part_text, part_date in parts:
+            for chunk in (_chunk_text(part_text) if part_text.strip() else []):
+                pieces.append((chunk, part_date))
+        if not pieces:
+            pieces = [("", date_iso)]
+
+        n_chunks = len(pieces)
+        for ci, (chunk, cdate) in enumerate(pieces):
             cu = uuid if n_chunks == 1 else f"{uuid}#{ci}"
-            fn = filename if n_chunks == 1 else f"{filename} [part {ci + 1}/{n_chunks}]"
+            fn_core = " | ".join(
+                [(cdate or "unknown-date")[:10], title]
+                + ([f"[{folder}]"] if folder else [])
+            )
+            fn = fn_core if n_chunks == 1 else f"{fn_core} [part {ci + 1}/{n_chunks}]"
             upsert_photo(
-                conn, uuid=cu, filename=fn, date_iso=date_iso,
+                conn, uuid=cu, filename=fn, date_iso=cdate,
                 ocr_text=header + "\n\n" + chunk, vlm_text="",
                 image_path_used="", open_url="", commit=False,
             )
@@ -473,6 +555,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="Also index trashed / recently-deleted notes.")
     p.add_argument("--dry-run", action="store_true",
                    help="Report counts, write nothing.")
+    p.add_argument("--dates-only", action="store_true",
+                   help="Recompute date_iso (+ filename date prefix) for existing "
+                        "notes in place — no re-chunk, no re-embed. For applying a "
+                        "date-resolution change cheaply.")
     p.add_argument("--progress-every", type=int, default=500)
     args = p.parse_args(argv)
 
@@ -497,7 +583,7 @@ def main(argv: list[str] | None = None) -> None:
         new, edited, skipped, errors = ingest(
             conn, note_store, en_index=en_index, force=args.force,
             include_trashed=args.include_trashed, dry_run=args.dry_run,
-            progress_every=args.progress_every,
+            dates_only=args.dates_only, progress_every=args.progress_every,
         )
     if (new or edited) and not args.dry_run:
         optimize(conn)
