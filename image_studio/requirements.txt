@@ -1,0 +1,4 @@
+# Qwen-Image Studio — standalone venv (keep OUT of the RAG .venv: mflux pins its
+# own mlx, which can conflict with the search app's deps).
+mflux
+gradio>=4,<6
