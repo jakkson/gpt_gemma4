@@ -33,3 +33,7 @@ Local_LLM_Stack_Chat.pdf
 Personal_LLM_Stack_Overview.docx
 *.docx
 *.pdf
+
+# Local DB safety backups (huge + personal — never commit)
+/photo_index.backup-*.sqlite
+image_studio/.venv/
