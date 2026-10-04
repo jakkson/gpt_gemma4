@@ -32,6 +32,9 @@ OUT_DIR = Path(os.environ.get("IMAGE_STUDIO_OUT", str(Path.home() / "Generated I
 # Which mflux command to use. Override if your mflux version names it differently
 # (e.g. the base model is `mflux-generate-qwen`).
 MFLUX_CMD = os.environ.get("MFLUX_QWEN_CMD", "mflux-generate-qwen-2.1")
+# LM Studio CLI, used by the "free the LLM" button to unload the big model so its
+# memory is available for image generation.
+LMS_CMD = os.environ.get("LMS_CMD", "lms")
 PORT = int(os.environ.get("IMAGE_STUDIO_PORT", "7863"))
 DEFAULT_QUANT = os.environ.get("IMAGE_STUDIO_QUANT", "8")
 # Flags not in the confirmed core set; dropped on an "unrecognized argument" retry
@@ -67,6 +70,24 @@ def _resolve_cmd() -> str | None:
 
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=3600)
+
+
+def free_llm():
+    """Unload ALL LM Studio models so their memory frees up for image generation.
+    Model-agnostic on purpose — it doesn't matter which LLM is loaded."""
+    exe = shutil.which(LMS_CMD)
+    if not exe:
+        return ("LM Studio CLI `lms` not on PATH. One-time: open LM Studio and run its "
+                "`lms bootstrap`, or just eject the model manually in LM Studio "
+                "(🖥️ Developer tab → eject / power icon) before generating.")
+    try:
+        p = subprocess.run([exe, "unload", "--all"], capture_output=True, text=True, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to run `lms unload --all`: {e}"
+    msg = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+    if p.returncode == 0:
+        return f"✅ Unloaded LM Studio models — memory freed for image gen.\n{msg}"
+    return f"`lms unload --all` exit {p.returncode}:\n{msg}"
 
 
 def generate(prompt, negative, width, height, steps, seed, quant, guidance,
@@ -140,13 +161,16 @@ with gr.Blocks(title="Qwen-Image Studio") as demo:
                 seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
                 quant = gr.Dropdown(["4", "6", "8"], value=DEFAULT_QUANT,
                                     label="Quantization (bits)")
-            go = gr.Button("Generate", variant="primary")
+            with gr.Row():
+                go = gr.Button("Generate", variant="primary", scale=3)
+                free = gr.Button("Free LLM memory", scale=1)
         with gr.Column(scale=1):
             out_img = gr.Image(label="Result", type="filepath")
             status = gr.Textbox(label="Status / log", lines=12)
     go.click(generate,
              [prompt, negative, width, height, steps, seed, quant, guidance],
              [out_img, status])
+    free.click(free_llm, None, status)
 
 
 if __name__ == "__main__":

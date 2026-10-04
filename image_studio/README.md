@@ -35,6 +35,17 @@ double-click it.
 - Output PNGs are saved to **`~/Generated Images`** (override with
   `IMAGE_STUDIO_OUT`). Each file is named `<timestamp>_<prompt-slug>_seed<N>.png`.
 - Recommended settings: **40 steps, guidance 1.0 (off)**. Seed `-1` = random.
+- **"Free LLM memory"** button runs `lms unload --all` to eject the big LLM from
+  LM Studio so its memory is available for image gen (needs the `lms` CLI on PATH;
+  otherwise eject manually in LM Studio first).
+
+## Loading the 235B LLM at all (separate from this app)
+If LM Studio refuses to load a ~100 GB model despite free RAM, raise the macOS GPU
+wired-memory cap (default ~75% of RAM blocks big models) and set LM Studio's
+**Model loading guardrails → Off**:
+```bash
+sudo sysctl iogpu.wired_limit_mb=122880   # 120 GB; resets on reboot
+```
 
 ## Overrides (env vars)
 | Var | Default | Purpose |
