@@ -1,8 +1,17 @@
-# Qwen-Image Studio
+# Image Studio
 
-Standalone local **text-to-image** generator for the MacBook (Apple Silicon),
-using **Qwen-Image 2.1** via **mflux / MLX**. Intentionally separate from the RAG
-search app — see why below.
+Standalone local **text-to-image** generator for the MacBook (Apple Silicon), via
+**mflux / MLX**, with a model picker. Intentionally separate from the RAG search
+app — see why below.
+
+| Model | Download | Speed | Best at |
+|---|---|---|---|
+| **Z-Image Turbo** (default) | ~6 GB | fastest (~9 steps) | realism, single subjects |
+| **FLUX.1-schnell** | ~7 GB | fast (4 steps) | complex / layered / architectural |
+| **Qwen-Image 2.1** | ~33 GB | slow (40 steps) | text-in-image, maximum detail |
+
+Each model downloads its weights on first use. The small models (Z-Image / FLUX)
+run fine alongside a modest LLM; only the big ones need **Free LLM memory** first.
 
 ## Why it's its own app (not a tab in the search UI)
 - **Memory:** Qwen-Image needs ~20 GB resident; it cannot coexist with the
@@ -30,11 +39,14 @@ cd ~/gpt-local-gemma/image_studio
 Or copy **`Image Studio.command`** to `~/Launchers` (or the Desktop) and
 double-click it.
 
-- **First generate downloads ~33 GB** of Qwen-Image weights from Hugging Face,
-  then quantizes to the chosen bits (default **q8**). Later runs reuse the cache.
+- **First use of each model downloads its weights** (Z-Image ~6 GB, FLUX ~7 GB,
+  Qwen-Image ~33 GB), then quantizes to the chosen bits. Later runs reuse the cache.
 - Output PNGs are saved to **`~/Generated Images`** (override with
   `IMAGE_STUDIO_OUT`). Each file is named `<timestamp>_<prompt-slug>_seed<N>.png`.
-- Recommended settings: **40 steps, guidance 1.0 (off)**. Seed `-1` = random.
+- Steps auto-set to each model's recommended default when you switch models
+  (Z-Image 9, FLUX 4, Qwen 40). Seed `-1` = random. Guidance/negative apply to
+  Qwen only (the turbo/schnell models run CFG-off).
+- Change the default model with `IMAGE_STUDIO_MODEL` (substring of a picker label).
 - **"Free LLM memory"** button runs `lms unload --all` to eject the big LLM from
   LM Studio so its memory is available for image gen (needs the `lms` CLI on PATH;
   otherwise eject manually in LM Studio first).
