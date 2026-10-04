@@ -214,8 +214,6 @@ with gr.Blocks(title="Image Studio") as demo:
 
 
 if __name__ == "__main__":
-    # show_api=False avoids Gradio's OpenAPI schema generation, which crashes on
-    # some gradio_client versions ("'const' in schema" on a bool). Belt-and-braces
-    # on top of requiring a modern gradio in requirements.txt.
-    demo.queue().launch(server_name="127.0.0.1", server_port=PORT,
-                        inbrowser=False, show_api=False)
+    # The gradio_client "'const' in schema" crash is fixed by the modern gradio
+    # (requirements pin >=5 on Python 3.11+); no launch-time workaround needed.
+    demo.queue().launch(server_name="127.0.0.1", server_port=PORT, inbrowser=False)
