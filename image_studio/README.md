@@ -23,12 +23,15 @@ run fine alongside a modest LLM; only the big ones need **Free LLM memory** firs
   adding a diffusion model there would OOM / kernel-panic. This tool is MacBook-only.
 
 ## Setup (once, on the MacBook)
+**Requires Python 3.11+** (mflux won't run on macOS's default 3.9). `setup.sh`
+auto-finds a suitable interpreter; if it can't, install one and point it there:
 ```bash
+brew install python@3.12        # only if setup.sh says no 3.11+ found
 cd ~/gpt-local-gemma/image_studio
-./setup.sh
+PYTHON=python3.12 ./setup.sh     # (PYTHON=… optional; auto-detects otherwise)
 ```
-Creates `image_studio/.venv`, installs `mflux` + `gradio`, and makes
-`~/Generated Images`.
+Creates `image_studio/.venv`, installs `mflux` + `gradio` (≥5), makes
+`~/Generated Images`. Re-running rebuilds the venv (safe).
 
 ## Run
 ```bash

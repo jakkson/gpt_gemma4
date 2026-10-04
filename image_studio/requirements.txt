@@ -1,4 +1,5 @@
-# Qwen-Image Studio — standalone venv (keep OUT of the RAG .venv: mflux pins its
-# own mlx, which can conflict with the search app's deps).
+# Image Studio — standalone venv (keep OUT of the RAG .venv: mflux pins its own
+# mlx, which can conflict with the search app's deps). Needs Python >= 3.11.
+# gradio>=5 avoids the older gradio_client JSON-schema crash ('const' in a bool).
 mflux
-gradio>=4,<6
+gradio>=5
