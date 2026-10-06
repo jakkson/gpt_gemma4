@@ -882,7 +882,8 @@ def chat_follow_up(user_msg: str, history: list, model: str,
     fresh_rows: list = []
     if db_path is not None and _topic_terms and not _referential:
         try:
-            sort = SORT_RECENT if _wants_recency(user_msg) else SORT_RELEVANT
+            sort = (SORT_RECENT if (_wants_recency(user_msg) or _is_history_query(user_msg))
+                    else SORT_RELEVANT)
             fresh_rows = _retrieve_rows(
                 db_path=db_path, question=user_msg, top_k=top_k,
                 sort_by=sort, restrict_finance=False,
@@ -1074,6 +1075,30 @@ def _is_calendar_query(question: str) -> bool:
     # A relative date window ("next week", "tomorrow") also implies a schedule
     # lookup even without an explicit calendar noun.
     return _calendar_window(question) is not None
+
+
+# Browser-history intent. hist: rows store only page title + URL (not the words
+# "safari"/"chrome"/"history"), so "summarize my Safari history" matched nothing.
+# Detect the intent so we can seed recent hist: rows and sort them newest-first.
+_HISTORY_PHRASES = (
+    "browser history", "browsing history", "web history", "internet history",
+    "safari history", "chrome history", "search history", "my browsing",
+    "sites i visited", "sites i've visited", "websites i visited",
+    "websites i've visited", "pages i visited", "what did i browse",
+    "what have i browsed", "what sites did i", "what websites did i",
+    "where did i browse", "what did i look at online", "been browsing",
+)
+_BROWSER_WORDS = (" safari ", " chrome ", " browser ", " browsing ")
+_BROWSE_ACTIONS = (" history ", " visited ", " visit ", " sites ", " websites ",
+                   " web pages ", " webpages ", " browsed ", " browse ", " urls ")
+
+
+def _is_history_query(question: str) -> bool:
+    ql = " " + " ".join((question or "").lower().split()) + " "
+    if any(p in ql for p in _HISTORY_PHRASES):
+        return True
+    return (any(b in ql for b in _BROWSER_WORDS)
+            and any(a in ql for a in _BROWSE_ACTIONS))
 
 
 def _calendar_window(question: str, today: date | None = None) -> tuple[str, str] | None:
@@ -1918,6 +1943,7 @@ def _retrieve_rows(
         # directly (FTS can't find them: "photo"/"recent" are stripped as
         # boilerplate and Photos rows store captions, not the word "photo").
         photo_disc = wants_visual and not msg_disc and not wants_money
+        hist_disc = _is_history_query(question)
 
         merged: dict[str, sqlite3.Row] = {}
         candidate_limit = max(top_k * 4, 40)
@@ -2134,6 +2160,26 @@ def _retrieve_rows(
                 "ORDER BY date_iso DESC LIMIT ?",
                 (past_win[0], past_win[1], max(candidate_limit * 20, 800)),
             ):
+                merged[r["uuid"]] = r
+
+        # Browser-history intent: hist: rows (page title + URL) carry no "safari"/
+        # "chrome"/"history" words, so FTS/semantic never surface them for "my
+        # Safari history". Seed the most RECENT hist: rows directly (scoped to the
+        # window if one was named) so the model has real browsing to summarize.
+        if _is_history_query(question):
+            if past_win:
+                hist_rows = conn.execute(
+                    "SELECT *, 0 AS rank FROM photo_meta WHERE uuid LIKE 'hist:%' "
+                    "AND substr(date_iso,1,10) BETWEEN ? AND ? ORDER BY date_iso DESC LIMIT ?",
+                    (past_win[0], past_win[1], max(candidate_limit * 20, 800)),
+                )
+            else:
+                hist_rows = conn.execute(
+                    "SELECT *, 0 AS rank FROM photo_meta WHERE uuid LIKE 'hist:%' "
+                    "ORDER BY date_iso DESC LIMIT ?",
+                    (max(candidate_limit * 10, 400),),
+                )
+            for r in hist_rows:
                 merged[r["uuid"]] = r
 
         # Year-in-name/text sweep: when a year is named ("...from 2016"), seed rows
@@ -2410,12 +2456,14 @@ def _retrieve_rows(
             # candidate seed drowns out "most recent email from Walmart". Pure
             # browse queries ("show my recent emails") have no content terms, so
             # this filter is skipped and all recent rows are kept.
-            _content = _query_content_terms(ql)
+            # Browser-history queries intentionally skip content/phrase anchoring:
+            # hist: rows carry none of the query words, so anchoring would drop them.
+            _content = [] if hist_disc else _query_content_terms(ql)
             # A named title-phrase ("SF Log Meeting") supersedes single-token
             # anchoring entirely: keep only rows containing the exact phrase.
             # Anchor terms like "summary"/"log" alone let a book chunk or JSON
             # blob with a newer file date bury the actual named item.
-            if q_phrases:
+            if q_phrases and not hist_disc:
                 _ppool = [
                     (r, f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower())
                     for r in rows
@@ -2481,7 +2529,19 @@ def _retrieve_rows(
                 )
                 return (in_month, str(r["date_iso"] or ""), str(r["ingested_at"] or ""))
 
-            if msg_disc:
+            if hist_disc:
+                # Browser-history query: float hist: rows (newest first); the
+                # matched-filter would otherwise drop them since they carry none of
+                # the query words. A later past-window filter scopes them if a window
+                # was named ("...this week").
+                hist_only = [r for r in rows if str(r["uuid"]).startswith("hist:")]
+                non_hist = [r for r in rows if not str(r["uuid"]).startswith("hist:")]
+                hist_only.sort(key=recency_tuple, reverse=True)
+                non_hist.sort(key=recency_tuple, reverse=True)
+                rows = hist_only[:top_k]
+                if len(rows) < top_k:
+                    rows.extend(non_hist[: top_k - len(rows)])
+            elif msg_disc:
                 msgs_only = [
                     r for r in rows if str(r["uuid"]).startswith(_MSG_MAIL_PREFIXES)
                 ]
@@ -2925,7 +2985,8 @@ def answer_question(
     # Recency is inferred from the question: date-order for recent/latest.
     # "upcoming/next" stays on RELEVANCE (a future-date bonus in _retrieve_rows
     # lifts upcoming items) so vague future queries don't collapse to newest-noise.
-    sort_by = SORT_RECENT if _wants_recency(q) else SORT_RELEVANT
+    sort_by = (SORT_RECENT if (_wants_recency(q) or _is_history_query(q))
+               else SORT_RELEVANT)
     t0 = time.perf_counter()
     now = time.time()
     key = _cache_key(
