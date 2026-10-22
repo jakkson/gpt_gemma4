@@ -35,8 +35,15 @@ restore_search() {
       [[ -n "$_m" ]] && "$OLLAMA_BIN" stop "$_m" >/dev/null 2>&1 || true
     done
   fi
-  echo "[nightly] restoring search app"
-  nohup "$ROOT/start_search.sh" </dev/null >"$ROOT/data/search_app.log" 2>&1 &
+  # Mini is ingest-only: by default do NOT reload the 17 GB answer model or
+  # relaunch the search UI (keeps the 30B unloaded until explicitly needed).
+  # Set MINI_SEARCH_AUTOSTART=1 to restore the old "relaunch search app" behavior.
+  if [[ "${MINI_SEARCH_AUTOSTART:-0}" == "1" ]]; then
+    echo "[nightly] restoring search app"
+    nohup "$ROOT/start_search.sh" </dev/null >"$ROOT/data/search_app.log" 2>&1 &
+  else
+    echo "[nightly] ingest-only: leaving the 30B unloaded, search UI not relaunched"
+  fi
 }
 trap restore_search EXIT
 trap 'exit 143' TERM INT

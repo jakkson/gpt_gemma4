@@ -40,7 +40,15 @@ done
 # Embedder (tiny) so nightly embed works even with JIT loading disabled.
 "$LMS" load "$EMBED_MODEL" >/dev/null 2>&1 || true
 
-# start_search.sh loads the 30B at 16384/parallel-1 and execs the search app.
+# The mini is INGEST-ONLY now: keep the tiny embedder resident for the nightly
+# embed step, but do NOT load the 17 GB answer model or launch the search UI —
+# that frees ~17 GB on the 32 GB box. To search on the mini on demand, run the
+# "Start LLM (MINI).command" launcher (it loads the 30B at context 16384 and
+# starts the app). Set MINI_SEARCH_AUTOSTART=1 to restore the old behavior.
 cd "$REPO" || { echo "[boot_search] repo not found: $REPO"; exit 1; }
-echo "[boot_search] launching start_search.sh (loads $QA_MODEL only)"
-exec ./start_search.sh
+if [[ "${MINI_SEARCH_AUTOSTART:-0}" == "1" ]]; then
+  echo "[boot_search] MINI_SEARCH_AUTOSTART=1 -> start_search.sh (loads $QA_MODEL)"
+  exec ./start_search.sh
+fi
+echo "[boot_search] ingest-only: embedder loaded, 30B NOT loaded, search UI not started."
+echo "[boot_search] run 'Start LLM (MINI).command' to search on the mini on demand."
