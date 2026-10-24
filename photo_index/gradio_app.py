@@ -882,8 +882,7 @@ def chat_follow_up(user_msg: str, history: list, model: str,
     fresh_rows: list = []
     if db_path is not None and _topic_terms and not _referential:
         try:
-            sort = (SORT_RECENT if (_wants_recency(user_msg) or _is_history_query(user_msg))
-                    else SORT_RELEVANT)
+            sort = SORT_RECENT if _wants_recent_sort(user_msg) else SORT_RELEVANT
             fresh_rows = _retrieve_rows(
                 db_path=db_path, question=user_msg, top_k=top_k,
                 sort_by=sort, restrict_finance=False,
@@ -1193,6 +1192,29 @@ def _recency_window_past(question: str, today: date | None = None) -> tuple[str,
     if " this year " in ql:
         return iso(date(d.year, 1, 1), d)
     return None
+
+
+def _wants_recent_sort(question: str) -> bool:
+    """Whether retrieval should sort by recency: explicit recency words, a browser-
+    history query, OR a named backward window ("yesterday", "last month"). The
+    window case is the key one — "summarize my day yesterday" has no recency *term*
+    but is entirely time-scoped, so it must route to recency (not relevance)."""
+    return (_wants_recency(question) or _is_history_query(question)
+            or _recency_window_past(question) is not None)
+
+
+# Generic words in a "what happened in <window>" summary that are NOT a topic —
+# used to decide a window query has no subject, so it should surface ALL of the
+# window's content rather than only rows that token-match the query.
+_WINDOW_GENERIC = frozenset({
+    "summarize", "summary", "recap", "overview", "day", "days", "happen",
+    "happened", "happening", "do", "did", "doing", "everything", "anything",
+    "stuff", "things", "activity", "activities", "up", "to",
+    # time words that _recency_window_past already consumes — not a topic
+    "yesterday", "today", "tonight", "morning", "afternoon", "evening", "night",
+    "week", "weeks", "weekend", "month", "months", "year", "recent", "recently",
+    "lately", "last", "past", "this",
+})
 
 
 def _base_uuid(uuid) -> str:
@@ -2508,12 +2530,17 @@ def _retrieve_rows(
             # this filter is skipped and all recent rows are kept.
             # Browser-history queries intentionally skip content/phrase anchoring:
             # hist: rows carry none of the query words, so anchoring would drop them.
-            _content = [] if hist_disc else _query_content_terms(ql)
+            # A pure window summary ("summarize my day yesterday" — a named window
+            # with no topic words) likewise skips anchoring, so the window's own
+            # content (notes etc.) isn't dropped for not containing "summarize"/"day".
+            _window_no_topic = bool(past_win) and not [
+                t for t in _query_content_terms(ql) if t not in _WINDOW_GENERIC]
+            _content = [] if (hist_disc or _window_no_topic) else _query_content_terms(ql)
             # A named title-phrase ("SF Log Meeting") supersedes single-token
             # anchoring entirely: keep only rows containing the exact phrase.
             # Anchor terms like "summary"/"log" alone let a book chunk or JSON
             # blob with a newer file date bury the actual named item.
-            if q_phrases and not hist_disc:
+            if q_phrases and not hist_disc and not _window_no_topic:
                 _ppool = [
                     (r, f"{r['filename'] or ''} {r['ocr_text'] or ''}".lower())
                     for r in rows
@@ -2639,12 +2666,22 @@ def _retrieve_rows(
                 matched.sort(key=month_recency_key, reverse=True)
                 unmatched.sort(key=recency_tuple, reverse=True)
                 if past_win:
-                    # Period synthesis ("what was worked on this week"): scope to the
-                    # window and spread across its notes/docs so one big multi-chunk
-                    # note can't fill every slot and hide the rest of the week.
+                    # Period synthesis ("what was worked on this week", "summarize my
+                    # day yesterday"): scope to the window and spread across its
+                    # sources. A pure window query with NO topic words should surface
+                    # ALL of the window's content (so "summarize my day" doesn't drop
+                    # the day's notes to the token-match filter); a window query WITH a
+                    # topic keeps the relevance-matched subset.
                     lo, hi = past_win
-                    in_win = [r for r in matched
+                    base_pool = rows if _window_no_topic else matched
+                    in_win = [r for r in base_pool
                               if lo <= str(r["date_iso"] or "")[:10] <= hi]
+                    # Lead the window summary with the user's source priority (Notes
+                    # first …), newest within each tier.
+                    in_win.sort(key=recency_tuple, reverse=True)
+                    in_win.sort(key=lambda r: (_priority_tier(r["uuid"], r["image_path_used"])
+                                               if _priority_tier(r["uuid"], r["image_path_used"])
+                                               is not None else 9))
                     pool = in_win if in_win else matched
                     rows = _diversify_by_base(pool, top_k, sem_scores,
                                               per_base_cap=max(2, top_k // 4))
@@ -3035,8 +3072,7 @@ def answer_question(
     # Recency is inferred from the question: date-order for recent/latest.
     # "upcoming/next" stays on RELEVANCE (a future-date bonus in _retrieve_rows
     # lifts upcoming items) so vague future queries don't collapse to newest-noise.
-    sort_by = (SORT_RECENT if (_wants_recency(q) or _is_history_query(q))
-               else SORT_RELEVANT)
+    sort_by = SORT_RECENT if _wants_recent_sort(q) else SORT_RELEVANT
     t0 = time.perf_counter()
     now = time.time()
     key = _cache_key(
