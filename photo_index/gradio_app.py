@@ -1242,6 +1242,43 @@ def _source_restriction(question: str) -> set[str] | None:
     return allowed or None
 
 
+# Default source priority for GENERIC queries (a soft bias / tie-breaker, not a
+# hard cascade): when relevance is close, prefer sources in this order —
+#   0 Apple Notes · 1 Documents · 2 Messages · 3 KPIX docs · 4 Calendar · 5 Photos.
+# The bonus is small relative to the real relevance signals (semantic ~0-25,
+# rerank, phrase +12), so it only flips near-ties. Skipped entirely when a query
+# names a specific source/intent (history, finance, calendar, photos, "from X",
+# "only my …"). Tune/disable with PHOTO_INDEX_SOURCE_PRIORITY_STRENGTH (0 = off).
+_SOURCE_PRIORITY_STRENGTH = float(
+    os.environ.get("PHOTO_INDEX_SOURCE_PRIORITY_STRENGTH", "8.0"))
+_SOURCE_PRIORITY_TIERS = 6
+
+
+def _priority_tier(uuid, image_path) -> int | None:
+    """Tier 0 (highest) … 5; None = source carries no bias (mail/web/history/…)."""
+    u = str(uuid or "")
+    if u.startswith("notes:"):
+        return 0
+    if u.startswith("doc:"):
+        return 3 if "/KPIX/" in str(image_path or "") else 1   # KPIX docs below general docs
+    if u.startswith("imsg:"):
+        return 2
+    if u.startswith("cal:"):
+        return 4
+    if not any(u.startswith(p) for p in _SOURCE_PREFIXES):
+        return 5   # raw Photos UUID / local image
+    return None
+
+
+def _source_priority_bonus(uuid, image_path) -> float:
+    if _SOURCE_PRIORITY_STRENGTH <= 0:
+        return 0.0
+    t = _priority_tier(uuid, image_path)
+    if t is None:
+        return 0.0
+    return _SOURCE_PRIORITY_STRENGTH * (_SOURCE_PRIORITY_TIERS - t) / _SOURCE_PRIORITY_TIERS
+
+
 def _diversify_by_base(rows: list, top_k: int, sem_scores: dict,
                        per_base_cap: int) -> list:
     """Spread the pick across distinct notes/docs instead of letting one big
@@ -2332,6 +2369,14 @@ def _retrieve_rows(
             except Exception:
                 rerank_map = {}
 
+        # Soft source-priority bias applies only to GENERIC queries — not when the
+        # query already targets a specific source/intent (those branches float the
+        # right source themselves, and a cross-source nudge would fight them).
+        apply_source_bias = not (
+            hist_disc or photo_disc or msg_disc or is_fin or wants_calendar
+            or (_src_allow is not None) or bool(named_sender) or bool(_named_source(question))
+        )
+
         def score(r: sqlite3.Row) -> tuple[int, float, float, str]:
             uid = str(r["uuid"] or "")
             is_imsg = uid.startswith("imsg:")
@@ -2396,6 +2441,11 @@ def _retrieve_rows(
                     entity_bonus += 14.0
                 elif uid.startswith("doc:"):
                     entity_bonus -= 12.0
+            # Soft default source priority (generic queries only): Notes > Docs >
+            # Messages > KPIX docs > Calendar > Photos. Small, so it only breaks
+            # near-ties — relevance still wins when it's clear.
+            if apply_source_bias:
+                entity_bonus += _source_priority_bonus(uid, r["image_path_used"])
             # Semantic similarity: strong signal for meaning-based relevance.
             entity_bonus += sem_scores.get(uid, 0.0) * _SEMANTIC_WEIGHT
             # Cross-encoder rerank: highest-precision relevance signal when present.
