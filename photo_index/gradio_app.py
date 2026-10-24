@@ -1216,6 +1216,16 @@ _WINDOW_GENERIC = frozenset({
     "lately", "last", "past", "this",
 })
 
+# Words that are discovery/scope, not a topic — used to decide a message/mail
+# "discovery" query actually names a subject (so it shouldn't dump recent msgs).
+_MSG_DISC_NON_TOPIC = frozenset({
+    "checking", "check", "source", "sources", "recent", "recently", "latest",
+    "newest", "email", "emails", "mail", "mails", "message", "messages", "text",
+    "texts", "inbox", "outlook", "imessage", "gmail", "two", "three", "four",
+    "five", "couple", "several", "some", "last", "most", "show", "list", "find",
+    "about", "from", "what", "which", "anything", "everything", "them", "they",
+})
+
 
 def _base_uuid(uuid) -> str:
     """The note/doc id without its ``#<chunk>`` suffix, so all chunks of one note
@@ -1223,6 +1233,27 @@ def _base_uuid(uuid) -> str:
     u = str(uuid or "")
     i = u.find("#")
     return u[:i] if i >= 0 else u
+
+
+_DOC_FREQ_CACHE: dict[str, int] = {}
+
+
+def _db_doc_freq(conn, term: str, cap: int = 4000) -> int:
+    """Approx. how many index rows contain `term` (capped for latency, cached).
+    Used to pick the most distinctive query term — the globally-rarest one is the
+    entity the user means ("hoka"), vs common filler ("two"/"shoe"/"purchases")."""
+    t = (term or "").lower()
+    if t in _DOC_FREQ_CACHE:
+        return _DOC_FREQ_CACHE[t]
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM photo_meta WHERE "
+            "instr(lower(coalesce(ocr_text,'')||' '||coalesce(filename,'')), ?) > 0 "
+            "LIMIT ?)", (t, cap)).fetchone()[0]
+    except Exception:
+        n = cap
+    _DOC_FREQ_CACHE[t] = n
+    return n
 
 
 _SOURCE_PREFIXES = ("notes:", "doc:", "mail:", "m365:", "imsg:",
@@ -1523,6 +1554,12 @@ _DISCOVERY_GENERIC = frozenset({
     # common browse residuals that would otherwise leak in as "entities"
     "most", "more", "some", "please", "want", "need", "looking", "search",
     "results", "result", "top", "regarding", "related", "any",
+    # scope/filler verbs & phrasing ("checking my email …", "REI is the source"):
+    # not topics, and they wrongly anchored onto "checking account"/"source" rows
+    "checking", "checked", "source", "sources", "reviewing", "pull", "pulling",
+    # spelled-out counts ("my two most recent …") — never an entity
+    "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "couple", "dozen",
 })
 
 
@@ -1983,7 +2020,14 @@ def _retrieve_rows(
             rq = question
 
         ql = (question or "").lower()
-        msg_disc = _message_discovery_query(question)
+        # Message/mail-discovery ("show me my recent emails/texts") dumps recent
+        # messages by date, IGNORING topic. Only do that for a PURE browse query —
+        # if the user names a real topic ("…my recent HOKA purchases"), fall through
+        # to normal topic retrieval so the scoped-to-email query still finds HOKA.
+        _msg_disc_topic = any(
+            len(t) >= 4 and t not in _MSG_DISC_NON_TOPIC
+            for t in _query_content_terms(ql))
+        msg_disc = _message_discovery_query(question) and not _msg_disc_topic
         finance_terms = (
             "price", "charge", "charged", "payment", "bill", "billing",
             "fee", "subscription", "cost",
@@ -2024,6 +2068,24 @@ def _retrieve_rows(
                 merged[r["uuid"]] = r
             if len(merged) >= max(top_k * 6, 80):
                 break
+
+        # Content-term gather: a noisy natural-language query ("checking my email,
+        # what are my two most recent HOKA shoe purchases?") makes the phrase-level
+        # FTS AND/phrase-match to NOTHING, starving the pool of the real entity rows.
+        # Also search the distinctive content terms — combined (precise) and each
+        # term on its own (so a rare entity like "hoka" always reaches the pool).
+        _cterms = _query_content_terms(ql)
+        if _cterms:
+            _cqueries = [" ".join(_cterms)] + [t for t in _cterms if len(t) >= 4]
+            for _cq in dict.fromkeys(_cqueries):   # dedup, preserve order
+                try:
+                    hits = search_meta(conn, _cq, limit=candidate_limit)
+                except sqlite3.OperationalError:
+                    hits = search_meta_fallback_substring(conn, _cq, limit=candidate_limit)
+                if not hits:
+                    hits = search_meta_fallback_substring(conn, _cq, limit=candidate_limit)
+                for r in hits:
+                    merged[r["uuid"]] = r
 
         _finance_trigger = (
             "price", "charge", "charged", "payment", "bill", "billing", "fee",
@@ -2586,7 +2648,12 @@ def _retrieve_rows(
                         else:
                             _kept = [r for r, _ in _src_rows]
                     else:
-                        _anchor = min(_present, key=_present.get)
+                        # Anchor on the DB-rarest content term (the distinctive
+                        # entity, e.g. "hoka"), NOT the rarest in the candidate pool
+                        # — content-term seeding can make the entity common in the
+                        # pool, which would make pool-rarity pick a filler word
+                        # ("two"/"purchases") and drop the entity's rows.
+                        _anchor = min(_present, key=lambda t: _db_doc_freq(conn, t))
                         _kept = [
                             r for r, txt in _pool
                             if _anchor in txt
