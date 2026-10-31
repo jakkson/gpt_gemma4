@@ -29,7 +29,7 @@ done
 
 # Force-load ONLY the intended models. Unload anything else that somehow came up
 # (e.g. a restored session) so the 32 GB is never over-committed.
-"$LMS" ps 2>/dev/null | awk 'NR>1{print $1}' | while read -r m; do
+"$LMS" ps 2>/dev/null | awk 'NR>1 && $1!="IDENTIFIER"{print $1}' | while read -r m; do
   case "$m" in
     "$QA_MODEL"|"$EMBED_MODEL"|"$EMBED_MODEL":*) : ;;   # keep
     "" ) : ;;
@@ -50,5 +50,9 @@ if [[ "${MINI_SEARCH_AUTOSTART:-0}" == "1" ]]; then
   echo "[boot_search] MINI_SEARCH_AUTOSTART=1 -> start_search.sh (loads $QA_MODEL)"
   exec ./start_search.sh
 fi
-echo "[boot_search] ingest-only: embedder loaded, 30B NOT loaded, search UI not started."
+# Ingest-only: make sure the 17 GB answer model is NOT resident, even if LM Studio
+# restored it from a previous session on launch (autoStartOnLaunch). The stray
+# loop above intentionally keeps $QA_MODEL, so unload it explicitly here.
+"$LMS" unload "$QA_MODEL" >/dev/null 2>&1 || true
+echo "[boot_search] ingest-only: embedder loaded, 30B NOT loaded (unloaded if restored)."
 echo "[boot_search] run 'Start LLM (MINI).command' to search on the mini on demand."
