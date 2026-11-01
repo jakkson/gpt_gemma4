@@ -3006,7 +3006,20 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
         # "Reference attachment": route open via /open-local-file (fetch + capture-
         # phase handler in _PAGE_LOAD_JS). Buttons avoid hash navigation from href="#".
         web_open = _safe_https_browser_url(open_url)
-        if image_path and not image_path.startswith("https://"):
+        if is_mail and str(open_url).startswith("message://"):
+            # Open by stable Message-ID, not the volatile per-machine .emlx path:
+            # Apple Mail resolves message:// wherever the message lives, so this
+            # works on any Mac with the account configured (and survives Mail
+            # compaction relocating the .emlx).
+            encoded = urllib.parse.quote(open_url, safe="")
+            req_path = f"/open-local-file?url={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
+            data_attr = html.escape(req_path, quote=True)
+            link_md = (
+                '<button type="button" class="pi-open-local-file" '
+                f'data-open-href="{data_attr}">Open in Apple Mail</button>'
+            )
+            ref = f"`{uuid}`"
+        elif image_path and not image_path.startswith("https://"):
             encoded = urllib.parse.quote(image_path, safe="")
             req_path = f"/open-local-file?path={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
             data_attr = html.escape(req_path, quote=True)
@@ -4133,8 +4146,12 @@ def build_app(
     return demo
 
 
-def _spawn_open_default_app(path: Path) -> None:
-    """Background worker: spawn OS open after HTTP response (Friendlier to tunnels)."""
+def _spawn_open_default_app(path: Path | str) -> None:
+    """Background worker: spawn OS open after HTTP response (Friendlier to tunnels).
+
+    Accepts a filesystem path or a URL string (e.g. ``message://<id>``); macOS
+    ``open`` dispatches both to the right app.
+    """
 
     def _run() -> None:
         try:
@@ -4207,19 +4224,48 @@ def _path_is_indexed(path: str) -> bool:
         return False
 
 
-def _open_local_file_handler(path: str, t: str = "") -> Response:
-    """Open ``path`` in the OS default app (macOS ``open`` / Linux ``xdg-open``).
+def _openurl_is_indexed(url: str) -> bool:
+    """True if ``url`` is stored as a row's ``open_url`` (e.g. a mail message:// link)."""
+    if _OPEN_LOCAL_FILE_DB is None:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{_OPEN_LOCAL_FILE_DB}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM photo_meta WHERE open_url = ? LIMIT 1", (url,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _open_local_file_handler(path: str = "", t: str = "", url: str = "") -> Response:
+    """Open an indexed file OR an indexed ``message://`` mail link in the OS default app.
 
     Invoked via ``fetch()`` from hit-summary controls (delegated click handler in
     ``_PAGE_LOAD_JS``) so the Gradio SPA never navigates. The handler returns
     immediately after scheduling ``open`` so proxies/tunnels finish the request
     before any foreground UI churn.
 
-    Security: requires the per-run token AND the path to be a file this index
+    Security: requires the per-run token AND the target to be something this index
     actually ingested — both checks stop cross-site "open anything" requests.
+
+    ``url`` opens a stable mail identifier (message://<Message-ID>) that Apple Mail
+    resolves regardless of where the .emlx physically lives — the robust path for
+    mail, whose on-disk .emlx files relocate on compaction and differ per machine.
     """
     if not secrets.compare_digest(t or "", _OPEN_LOCAL_FILE_TOKEN):
         raise HTTPException(status_code=403, detail="bad or missing token")
+    if url:
+        # Only message:// is openable this way, and only if it's an indexed row.
+        if not url.startswith("message://"):
+            raise HTTPException(status_code=403, detail="unsupported url scheme")
+        if not _openurl_is_indexed(url):
+            raise HTTPException(status_code=403, detail="url is not an indexed link")
+        _spawn_open_default_app(url)
+        return Response(status_code=204)
     if not path:
         raise HTTPException(status_code=400, detail="missing path")
     if not _path_is_indexed(path):
