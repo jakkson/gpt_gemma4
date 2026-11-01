@@ -1,207 +1,234 @@
 # gpt-local-gemma
 
-Local personal-search stack for Photos + Messages using Ollama/Gemma, SQLite FTS, and Gradio.
+A fully local, private retrieval-augmented assistant over your own Apple data.
+It indexes **Photos, Messages, Apple Mail, Documents & books, Apple Notes, Calendar,
+and browser history** into a single SQLite index, then answers questions and
+summarizes documents with a **local LLM** — nothing leaves the machine.
 
-## First-Time Setup
+Everything runs on-device: a local LLM serves answers, a local embedding model
+powers semantic search, and a local vision model captions images during ingest.
 
-1) Create and activate virtualenv:
+---
 
-- `python3 -m venv .venv`
-- `source .venv/bin/activate`
+## Architecture at a glance
 
-2) Install dependencies:
+| Piece | What it is | Runs on |
+|---|---|---|
+| **Answer model** | Qwen3-30B-A3B (instruct) via **LM Studio** (OpenAI-compatible API on `:1234`) | local |
+| **Embeddings** | `nomic-embed-text-v1.5` (768-dim) for semantic search | local (LM Studio / Ollama) |
+| **Reranker** | `bge-reranker-base` cross-encoder (precision stage, MPS on Apple Silicon) | local |
+| **Vision (ingest only)** | Ollama VLM + Apple Vision OCR for images/PDFs | local |
+| **Index** | SQLite + FTS5 (external-content) with an embedding BLOB column | `data/photo_index.sqlite` |
+| **UI** | Gradio web app on `:7860` | local |
 
-- `pip install -r requirements.txt`
+**Retrieval is hybrid:** nomic embeddings (meaning) blended with FTS5 BM25
+(keywords), then bge reranking, plus a self-correcting query-rewrite pass and
+follow-up chat that reuses the prior answer's records.
 
-3) LLM for **answers** (pick one):
+**Source tags** — every indexed row is prefixed by origin so results stay
+attributable and de-collide: `imsg:` (Messages), `mail:` (Apple Mail),
+`doc:` (Documents/books), `notes:` (Apple Notes), `cal:` (Calendar), `hist:` (browser
+history), `web:` (scraped pages); Photos rows carry the raw Photos UUID.
 
-**Option A — LM Studio (recommended for faster Q&A):**
+### Optional two-machine setup
 
-- Install [LM Studio](https://lmstudio.ai/), download **Qwen2.5-3B-Instruct** (GGUF).
-- In LM Studio: load the model → **Local Server** tab → Start server (default `http://127.0.0.1:1234`).
-- Set env (add to your shell profile or run before Gradio):
+This stack is designed to run on one Mac, but also supports a **source-of-truth
++ daily-driver** split:
 
+- A always-on Mac (e.g. a Mac mini) holds the **canonical index** and runs the
+  nightly ingest, mail rules, and the search app.
+- A higher-RAM Mac (e.g. a MacBook Pro) is the **daily driver** for answers,
+  pulling a fresh copy of the DB on demand with `scripts/sync_db_from_mini.sh`.
+
+Remote access is left to you (SSH / Tailscale / etc.).
+
+---
+
+## First-time setup
+
+1. **Virtualenv + deps**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. **LM Studio (answers + embeddings)**
+   - Install [LM Studio](https://lmstudio.ai/) and download a **Qwen3-30B-A3B instruct** build
+     (MLX on Apple Silicon is fastest) plus the **nomic-embed-text-v1.5** embedding model.
+   - Load the answer model, then start the server: **Developer/Local Server → Start** (`http://127.0.0.1:1234`).
+   - ⚠️ **Load the answer model at 16384+ context.** If it JIT-loads at the 4096 default,
+     long prompts are silently truncated and answers confabulate. Verify with `lms ps`.
+   - Point the app at it:
+     ```bash
+     export PHOTO_INDEX_LLM_BACKEND=openai
+     export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
+     export PHOTO_INDEX_QA_MODEL=<the model id shown in LM Studio>
+     export PHOTO_INDEX_QA_MODEL_SMALL=<same id>
+     ```
+
+3. **Ollama (vision ingest only)**
+   - Install [Ollama](https://ollama.com/) and pull a vision model (e.g. `ollama pull gemma3` or a Qwen-VL).
+   - Only used to caption images/PDFs during ingest; answers do not use Ollama.
+
+4. **macOS privacy permissions (required)**
+   - Grant **Full Disk Access** to the Python binary running this code
+     (`.venv/bin/python`) in **System Settings → Privacy & Security**.
+   - Needed to read Apple Photos, Messages `chat.db`, Apple Mail, Calendar, and browser history.
+     A background nightly can't click the per-app TCC prompt, so this one-time grant is essential.
+
+5. **Start the search UI**
+   ```bash
+   ./start_search.sh        # loads the answer model at proper context + launches the app
+   ```
+   Open <http://127.0.0.1:7860>.
+
+---
+
+## What gets indexed
+
+Each source has its own ingest module. The **nightly** (`scripts/run_nightly_ingest.sh`)
+runs them incrementally; you can also run any one by hand.
+
+| Source | Module | Notes |
+|---|---|---|
+| Photos | `photo_index.ingest` | OCR (Apple Vision) + Ollama VLM captions |
+| Messages | `photo_index.messages_ingest` | `chat.db`; handles resolved to contact names |
+| Apple Mail | `photo_index.mail_ingest` | `.emlx` across accounts & folders |
+| Outlook / M365 | `photo_index.outlook_graph_ingest` | Microsoft Graph, delegated `Mail.Read` (optional) |
+| Documents & books | `photo_index.documents_ingest` | PDF/Word/PowerPoint/Excel/RTF/text/epub; long docs chunked into passages |
+| Document OCR/VLM | `photo_index.documents_vlm_ingest` | Apple Vision + Ollama VLM on images/PDFs (slow) |
+| Apple Notes | `photo_index.notes_ingest` | reads NoteStore directly; creation-date resolved (Evernote-original when known) |
+| Calendar | `photo_index.calendar_ingest` | Apple iCal events, calendar-aware retrieval |
+| Browser history | `photo_index.history_ingest` | Safari + Chrome (title + URL + last-visit) |
+| Web pages | `photo_index.web_ingest` | scrape permitted sites (robots + rate-limit), with a review gap |
+| Embedding pass | `photo_index.embed_index` | embeds new/changed rows after text ingest |
+
+Config knobs used by the nightly:
+`PHOTO_INDEX_BOOKS_ROOT` (offline library, default `~/LLM_Books`),
+`EXTRA_DOC_ROOTS` (extra document folders), and `--exclude` for noisy subfolders.
+The primary document root defaults to `~/Dropbox/Documents`.
+
+---
+
+## Answering & the search UI
+
+`python -m photo_index.gradio_app` (or `./start_search.sh`) serves the web UI:
+
+- Hybrid semantic + keyword search with **bge reranking**.
+- **Self-correcting retrieval** — if a named anchor is missing from the top rows,
+  the LLM rewrites the query and retries (`PHOTO_INDEX_SELF_CORRECT=1`).
+- **Follow-up chat** — replies drill into the prior answer's records instead of
+  re-searching, unless you introduce a new topic.
+- **Upload / summarize box** — drop one or more documents for a one-shot
+  summary/analysis. This is **ad-hoc: uploaded files are NOT added to the index.**
+  To make a file searchable, put it in an ingest root and let the nightly index it.
+- **`about_me.md`** — an optional personal profile in `data/` that is prepended to
+  every answer for context.
+- Click-to-preview image row and Reveal in Finder.
+
+`python -m photo_index.search_cli "your question"` gives the same retrieval from the CLI.
+
+---
+
+## Nightly ingest, health check, boot start
+
+- **Nightly ingest** — `scripts/run_nightly_ingest.sh`, scheduled via launchd for
+  **22:00 nightly (Mon–Sat)**. It takes the search app offline during ingest,
+  frees the answer model to avoid GPU memory over-commit, hard-stops on a time
+  budget, and auto-restores the app afterward. Install/uninstall:
+  ```bash
+  ./install_photo_nightly_launchd.sh
+  ./uninstall_photo_nightly_launchd.sh
+  ```
+- **Weekly doctor** — `scripts/doctor.py`, **Sunday 22:00**: DB health report + safe optimizes.
+- **Boot auto-start** — `scripts/boot_search.sh` (launchd `RunAtLoad`) brings LM
+  Studio + the answer model + the search app back up after a reboot.
+
+Run everything by hand:
 ```bash
-export PHOTO_INDEX_LLM_BACKEND=openai
-export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
-export PHOTO_INDEX_QA_MODEL=qwen2.5-3b-instruct
-export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-3b-instruct
+python -m photo_index.nightly                       # all incremental ingests
+python -m photo_index.nightly --skip-photos --skip-messages   # docs only
+./update_documents.sh            # documents, text only
+./update_documents.sh --ocr-vlm  # documents + OCR/VLM (matches nightly)
 ```
 
-Use the exact model id shown in LM Studio’s server UI if the name differs. With one model loaded, any id often works.
+---
 
-**Option B — Ollama only (legacy):**
+## Mail rules & the Mail Rule Dropper
 
-- `ollama list`
-- Example pulls: `ollama pull gemma4:26b`, `ollama pull qwen2.5:3b`
-- Leave `PHOTO_INDEX_LLM_BACKEND` unset (defaults to `ollama`).
+An automation that files or trashes Inbox mail by rule:
 
-**Vision captioning during ingest always uses Ollama** (`gemma4` etc.) unless you change ingest separately. A **VL** model in LM Studio (e.g. Qwen2.5-VL) is not used by this repo yet.
+- **`data/mail_rule.py`** — moves senders to folders (`data/mail_routes.json`) or
+  trashes by keyword (`data/trash_keywords.txt`), driving Mail via AppleScript.
+  Folder routes win over trash. (These `data/` files are personal and gitignored.)
+- **`scripts/mail_rules_tick.sh`** — one launchd job (every 60s) that runs the
+  route/keyword/trump passes **sequentially** with a lock, so Mail is never driven
+  by concurrent AppleScript clients (which caused beachballs).
+- **`scripts/mail_dropper.py`** — a small GUI: grab/drop a sender, choose Trash or
+  a folder, Apply. Adding a rule is instant; the per-minute job files matching mail
+  (newest ~50, read or unread) within a minute. Shows existing rules for a sender
+  with per-rule Delete buttons.
 
-4) macOS privacy permissions (required):
+---
 
-- Enable **Full Disk Access** for the app running Python (Cursor/Terminal/iTerm).
-- Required for:
-  - Apple Photos library access
-  - Apple Messages `chat.db` access
+## Other tools
 
-5) Start Gradio UI:
+- **`photo_index.web_ingest_gui`** — standalone Gradio front-end for web scraping (`:7862`).
+- **`scripts/sync_db_from_mini.sh`** — pull the source-of-truth DB to a daily-driver Mac.
+- **`scripts/rechunk_contact_directory.py` / `rechunk_reference_book.py` /
+  `normalize_artist_names.py`** — re-chunk reference dumps (address books,
+  alphabetized books) into one record per entry for reliable retrieval.
+- **`photo_index.prune_index`** — remove rows by source/prefix.
 
-**Quickest (LM Studio):** start LM Studio's Developer-tab server, then:
+---
+
+## Core data files (all under `data/`, gitignored)
+
+- `photo_index.sqlite` — the index (+ `.emb_mat.npy` / `.emb_uuids.npy` embedding cache)
+- `synonyms.json` — user-editable retrieval aliases
+- `about_me.md` — personal profile prepended to answers
+- `mail_routes.json`, `trash_keywords.txt` — mail-rule config (personal)
+- `query_log.jsonl` — durable query log
+- `gradio_search_cache.json` — cached answers
+
+---
+
+## Common commands & health checks
 
 ```bash
-./start_search.sh          # fast 3B for everything
-./start_search.sh --big    # 3B default, escalate to 32B on broad queries
+# Row counts by source
+sqlite3 data/photo_index.sqlite \
+  "SELECT substr(uuid,1,instr(uuid,':')-1) src, COUNT(*) FROM photo_meta \
+   WHERE instr(uuid,':')>0 GROUP BY src ORDER BY 2 DESC;"
+
+# Is an ingest running?
+pgrep -fl "photo_index" || echo "not running"
+
+# Nightly job + logs
+launchctl list | grep com.gptlocalgemma
+tail -f data/nightly_ingest.log
+
+# Confirm the answer model's loaded context (must be >= 16384)
+lms ps
 ```
 
-Override model ids with env vars if your LM Studio shows different names
-(e.g. `PHOTO_INDEX_QA_MODEL`, `PHOTO_INDEX_QA_MODEL_SMALL`).
+---
 
-**Manual equivalent:**
+## Concurrency safety
 
-```bash
-export PHOTO_INDEX_LLM_BACKEND=openai
-export PHOTO_INDEX_LLM_BASE_URL=http://127.0.0.1:1234/v1
-export PHOTO_INDEX_QA_MODEL=qwen2.5-vl-3b-instruct
-export PHOTO_INDEX_QA_MODEL_SMALL=qwen2.5-vl-3b-instruct
-python -m photo_index.gradio_app --no-auto-route --top-k 15
-```
+Ingest modules share a global lock (`data/content_ingest.lock` via
+`photo_index.ingest_lock.global_ingest_lock()`) so photo/doc/message/mail/embedding
+jobs never run simultaneously.
 
-(`--no-auto-route` is fine when large and small are the same model.)
+---
 
-**With Ollama (answers):**
+## Operational notes / gotchas
 
-- `python -m photo_index.gradio_app --qa-model gemma4:26b --qa-model-small qwen2.5:3b --top-k 15`
-
-Open `http://127.0.0.1:7860`
-
-## What Each Python App Does
-
-- `python -m photo_index.ingest`
-  - Main Photos indexer.
-  - Reads Apple Photos library items, runs OCR + VLM captioning, writes to `data/photo_index.sqlite`.
-  - Skips already indexed UUIDs by default.
-
-- `python -m photo_index.messages_ingest`
-  - Messages indexer.
-  - Reads `~/Library/Messages/chat.db` text messages and writes them into the same SQLite/FTS index.
-  - Uses `imsg:` UUID prefix to avoid collisions with photo UUIDs.
-
-- `python -m photo_index.search_cli "your question"`
-  - CLI retrieval + Gemma answer over indexed content.
-  - Uses FTS with synonym expansion and fallback substring search.
-
-- `python -m photo_index.gradio_app`
-  - Local web UI (`http://127.0.0.1:7860`) for search and Q&A.
-  - Includes:
-    - click-to-preview image row
-    - Reveal in Finder
-    - auto-routing (small vs large model + retry-on-low-confidence)
-    - typo autocorrect fallback
-    - synonym expansion
-    - Alias Manager UI for editing `data/synonyms.json`
-    - "Re-check with big model" button — re-runs the current query on
-      `--qa-model-big` (env `PHOTO_INDEX_QA_MODEL_BIG`, default
-      `qwen2.5-vl-32b-instruct`) regardless of the launch model. With LM Studio,
-      enable Just-In-Time model loading so the big model loads on demand.
-
-- `python -m photo_index.nightly`
-  - One-pass runner for launchd: incremental **new photos**, **new messages**, then
-    **new/changed documents** under `~/Dropbox/Documents` (text extract, then Apple
-    Vision OCR + Ollama VLM on PDF/PNG/JPG). Skips unchanged files by mtime+size; no
-    `--force`. Requires **Ollama** for photo and document VLM. Opt out of heavy OCR:
-    `--skip-documents-vlm`.
-
-- `python -m photo_index.documents_ingest`
-  - Index PDF / Office / text files under a folder (default: `~/Dropbox/Documents`).
-  - Skips unchanged files already in the DB (same path + mtime + size). Use `--force`
-    to re-read everything.
-
-- `python -m photo_index.documents_vlm_ingest`
-  - Apple Vision OCR + Ollama VLM for **images and PDFs** in a folder (slow). Nightly
-    runs this after `documents_ingest` unless `--skip-documents-vlm`.
-
-- `python osxphotos_script.py`
-  - Small demo script (first 10 photos) for quick vision checks.
-  - Not the full production ingest.
-
-## Core Data Files
-
-- `data/photo_index.sqlite` - main index DB
-- `data/photo_index.checkpoint.json` - latest ingest checkpoint status
-- `data/synonyms.json` - user-editable aliases for retrieval expansion
-- `data/gradio_search_cache.json` - cached Gradio search answers
-
-## Common Commands
-
-- Start Gradio app:
-  - `python -m photo_index.gradio_app --qa-model gemma4:26b --qa-model-small qwen2.5:3b --top-k 15`
-
-- Run Photos ingest now:
-  - `python -m photo_index.ingest --vlm-model gemma4:26b --progress-every 1`
-
-- Run Messages ingest now:
-  - `python -m photo_index.messages_ingest`
-
-- Run Documents ingest now (incremental — new/changed files only):
-  - `./update_documents.sh` (text only)
-  - `./update_documents.sh --ocr-vlm` (text + OCR/VLM on PDF/PNG/JPG; matches nightly)
-  - Or: `python -m photo_index.documents_ingest`
-  - Override folder: `python -m photo_index.documents_ingest --root ~/Dropbox/Documents`
-
-- Run all incremental ingests (photos + messages + documents + document OCR/VLM):
-  - `python -m photo_index.nightly`
-  - Documents only: `python -m photo_index.nightly --skip-photos --skip-messages`
-  - Documents text only (no OCR/VLM): add `--skip-documents-vlm`
-
-- Run Outlook / Microsoft 365 mail ingest (Microsoft Graph, delegated **Mail.Read**):
-  - Register an app in Entra ID, add redirect `http://localhost`, grant Graph delegated **Mail.Read** (and **offline_access**).
-  - Or run **`./scripts/register_entra_personal_photo_index_mail.sh`** after **`az login --allow-no-subscriptions`** (no Azure subscription needed) or **`az login`**, to create **`personal-photo-index-mail`** automatically.
-  - `export GRAPH_CLIENT_ID='your-client-id'`
-  - `python -m photo_index.outlook_graph_ingest --auth interactive`
-  - First run opens a browser to sign in; later runs use `data/graph_mail_token_cache.json`. Incremental sync uses `data/graph_mail_delta.json`.
-  - **Azure CLI login crashes** (no Azure subscription; error in **Tenant and subscription selection** such as `'NoneType' object has no attribute 'get'`): run **`brew upgrade azure-cli`**, then **`az login --allow-no-subscriptions --tenant YOUR_TENANT_ID`** (copy **Tenant ID** from **Microsoft Entra admin center → Overview**). Or **`az login --use-device-code --allow-no-subscriptions --tenant YOUR_TENANT_ID`**. If CLI keeps failing, create the app only in the portal (**App registrations → New registration**, name **`personal-photo-index-mail`**, **Mobile and desktop** redirect **`http://localhost`**, API permissions **Mail.Read** + **offline_access**, **Grant admin consent**), then **`export GRAPH_CLIENT_ID='…'`** from **Application (client) ID**.
-
-- Install nightly 2:00 AM photo + messages + documents ingest (text + OCR/VLM; launchd):
-  - `./install_photo_nightly_launchd.sh`
-  - Also installs a **wake scheduler** (root LaunchDaemon): wakes the Mac at **1:55 AM**
-    daily so ingest starts at 2:00 AM. Requires your admin password once.
-  - Check wake status: `.venv/bin/python -m photo_index.nightly_wake status`
-  - Uninstall: `./uninstall_photo_nightly_launchd.sh`
-  - **Laptop:** plug in overnight; closed lid on battery may block wake. **Desktop:** leave
-    “Prevent computer from sleeping” or rely on the scheduled wake + `caffeinate` during ingest.
-
-## Concurrency Safety
-
-Ingest modules use a shared global lock (`data/content_ingest.lock`) so different ingest jobs (photos/docs/messages/email) do not run at the same time, as long as they use `photo_index.ingest_lock.global_ingest_lock()`.
-
-## Daily Workflow
-
-- Open search UI:
-  - `source .venv/bin/activate`
-  - `python -m photo_index.gradio_app --qa-model gemma4:26b --qa-model-small qwen2.5:3b --top-k 15`
-  - Browse at `http://127.0.0.1:7860`
-
-- Manually ingest new photos:
-  - `python -m photo_index.ingest --vlm-model gemma4:26b --progress-every 1`
-
-- Manually ingest new Messages:
-  - `python -m photo_index.messages_ingest`
-
-- Manually ingest Outlook / Microsoft 365 (after `GRAPH_CLIENT_ID` is set):
-  - `python -m photo_index.outlook_graph_ingest --auth interactive`
-
-- Quick health checks:
-  - Row count:
-    - `sqlite3 data/photo_index.sqlite "SELECT COUNT(*) FROM photo_meta;"`
-  - Last checkpoint:
-    - `cat data/photo_index.checkpoint.json`
-  - Ingest running?:
-    - `pgrep -fl "photo_index.ingest" || echo "not running"`
-
-- Nightly job status (if installed):
-  - `launchctl list | rg com.gptlocalgemma.photoindex.nightly`
-  - Logs:
-    - `tail -f data/nightly_ingest.log`
-    - `tail -f data/nightly_ingest.error.log`
-
+- **LM Studio context:** always load the answer model at **16384+** (ideally 32K–64K
+  for document summarization). The 4096 default silently truncates. Verify with `lms ps`.
+- **GPU memory (Apple Silicon unified memory):** the answer model and the vision
+  model can over-commit a small machine and trigger a GPU fault. The nightly frees
+  the answer model during vision ingest; keep only one large model resident at a time.
+- **Full Disk Access** for the venv Python is required for unattended ingest to read
+  protected app data; re-grant it if you upgrade Python (the binary path changes).

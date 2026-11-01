@@ -103,6 +103,12 @@ def run_messages_ingest(
     conn = connect(index_db_path)
     init_schema(conn)
 
+    # Handle->name map (built from a Contacts CSV, see photo_index.contacts).
+    # Lets new messages carry the contact NAME so name searches find them; empty
+    # {} if no map has been built yet.
+    from photo_index.contacts import load_map, resolve as _resolve_contact
+    _contacts_map = load_map()
+
     if not chat_db_path.exists():
         raise FileNotFoundError(f"Messages DB not found: {chat_db_path}")
 
@@ -160,9 +166,14 @@ def run_messages_ingest(
 
         handle = (r["handle_id"] or "").strip() or "unknown"
         direction = "from_me" if int(r["is_from_me"] or 0) == 1 else "from_them"
-        filename = f"message:{handle}"
+        # Resolve the handle to a contact name so searches by a person's name
+        # match their texts (the message text only holds the phone/email).
+        name = _resolve_contact(handle, _contacts_map) if _contacts_map else None
+        filename = f"message:{handle} | {name}" if name else f"message:{handle}"
         date_iso = _to_iso_from_apple_time(r["date_raw"])
         meta = f"source=messages direction={direction} handle={handle}"
+        if name:
+            meta += f" contact={name}"
 
         try:
             upsert_photo(
