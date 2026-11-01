@@ -2967,6 +2967,14 @@ def _rows_preview(rows: list[sqlite3.Row]) -> list[list[str]]:
     return preview
 
 
+# When searching on a machine that doesn't hold the indexed files (the MacBook,
+# vs the mini where ingest runs), set these so file-backed hits link to the mini's
+# read-only file bridge (photo_index.file_bridge) and stream/open in the browser.
+# Unset (e.g. on the mini itself) → keep the native "open on this machine" button.
+_FILE_BRIDGE_URL = os.environ.get("PHOTO_INDEX_FILE_BRIDGE_URL", "").strip().rstrip("/")
+_FILE_BRIDGE_TOKEN = os.environ.get("PHOTO_INDEX_FILE_BRIDGE_TOKEN", "").strip()
+
+
 def _rows_to_hit_summary(rows: list[list[str]]) -> str:
     if not rows:
         return "No hits yet."
@@ -3021,12 +3029,25 @@ def _rows_to_hit_summary(rows: list[list[str]]) -> str:
             ref = f"`{uuid}`"
         elif image_path and not image_path.startswith("https://"):
             encoded = urllib.parse.quote(image_path, safe="")
-            req_path = f"/open-local-file?path={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
-            data_attr = html.escape(req_path, quote=True)
-            link_md = (
-                '<button type="button" class="pi-open-local-file" '
-                f'data-open-href="{data_attr}">Open local file</button>'
-            )
+            if _FILE_BRIDGE_URL and _FILE_BRIDGE_TOKEN:
+                # Remote search machine: stream the file from the mini's bridge.
+                bridge = (
+                    f"{_FILE_BRIDGE_URL}/file?path={encoded}"
+                    f"&t={urllib.parse.quote(_FILE_BRIDGE_TOKEN, safe='')}"
+                )
+                esc = html.escape(bridge, quote=True)
+                link_md = (
+                    f'<a href="{esc}" target="_blank" rel="noopener noreferrer">'
+                    "Open file</a>"
+                )
+            else:
+                # Local machine holds the file: open in the OS default app.
+                req_path = f"/open-local-file?path={encoded}&t={_OPEN_LOCAL_FILE_TOKEN}"
+                data_attr = html.escape(req_path, quote=True)
+                link_md = (
+                    '<button type="button" class="pi-open-local-file" '
+                    f'data-open-href="{data_attr}">Open local file</button>'
+                )
             ref = f"`{image_path}`"
         elif is_msg:
             link_md = "Use **Open Messages.app** below to jump to your texts"
