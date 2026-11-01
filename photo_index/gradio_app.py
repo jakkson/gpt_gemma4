@@ -2968,11 +2968,25 @@ def _rows_preview(rows: list[sqlite3.Row]) -> list[list[str]]:
 
 
 # When searching on a machine that doesn't hold the indexed files (the MacBook,
-# vs the mini where ingest runs), set these so file-backed hits link to the mini's
-# read-only file bridge (photo_index.file_bridge) and stream/open in the browser.
-# Unset (e.g. on the mini itself) → keep the native "open on this machine" button.
+# vs the mini where ingest runs), set PHOTO_INDEX_FILE_BRIDGE_URL so file-backed
+# hits link to the mini's read-only file bridge (photo_index.file_bridge) and
+# stream/open in the browser. Unset (e.g. on the mini itself) → keep the native
+# "open on this machine" button. The token comes from the env var if set, else the
+# shared token file copied from the mini (data/.file_bridge_token) — so no secret
+# need pass through a shell env.
+def _file_bridge_token() -> str:
+    tok = os.environ.get("PHOTO_INDEX_FILE_BRIDGE_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        p = Path(__file__).resolve().parent.parent / "data" / ".file_bridge_token"
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 _FILE_BRIDGE_URL = os.environ.get("PHOTO_INDEX_FILE_BRIDGE_URL", "").strip().rstrip("/")
-_FILE_BRIDGE_TOKEN = os.environ.get("PHOTO_INDEX_FILE_BRIDGE_TOKEN", "").strip()
+_FILE_BRIDGE_TOKEN = _file_bridge_token()
 
 
 def _rows_to_hit_summary(rows: list[list[str]]) -> str:
