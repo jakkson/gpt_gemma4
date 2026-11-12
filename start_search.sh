@@ -87,9 +87,26 @@ if [[ -x "$LMS_BIN" ]]; then
   if [[ "$need_reload" == "1" ]]; then
     echo "[start_search] loading $PHOTO_INDEX_QA_MODEL (context=$WANT_CTX parallel=$WANT_PARALLEL)..."
     "$LMS_BIN" unload "$PHOTO_INDEX_QA_MODEL" >/dev/null 2>&1 || true
-    "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" --parallel "$WANT_PARALLEL" >/dev/null 2>&1 \
-      && echo "[start_search] loaded (context=$WANT_CTX parallel=$WANT_PARALLEL)" \
-      || echo "[start_search warn] could not load model via lms; answers may truncate or OOM"
+    # Let unified memory actually release before loading. Loading immediately after
+    # an unload can trip LM Studio's "insufficient system resources" guardrail —
+    # the freed GB aren't reclaimed yet — and then the UI comes up with no model
+    # loaded (the "launcher didn't load the 30B" symptom). Settle, then retry once.
+    sleep 3
+    _loaded_ok=0
+    for _try in 1 2; do
+      if "$LMS_BIN" load "$PHOTO_INDEX_QA_MODEL" --context-length "$WANT_CTX" --parallel "$WANT_PARALLEL" >/dev/null 2>&1; then
+        _loaded_ok=1; break
+      fi
+      echo "[start_search] load attempt $_try blocked (likely the RAM guardrail); waiting to retry..."
+      sleep 5
+    done
+    if [[ "$_loaded_ok" == "1" ]]; then
+      echo "[start_search] loaded (context=$WANT_CTX parallel=$WANT_PARALLEL)"
+    else
+      echo "[start_search warn] could NOT load $PHOTO_INDEX_QA_MODEL (LM Studio guardrail / low RAM)."
+      echo "[start_search warn] Open LM Studio, load it manually (click 'Load Anyway' if prompted),"
+      echo "[start_search warn] then refresh the page. The UI will still start and use whatever is loaded."
+    fi
   fi
 fi
 

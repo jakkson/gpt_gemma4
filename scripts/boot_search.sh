@@ -37,8 +37,12 @@ done
   esac
 done
 
-# Embedder (tiny) so nightly embed works even with JIT loading disabled.
-"$LMS" load "$EMBED_MODEL" >/dev/null 2>&1 || true
+# Embedder (tiny) so nightly embed works even with JIT loading disabled. Only load
+# it if it isn't already resident — repeated runs were stacking duplicate instances
+# (text-embedding-...:2, :3) that needlessly held RAM.
+if ! "$LMS" ps 2>/dev/null | awk 'NR>1 && $1!="IDENTIFIER"{print $1}' | grep -qx "$EMBED_MODEL"; then
+  "$LMS" load "$EMBED_MODEL" >/dev/null 2>&1 || true
+fi
 
 # The mini is INGEST-ONLY now: keep the tiny embedder resident for the nightly
 # embed step, but do NOT load the 17 GB answer model or launch the search UI —
