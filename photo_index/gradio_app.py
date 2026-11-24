@@ -2798,12 +2798,29 @@ def _retrieve_rows(
                                                if _priority_tier(r["uuid"], r["image_path_used"])
                                                is not None else 9))
                     pool = in_win if in_win else matched
+                    _per_base_cap = max(2, top_k // 4)
                     rows = _diversify_by_base(pool, top_k, sem_scores,
-                                              per_base_cap=max(2, top_k // 4))
+                                              per_base_cap=_per_base_cap)
                     if len(rows) < top_k:
+                        # Backfill toward top_k, but keep honoring the per-note cap:
+                        # a window with only a few distinct notes must not pad the
+                        # list with duplicate chunks of a note already at the cap.
+                        _bcount: dict[str, int] = {}
+                        for r in rows:
+                            _b = _base_uuid(r["uuid"])
+                            _bcount[_b] = _bcount.get(_b, 0) + 1
                         have = {id(r) for r in rows}
-                        rows.extend(r for r in pool if id(r) not in have)
-                        rows = rows[:top_k]
+                        for r in pool:
+                            if len(rows) >= top_k:
+                                break
+                            if id(r) in have:
+                                continue
+                            _b = _base_uuid(r["uuid"])
+                            if _bcount.get(_b, 0) >= _per_base_cap:
+                                continue
+                            rows.append(r)
+                            have.add(id(r))
+                            _bcount[_b] = _bcount.get(_b, 0) + 1
                 else:
                     rows = matched[:top_k]
                     if len(rows) < top_k:
