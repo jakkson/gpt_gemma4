@@ -1067,6 +1067,14 @@ _CALENDAR_PHRASES = (
 
 def _is_calendar_query(question: str) -> bool:
     ql = (question or "").lower()
+    # An explicit non-calendar corpus ("using Apple Notes", "search my documents")
+    # means the user wants that source's own records, not their agenda. Don't hijack
+    # it into a forward calendar lookup — that floats cal: events and applies a
+    # today→Sunday window that drops earlier-in-the-week notes (e.g. "summarize my
+    # meetings this week" from Apple Notes was losing Monday's meeting notes).
+    _restrict = _source_restriction(question)
+    if _restrict is not None and "cal:" not in _restrict:
+        return False
     if set(re.findall(r"[a-z]+", ql)) & _CALENDAR_TERMS:
         return True
     if any(p in ql for p in _CALENDAR_PHRASES):
@@ -1272,7 +1280,16 @@ def _source_restriction(question: str) -> set[str] | None:
     """When the user restricts the sources EXCLUSIVELY ("using only my notes and
     documents", "search just my emails"), return the allowed uuid-source set so
     results from other sources are dropped. None = no restriction."""
-    ql = " " + " ".join((question or "").lower().split()) + " "
+    # Normalize punctuation to spaces so "Apple Notes," (trailing comma) and
+    # "notes." still match the phrase checks below.
+    ql = " " + " ".join(re.sub(r"[^a-z0-9]+", " ", (question or "").lower()).split()) + " "
+    # Corpus directives that scope the search even without "only/just", e.g.
+    # "using Apple Notes, summarize ...", "in my Apple Notes", "search my notes",
+    # "from my notes". Without this, "Apple Notes" was ignored and the answer
+    # pulled in emails/history (and anchored on the word "apple").
+    if " apple notes " in ql or re.search(
+            r" (?:in|using|from|within|search|across|searching) (?:my )?(?:apple )?notes ", ql):
+        return {"notes:", "evernote:"}
     if not any(w in ql for w in (" only ", " just ", " exclusively ",
                                  " nothing but ", " solely ")):
         return None
@@ -1583,6 +1600,8 @@ _CONTENT_TERM_SKIP = frozenset({
     # as entities and anchor on marketing rows
     "can", "cannot", "word", "words", "summary", "summarize", "summarise",
     "brief", "briefly", "short", "quick",
+    # corpus/scope prepositions ("using Apple Notes", "within my docs") — not topics
+    "using", "within", "across", "via",
 })
 
 
@@ -1620,6 +1639,17 @@ def _query_content_terms(ql: str) -> list[str]:
             continue
         out.append(tok)
     return out
+
+
+def _term_in(term: str, txt: str) -> bool:
+    """Substring match that tolerates a simple English plural, so a query term like
+    'meetings' also matches a note titled 'Sac Log Meeting'. Guarded to longer words
+    and non-'ss' endings so it doesn't over-stem ('press' -> 'pres')."""
+    if term in txt:
+        return True
+    if len(term) >= 6 and term.endswith("s") and not term.endswith("ss"):
+        return term[:-1] in txt
+    return False
 
 
 def _query_years(question: str) -> list[str]:
@@ -2204,6 +2234,11 @@ def _retrieve_rows(
         # the pool, newest first. Token-level FTS can drop the distinctive part
         # ("SF" is under the 3-char floor) and rank generic matches above it.
         q_phrases = _title_phrases(question)
+        if re.search(r"\bapple notes?\b", ql):
+            # "Apple Notes" is the named SOURCE, not a content phrase — filtering
+            # rows to those literally containing "apple notes" would drop the very
+            # notes the user wants (e.g. meeting notes that never say "apple notes").
+            q_phrases = [p for p in q_phrases if p not in ("apple notes", "apple note")]
         if q_phrases:
             for ph in q_phrases[:3]:
                 like = f"%{ph}%"  # SQLite LIKE is already case-insensitive
@@ -2598,6 +2633,10 @@ def _retrieve_rows(
             _window_no_topic = bool(past_win) and not [
                 t for t in _query_content_terms(ql) if t not in _WINDOW_GENERIC]
             _content = [] if (hist_disc or _window_no_topic) else _query_content_terms(ql)
+            if _content and re.search(r"\bapple notes\b", ql):
+                # "apple" here is the source name ("Apple Notes"), not a topic — it
+                # would otherwise anchor on notes mentioning Apple and drop the rest.
+                _content = [t for t in _content if t != "apple"]
             # A named title-phrase ("SF Log Meeting") supersedes single-token
             # anchoring entirely: keep only rows containing the exact phrase.
             # Anchor terms like "summary"/"log" alone let a book chunk or JSON
@@ -2619,7 +2658,7 @@ def _retrieve_rows(
                 # Anchor on the RAREST content term — the distinctive entity
                 # ("walmart"), not a common one ("order") — so multi-word queries
                 # don't dilute with rows that only match the generic word.
-                _counts = {t: sum(1 for _, txt in _pool if t in txt) for t in _content}
+                _counts = {t: sum(1 for _, txt in _pool if _term_in(t, txt)) for t in _content}
                 _present = {t: c for t, c in _counts.items() if c > 0}
                 if _present:
                     # If the query is scoped to a source ("...from CVS"), anchor on
@@ -2638,6 +2677,11 @@ def _retrieve_rows(
                         _topic = [t for t in _present if t != _src]
                         _src_rows = [(r, txt) for r, txt in _pool if _src in txt]
                         if _topic:
+                            # Exact substring (not _term_in's plural stem) for the
+                            # source-scoped topic: stemming "prescriptions"->"prescription"
+                            # here admits recent CVS marketing mail that namedrops the
+                            # singular word, which then buries the real Rx messages under
+                            # pure recency sort. The _anchor else-branch below still stems.
                             _kept = [
                                 r for r, txt in _src_rows
                                 if sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.40
@@ -2656,7 +2700,7 @@ def _retrieve_rows(
                         _anchor = min(_present, key=lambda t: _db_doc_freq(conn, t))
                         _kept = [
                             r for r, txt in _pool
-                            if _anchor in txt
+                            if _term_in(_anchor, txt)
                             or sem_scores.get(str(r["uuid"] or ""), 0.0) >= 0.55
                         ]
                     if _kept:
@@ -2740,7 +2784,11 @@ def _retrieve_rows(
                     # the day's notes to the token-match filter); a window query WITH a
                     # topic keeps the relevance-matched subset.
                     lo, hi = past_win
-                    base_pool = rows if _window_no_topic else matched
+                    # `rows` is already topic-anchored above (plural-tolerant), so scope
+                    # the window from it rather than from `matched` — the latter re-filters
+                    # on exact token overlap and would drop e.g. a "Log Meeting" note for
+                    # the query word "meetings" (plural) even inside the window.
+                    base_pool = rows
                     in_win = [r for r in base_pool
                               if lo <= str(r["date_iso"] or "")[:10] <= hi]
                     # Lead the window summary with the user's source priority (Notes
