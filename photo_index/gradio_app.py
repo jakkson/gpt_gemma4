@@ -62,6 +62,11 @@ _SYNONYMS_PATH = Path(__file__).resolve().parent.parent / "data" / "synonyms.jso
 # answer + follow-up so the model applies them even when the records don't restate
 # them. Edited in the UI or on disk; read fresh each prompt (tiny file).
 _ABOUT_ME_PATH = Path(__file__).resolve().parent.parent / "data" / "about_me.md"
+# Standing answer-style instructions (free text / markdown). UNLIKE about_me.md
+# (which is FACTS), this file governs only HOW answers are written — tone, format,
+# length, ordering. Injected into every answer + follow-up; never overrides the
+# indexed records. Edit on disk (data/primer.md); read fresh each prompt.
+_PRIMER_PATH = Path(__file__).resolve().parent.parent / "data" / "primer.md"
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
@@ -171,6 +176,28 @@ def _about_me_block() -> str:
         "records show a purchase, payment, or event, report it as evidence even "
         "when a profile fact seems to point elsewhere. Records win over profile "
         "facts whenever they appear to conflict.\n\n"
+    )
+
+
+def _primer_block() -> str:
+    """User's standing answer-style instructions (data/primer.md), injected into
+    every answer. Governs HOW the answer is written — tone, format, length, ordering
+    — and NEVER overrides the indexed records. Lines starting with '#' are treated
+    as comments. Returns '' when the file is absent or empty."""
+    try:
+        raw = _PRIMER_PATH.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return ""
+    lines = [ln for ln in raw.splitlines() if not ln.lstrip().startswith("#")]
+    text = "\n".join(lines).strip()
+    if not text:
+        return ""
+    return (
+        "STANDING INSTRUCTIONS (the user's answer-style preferences — follow them "
+        "for tone, format, length, and ordering). These shape HOW you write the "
+        "answer, not what is true: they NEVER override the indexed records or the "
+        "rules below. If one conflicts with the records, the records win.\n"
+        f"{text}\n\n"
     )
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'-]{2,}")
 _TERM_VOCAB_CACHE: dict[str, set[str]] = {}
@@ -485,7 +512,7 @@ def _build_prompt(
             block = f"DATE: {_date_age_label(r['date_iso'])}\n{block}"
             blocks.append(block)
     context = "\n\n---\n\n".join(blocks)
-    about_me = _about_me_block() + _today_note()
+    about_me = _about_me_block() + _primer_block() + _today_note()
     if _is_itinerary_query(question) and _wants_future(question):
         about_me += (
             "BOOKING ORDER: the records below are bookings/confirmations ordered "
@@ -790,7 +817,7 @@ def _chat_system_prompt(context: str) -> str:
         "on-device personal index (their photos, OCR, captions, messages, email, "
         "and notes).\n\n"
         f"{_LOCAL_INDEX_POLICY}"
-        f"{_about_me_block()}{_today_note()}"
+        f"{_about_me_block()}{_primer_block()}{_today_note()}"
         "GROUND RULES\n"
         "- The indexed records below were retrieved as the MOST RELEVANT to the "
         "user's latest message — treat them as the material to answer from. If a "
