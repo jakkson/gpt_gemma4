@@ -306,6 +306,23 @@ def _native_text_already_substantial(row: sqlite3.Row | None, threshold: int) ->
     return len(ocr.strip()) >= threshold
 
 
+def _chunked_native_text_present(conn: sqlite3.Connection, base_uuid: str,
+                                 threshold: int) -> bool:
+    """True when documents_ingest stored this file as CHUNK rows (uuid#0..#N).
+
+    Long PDFs are chunked, so the base `doc:HASH` row is absent and
+    `_existing_row(base)` misses them — which previously made the VLM pass
+    re-OCR the file and write a duplicate base row alongside the text chunks.
+    This detects the chunks (summed text length) so we can skip such
+    already-texted PDFs entirely.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(length(ocr_text)), 0) FROM photo_meta WHERE uuid LIKE ?",
+        (base_uuid + "#%",),
+    ).fetchone()
+    return bool(row and row[0] >= threshold)
+
+
 def run_documents_vlm_ingest(
     *,
     root: Path,
@@ -343,7 +360,7 @@ def run_documents_vlm_ingest(
 
     walk = considered = 0
     indexed = skipped_unchanged = skipped_too_small = skipped_kind = 0
-    skipped_noise = skipped_hidden = errors = 0
+    skipped_noise = skipped_hidden = errors = skipped_already_texted = 0
     last_rel_path = ""
     started_at_unix = time.time()
     t0 = time.perf_counter()
@@ -371,6 +388,7 @@ def run_documents_vlm_ingest(
             "skipped_kind_filter": skipped_kind,
             "skipped_noise_dirs": skipped_noise,
             "skipped_hidden": skipped_hidden,
+            "skipped_already_texted": skipped_already_texted,
             "errors": errors,
             "last_rel_path": last_rel_path,
             "files_per_second": round(rate, 3),
@@ -446,6 +464,16 @@ def run_documents_vlm_ingest(
         size_i = int(st.st_size)
 
         existing = _existing_row(conn, uuid)
+
+        # A long PDF already text-indexed as chunk rows (doc:HASH#0..#N) has no
+        # base row, so `existing` is None here. Processing it would re-OCR the
+        # file and write a duplicate base row beside the chunks. Skip it — the
+        # text pass already covers it. (Short single-row PDFs are handled below
+        # via `existing`, and truly scanned PDFs have no chunks so fall through.)
+        if (not force and is_pdf and existing is None
+                and _chunked_native_text_present(conn, uuid, pdf_native_text_threshold)):
+            skipped_already_texted += 1
+            continue
 
         if not force and existing is not None and _vlm_meta_matches(
             existing["vlm_text"] or "", mtime_ns, size_i
@@ -538,8 +566,8 @@ def run_documents_vlm_ingest(
         f"[vlm-docs done] considered={considered} indexed={indexed} "
         f"unchanged={skipped_unchanged} too_small={skipped_too_small} "
         f"kind_skipped={skipped_kind} noise={skipped_noise} "
-        f"hidden={skipped_hidden} errors={errors} "
-        f"elapsed={elapsed:.1f}s db={index_db_path}"
+        f"hidden={skipped_hidden} already_texted={skipped_already_texted} "
+        f"errors={errors} elapsed={elapsed:.1f}s db={index_db_path}"
     )
     conn.close()
     return {
@@ -547,6 +575,7 @@ def run_documents_vlm_ingest(
         "indexed": indexed,
         "skipped_unchanged": skipped_unchanged,
         "skipped_too_small": skipped_too_small,
+        "skipped_already_texted": skipped_already_texted,
         "errors": errors,
         "elapsed": elapsed,
     }

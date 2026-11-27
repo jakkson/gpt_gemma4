@@ -170,7 +170,12 @@ def _should_skip_unchanged(
 ) -> bool:
     if force:
         return False
-    row = conn.execute("SELECT vlm_text FROM photo_meta WHERE uuid = ?", (uuid,)).fetchone()
+    # A file is either one row (uuid) or many chunk rows (uuid#0, uuid#1, …);
+    # check either representation for the unchanged mtime/size stamp.
+    row = conn.execute(
+        "SELECT vlm_text FROM photo_meta WHERE uuid IN (?, ?) LIMIT 1",
+        (uuid, f"{uuid}#0"),
+    ).fetchone()
     if row is None:
         return False
     blob = row[0] or ""
@@ -178,6 +183,55 @@ def _should_skip_unchanged(
     if not m:
         return False
     return int(m.group(1)) == mtime_ns and int(m.group(2)) == size
+
+
+# --- Chunking large documents (books, long PDFs) -----------------------------
+#
+# A whole book stored as ONE row is useless for RAG: the prompt only shows a
+# small slice per record, so the model sees page 1 and nothing else. Split long
+# text into overlapping passages, each its own indexed+embedded row, so the
+# retriever can surface the RELEVANT passage and the model reads it in full.
+_CHUNK_MIN_CHARS = 6_000     # below this: keep as a single row
+_CHUNK_SIZE = 1_800          # target chars per chunk (fits the prompt field cap)
+_CHUNK_OVERLAP = 250         # carry-over tail for cross-boundary context
+_CHUNK_MAX = 600             # safety cap on chunks per file (very large books)
+
+# Only PROSE files get chunked into passages. Data/code files (csv, json, xlsx,
+# source code, plists…) stay a single truncated row: nobody retrieves "page 37
+# of a contacts CSV", and chunking them would add ~100K noise rows competing
+# with real content in every search. FTS still matches terms in the single row.
+_PROSE_CHUNK_EXTS = frozenset({
+    ".pdf", ".doc", ".docx", ".txt", ".rtf", ".md", ".markdown",
+    ".html", ".htm", ".epub", ".pages", ".odt", ".pptx", ".key",
+})
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split into ~_CHUNK_SIZE passages on paragraph boundaries, with overlap."""
+    text = text.strip()
+    if len(text) <= _CHUNK_MIN_CHARS:
+        return [text]
+    paras = re.split(r"\n\s*\n", text)
+    chunks: list[str] = []
+    cur = ""
+    for p in paras:
+        p = p.strip()
+        if not p:
+            continue
+        if cur and len(cur) + len(p) + 2 > _CHUNK_SIZE:
+            chunks.append(cur)
+            cur = cur[-_CHUNK_OVERLAP:] + "\n\n" + p  # overlap tail for context
+        else:
+            cur = (cur + "\n\n" + p) if cur else p
+        # A single paragraph larger than the target gets hard-split.
+        while len(cur) > _CHUNK_SIZE * 1.6:
+            chunks.append(cur[:_CHUNK_SIZE])
+            cur = cur[_CHUNK_SIZE - _CHUNK_OVERLAP:]
+        if len(chunks) >= _CHUNK_MAX:
+            break
+    if cur.strip() and len(chunks) < _CHUNK_MAX:
+        chunks.append(cur)
+    return chunks[:_CHUNK_MAX]
 
 
 _TEXT_EXT = frozenset(
@@ -248,22 +302,61 @@ def extract_pptx(path: Path) -> str:
 
 
 def extract_xlsx(path: Path) -> str:
+    """Extract a spreadsheet as HEADER-RESOLVED text: each data cell is emitted
+    with its column header (and the row's label) inline — e.g. "05:00 PM — Mon
+    09-15: America's Funniest Videos" — instead of a raw flattened grid. This
+    spares the LLM the 2-D lookup (mapping a cell back to a far-away header row +
+    header column) that makes grid data like a TV schedule unanswerable when
+    flattened. Falls back to tab-flattening for sheets with no detectable header."""
     from openpyxl import load_workbook
+    from datetime import datetime as _dt, date as _date
+
+    def fmt(c) -> str:
+        if c is None:
+            return ""
+        if isinstance(c, _dt):
+            return (c.strftime("%a %m-%d") if (c.hour == 0 and c.minute == 0)
+                    else c.strftime("%a %m-%d %H:%M"))
+        if isinstance(c, _date):
+            return c.strftime("%a %m-%d")
+        return str(c).strip()
 
     wb = load_workbook(path, read_only=True, data_only=True)
     parts: list[str] = []
     try:
         for sheet in wb.worksheets:
             parts.append(f"## Sheet: {sheet.title}")
-            for row in sheet.iter_rows(max_row=5000, values_only=True):
-                cells = []
-                for c in row:
-                    if c is None:
-                        cells.append("")
-                    else:
-                        cells.append(str(c).strip())
-                if any(x for x in cells):
-                    parts.append("\t".join(cells))
+            rows = [[fmt(c) for c in r]
+                    for r in sheet.iter_rows(max_row=5000, values_only=True)]
+            # Header row = the first of the first 6 rows with >=2 DISTINCT
+            # non-empty cells (skips repeated banner rows like "KPYX KPYX ...").
+            header: list[str] | None = None
+            header_idx = -1
+            for i, r in enumerate(rows[:6]):
+                ne = [v for v in r if v]
+                if len(ne) >= 2 and len(set(ne)) >= 2:
+                    header, header_idx = r, i
+                    break
+            for i, r in enumerate(rows):
+                if not any(r):
+                    continue
+                if header is None or i <= header_idx:
+                    parts.append("\t".join(v for v in r if v))
+                    continue
+                label = r[0]
+                frags = []
+                for c in range(1, len(r)):
+                    v = r[c]
+                    if not v:
+                        continue
+                    col = header[c] if c < len(header) else ""
+                    frags.append(f"{col}: {v}" if col else v)
+                if not frags:
+                    if label:
+                        parts.append(label)
+                    continue
+                body = "; ".join(frags)
+                parts.append(f"{label} — {body}" if label else body)
     finally:
         wb.close()
     return "\n".join(parts)
@@ -291,6 +384,57 @@ def extract_rtf(path: Path) -> str:
 
     txt = extract_text_plain(path)
     return rtf_to_text(txt)
+
+
+def extract_epub(path: Path) -> str:
+    """EPUB = a zip of XHTML chapters. Stdlib-only: read the OPF spine for the
+    author's chapter order (fallback: name-sorted), strip HTML to plain text
+    with the same stripper the mail ingest uses."""
+    import posixpath
+    import urllib.parse
+    import zipfile
+
+    from photo_index.mail_ingest import _strip_html
+
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        html_names = [n for n in names if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        ordered: list[str] | None = None
+        opf = next((n for n in names if n.lower().endswith(".opf")), None)
+        if opf:
+            try:
+                opf_xml = z.read(opf).decode("utf-8", "replace")
+                manifest = dict(
+                    re.findall(r'<item\b[^>]*\bid="([^"]+)"[^>]*\bhref="([^"]+)"', opf_xml)
+                )
+                # Some OPFs put href before id.
+                for href, iid in re.findall(
+                    r'<item\b[^>]*\bhref="([^"]+)"[^>]*\bid="([^"]+)"', opf_xml
+                ):
+                    manifest.setdefault(iid, href)
+                spine = re.findall(r'<itemref\b[^>]*\bidref="([^"]+)"', opf_xml)
+                base = posixpath.dirname(opf)
+                cand = []
+                for iid in spine:
+                    href = manifest.get(iid)
+                    if not href:
+                        continue
+                    p = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href)))
+                    if p in names:
+                        cand.append(p)
+                if cand:
+                    ordered = cand
+            except Exception:
+                ordered = None
+        parts: list[str] = []
+        for n in (ordered or sorted(html_names))[:500]:
+            try:
+                t = _strip_html(z.read(n).decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if t:
+                parts.append(t)
+    return "\n\n".join(parts)
 
 
 def extract_textutil(path: Path) -> str | None:
@@ -326,6 +470,8 @@ def extract_auto(path: Path, ext: str) -> tuple[str | None, str, str | None]:
             return extract_xlsx(path), "openpyxl", None
         if ext == ".xls":
             return extract_xls(path), "xlrd", None
+        if ext == ".epub":
+            return extract_epub(path), "epub-zip", None
         if ext == ".rtf":
             try:
                 return extract_rtf(path), "striprtf", None
@@ -365,10 +511,18 @@ def run_documents_ingest(
     skip_images: bool,
     skip_audio: bool,
     max_chars_per_file: int,
+    exclude: tuple[str, ...] = (),
+    index_media_filenames: bool = False,
 ) -> dict[str, int | float]:
     root = Path(os.path.abspath(root)).resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Root is not a directory: {root}")
+    # Absolute, resolved prefixes to skip entirely (e.g. a noisy subfolder).
+    exclude_prefixes = tuple(
+        str(Path(os.path.abspath(os.path.expanduser(e))).resolve()) for e in exclude
+    )
+    if exclude_prefixes:
+        _log(f"[documents] excluding paths under: {', '.join(exclude_prefixes)}")
 
     conn = connect(index_db_path)
     init_schema(conn)
@@ -496,11 +650,12 @@ def run_documents_ingest(
             skipped_temp += 1
             continue
         ext = p.suffix.lower()
-        if ext in _VIDEO_EXT:
+        is_media = ext in _VIDEO_EXT or ext in _AUDIO_EXT
+        # Video/audio: index the FILENAME only (searchable by name, no content
+        # extraction / transcription / VLM) when enabled; else skip entirely.
+        media_only = index_media_filenames and is_media
+        if is_media and not media_only:
             skipped_video += 1
-            continue
-        if skip_audio and ext in _AUDIO_EXT:
-            skipped_media += 1
             continue
         if skip_images and ext in _RASTER_IMAGE_EXT:
             skipped_media += 1
@@ -509,6 +664,9 @@ def run_documents_ingest(
             rp = p.resolve()
             rel_parts = rp.relative_to(root_rp).parts
         except ValueError:
+            continue
+        if exclude_prefixes and str(rp).startswith(exclude_prefixes):
+            skipped_noise += 1
             continue
         if any(seg.startswith(".") for seg in rel_parts):
             skipped_hidden += 1
@@ -552,6 +710,42 @@ def run_documents_ingest(
             skipped_dup += 1
             continue
 
+        if media_only:
+            # Filename-only index for video/audio: one row, searchable by name
+            # and relative path, with NO content extraction (no transcription or
+            # VLM). Lets "the interview mp4 from the parade" be found by name.
+            rel = rel_for(path)
+            iso = None
+            _mt = getattr(st, "st_mtime", 0)
+            if _mt > 0:
+                iso = datetime.fromtimestamp(_mt, tz=timezone.utc).isoformat()
+            meta = _meta_line(mtime_ns, size_i, rel, root_display)
+            try:
+                conn.execute(
+                    "DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
+                    (uuid, uuid + "#%"),
+                )
+            except Exception:
+                pass
+            try:
+                upsert_photo(
+                    conn,
+                    uuid=uuid,
+                    filename=rel,
+                    date_iso=iso,
+                    ocr_text=f"{p.name}\n{rel}",
+                    vlm_text=f"{meta}\nextractor=filename-only ({ext.lstrip('.')})",
+                    image_path_used=str(path),
+                    commit=False,
+                )
+                indexed += 1
+                if commit_every <= 1 or indexed % commit_every == 0:
+                    commit_ingest(conn)
+            except Exception as e:
+                errors += 1
+                _log(f"[documents warn] {path} filename-only: {e}")
+            continue
+
         text_raw, how, extract_err = extract_auto(path, ext)
         rel_for_report = rel_for(path)
         if not text_raw or not text_raw.strip():
@@ -581,7 +775,15 @@ def run_documents_ingest(
                     empty_overflow += 1
             continue
 
-        blob = _truncate(text_raw.strip(), max_chars_per_file)
+        # Chunk long PROSE docs into passages; short files and data/code files
+        # stay a single row. Cap total per file so a pathological doc can't
+        # explode the index.
+        if ext in _PROSE_CHUNK_EXTS:
+            chunks = _chunk_text(text_raw.strip())
+        else:
+            chunks = [text_raw.strip()]
+        if len(chunks) == 1:
+            chunks = [_truncate(chunks[0], max_chars_per_file)]
 
         mt = getattr(st, "st_mtime", 0)
         iso = None
@@ -592,23 +794,40 @@ def run_documents_ingest(
         meta = _meta_line(mtime_ns, size_i, rel, root_display)
         how_line = f"extractor={how}"
 
+        # Clean slate for this file: remove any prior rows (a former single-row
+        # book becoming chunks, or a changed chunk count) before writing.
         try:
-            upsert_photo(
-                conn,
-                uuid=uuid,
-                filename=rel,
-                date_iso=iso,
-                ocr_text=blob,
-                vlm_text=f"{meta}\n{how_line}",
-                image_path_used=str(path),
-                commit=False,
+            conn.execute(
+                "DELETE FROM photo_meta WHERE uuid = ? OR uuid LIKE ?",
+                (uuid, uuid + "#%"),
             )
+        except Exception:
+            pass
+
+        n = len(chunks)
+        wrote = 0
+        for i, chunk in enumerate(chunks):
+            cu = uuid if n == 1 else f"{uuid}#{i}"
+            fn = rel if n == 1 else f"{rel} [part {i + 1}/{n}]"
+            try:
+                upsert_photo(
+                    conn,
+                    uuid=cu,
+                    filename=fn,
+                    date_iso=iso,
+                    ocr_text=chunk,
+                    vlm_text=f"{meta}\n{how_line}",
+                    image_path_used=str(path),
+                    commit=False,
+                )
+                wrote += 1
+            except Exception as e:
+                errors += 1
+                _log(f"[documents warn] {path} chunk {i + 1}/{n}: {e}")
+        if wrote:
             indexed += 1
             if commit_every <= 1 or indexed % commit_every == 0:
                 commit_ingest(conn)
-        except Exception as e:
-            errors += 1
-            _log(f"[documents warn] {path}: {e}")
 
     commit_ingest(conn)
     _maybe_checkpoint(finished=True)
@@ -674,10 +893,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Include audio extensions (normally skipped — little extractable text).",
     )
     p.add_argument(
+        "--index-media-filenames",
+        action="store_true",
+        help="Index video/audio files by FILENAME only (searchable by name; no "
+             "content extraction, transcription, or VLM). Overrides the normal "
+             "video/audio skip.",
+    )
+    p.add_argument(
         "--max-chars-per-file",
         type=int,
         default=400_000,
         help="Truncate stored text beyond this character count.",
+    )
+    p.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Skip files under this path (repeatable). E.g. a noisy subfolder.",
     )
     p.add_argument(
         "--no-global-ingest-lock",
@@ -712,6 +945,8 @@ def main(argv: list[str] | None = None) -> None:
             skip_images=not args.include_images,
             skip_audio=not args.include_audio,
             max_chars_per_file=max(10_000, args.max_chars_per_file),
+            exclude=tuple(args.exclude),
+            index_media_filenames=args.index_media_filenames,
         )
 
     if args.no_global_ingest_lock:
