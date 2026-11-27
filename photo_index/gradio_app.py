@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -35,6 +36,7 @@ from PIL import Image
 
 from photo_index.llm_client import (
     chat_completion_text,
+    chat_completion_with_logprob,
     chat_user_prompt,
     embed_query,
     inference_opts_for_model,
@@ -775,6 +777,14 @@ def _prompt_field_cap_for_model(model: str) -> int | None:
 # same resident model). A no-GPU support check: do the answer's hard claims
 # (numbers, dates, money, proper nouns) actually appear in the retrieved rows?
 _ESCALATE_BELOW = float(os.environ.get("PHOTO_INDEX_ESCALATE_BELOW", "0.45"))
+# Optional token-level signal (the paper's router probe). When on, the first
+# answer call is non-streaming and returns its mean token log-probability; an
+# egregiously unsure answer then gets pulled into escalation range even if it
+# happened to echo context tokens. Off by default: it forces a non-streaming
+# answer call, and the floor wants tuning on your own model. _LOGPROB_MIN is a
+# geometric-mean token probability in (0, 1] (0.33 ~ mean logprob -1.1).
+_LOGPROB_GATE = os.environ.get("PHOTO_INDEX_LOGPROB_GATE", "0") == "1"
+_LOGPROB_MIN = float(os.environ.get("PHOTO_INDEX_LOGPROB_MIN", "0.33"))
 _CLAIM_RE = re.compile(
     r"\$\s?\d[\d,]*\.?\d*"                                   # $51.25, $ 1,200
     r"|\b\d[\d,]*\.?\d*\s?%"                                 # 3.5%
@@ -803,25 +813,38 @@ def _norm_claim(c: str) -> str:
     return c
 
 
-def _answer_confidence(answer: str, rows: list[sqlite3.Row]) -> tuple[float, str]:
+def _answer_confidence(
+    answer: str,
+    rows: list[sqlite3.Row],
+    mean_logprob: float | None = None,
+) -> tuple[float, str]:
     """No-GPU support score in 0..1: the share of the answer's checkable claims
     (numbers, dates, money, multiword proper nouns) that appear in the rows the
-    model was shown. Soft answers with nothing checkable are not penalized."""
+    model was shown. Soft answers with nothing checkable are not penalized. When
+    ``mean_logprob`` is given and the token-level confidence is egregiously low,
+    the score is pulled into escalation range regardless of overlap."""
     if _policy_refusal_answer(answer):
-        return 0.0, "refusal"
-    if _low_confidence_answer(answer):
-        return 0.2, "hedged"
-    ctx = " ".join(row_to_prompt_block(r) for r in rows).lower()
-    ctx = re.sub(r"\s+", " ", ctx)
-    claims = {_norm_claim(c) for c in _CLAIM_RE.findall(answer)}
-    claims.discard("")
-    # Drop claims that are substrings of a longer claim (e.g. "23" inside "Nov 23")
-    # so a matched date isn't double-counted as an unmatched bare number.
-    claims = {c for c in claims if not any(c != o and c in o for o in claims)}
-    if not claims:
-        return 0.75, "no_hard_claims"
-    hit = sum(1 for c in claims if c in ctx)
-    return hit / len(claims), f"grounded {hit}/{len(claims)}"
+        g, why = 0.0, "refusal"
+    elif _low_confidence_answer(answer):
+        g, why = 0.2, "hedged"
+    else:
+        ctx = " ".join(row_to_prompt_block(r) for r in rows).lower()
+        ctx = re.sub(r"\s+", " ", ctx)
+        claims = {_norm_claim(c) for c in _CLAIM_RE.findall(answer)}
+        claims.discard("")
+        # Drop claims that are substrings of a longer claim (e.g. "23" inside
+        # "Nov 23") so a matched date isn't double-counted as a bare number.
+        claims = {c for c in claims if not any(c != o and c in o for o in claims)}
+        if not claims:
+            g, why = 0.75, "no_hard_claims"
+        else:
+            hit = sum(1 for c in claims if c in ctx)
+            g, why = hit / len(claims), f"grounded {hit}/{len(claims)}"
+    if mean_logprob is not None:
+        lp = math.exp(max(mean_logprob, -20.0))  # geometric-mean token prob in (0,1]
+        if lp < _LOGPROB_MIN:
+            g, why = min(g, 0.3), f"{why};lp {lp:.2f}"
+    return g, why
 
 
 def _escalate_low_confidence(
@@ -875,6 +898,25 @@ def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
         )
     except Exception as e:
         return "", str(e)
+
+
+def _safe_chat_lp(*, model: str, prompt: str) -> tuple[str, str | None, float | None]:
+    """Like _safe_chat but also returns the reply's mean token log-probability.
+    Falls back to the ordinary streaming call (with its shrink-on-overflow
+    handling) if the non-streaming logprob call fails, so it never regresses the
+    baseline — only loses the logprob."""
+    opts = inference_opts_for_model(model)
+    try:
+        text, lp = chat_completion_with_logprob(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=float(opts["timeout"]),
+            max_tokens=int(opts["max_tokens"]),
+        )
+        return text, None, lp
+    except Exception:
+        text, err = _safe_chat(model=model, prompt=prompt)
+        return text, err, None
 
 
 # --- Follow-up conversation ---------------------------------------------------
@@ -3504,7 +3546,11 @@ def answer_question(
         conversational=conversational,
     )
 
-    answer, err = _safe_chat(model=first_model, prompt=prompt)
+    if _LOGPROB_GATE:
+        answer, err, first_lp = _safe_chat_lp(model=first_model, prompt=prompt)
+    else:
+        answer, err = _safe_chat(model=first_model, prompt=prompt)
+        first_lp = None
     used_model = first_model
     if err:
         if first_model != qa_model:
@@ -3553,7 +3599,10 @@ def answer_question(
     # retrieved rows, try one wider-retrieval pass on the same resident model
     # (no model swap, no network). Aggregate pulls already retrieve wide.
     if rows and not aggregate_mode:
-        conf, conf_why = _answer_confidence(answer, rows)
+        # The logprob is only valid if the first-model answer is still the one in
+        # hand; a retry above would have swapped the model (and the probe).
+        probe_lp = first_lp if used_model == first_model else None
+        conf, conf_why = _answer_confidence(answer, rows, mean_logprob=probe_lp)
         if conf < _ESCALATE_BELOW:
             answer, used_model, route = _escalate_low_confidence(
                 question=effective_query, db_path=db_path, rows=rows,

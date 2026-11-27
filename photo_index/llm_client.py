@@ -179,6 +179,35 @@ def chat_user_prompt(
     )
 
 
+def chat_completion_with_logprob(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float | None = None,
+    max_tokens: int | None = None,
+) -> tuple[str, float | None]:
+    """Like ``chat_completion_text`` but also returns the mean per-token
+    log-probability of the reply, a cheap confidence signal. Forces a
+    non-streaming call so the logprobs come back inline. Returns ``None`` for the
+    logprob on backends that do not report it (e.g. Ollama)."""
+    messages = _apply_no_think(messages)
+    opts = inference_opts_for_model(model)
+    if timeout is None:
+        timeout = float(opts["timeout"])
+    if max_tokens is None:
+        max_tokens = int(opts["max_tokens"])
+    backend = llm_backend()
+    if backend in ("openai", "lmstudio", "llama.cpp", "llamacpp"):
+        return _openai_compatible_chat_logprob(
+            model=model, messages=messages, timeout=timeout, max_tokens=max_tokens,
+        )
+    text = chat_completion_text(
+        model=model, messages=messages, timeout=timeout, max_tokens=max_tokens,
+        stream=False,
+    )
+    return text, None
+
+
 _DEFAULT_EMBED_MODEL = "text-embedding-nomic-embed-text-v1.5"
 # nomic-embed-text was trained with task prefixes; using them materially improves
 # retrieval quality. Documents and queries get different prefixes.
@@ -522,6 +551,67 @@ def _openai_compatible_chat(
     if text is not None:
         return str(text).strip()
     raise RuntimeError(f"Could not parse assistant text from {url}: {first!r}")
+
+
+def _mean_logprob(choice: dict[str, Any]) -> float | None:
+    """Mean per-token log-probability from an OpenAI-style choice, or None.
+
+    Handles the chat shape (``logprobs.content[].logprob``) and the legacy
+    completions shape (``logprobs.token_logprobs``)."""
+    lp = choice.get("logprobs")
+    if not isinstance(lp, dict):
+        return None
+    vals: list[float] = []
+    content = lp.get("content")
+    if isinstance(content, list):
+        for tok in content:
+            if isinstance(tok, dict) and isinstance(tok.get("logprob"), (int, float)):
+                vals.append(float(tok["logprob"]))
+    if not vals and isinstance(lp.get("token_logprobs"), list):
+        vals = [float(x) for x in lp["token_logprobs"] if isinstance(x, (int, float))]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _openai_compatible_chat_logprob(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float,
+    max_tokens: int,
+) -> tuple[str, float | None]:
+    """A non-streaming chat completion that also requests token logprobs.
+    Returns (text, mean_logprob or None)."""
+    url = f"{openai_base_url()}/chat/completions"
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": float(os.environ.get("PHOTO_INDEX_LLM_TEMPERATURE", "0.2")),
+        "logprobs": True,
+    }
+    data = _http_json("POST", url, payload, timeout=timeout)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected response from {url}: not a JSON object")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"No choices in LLM response from {url}: {data!r}")
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    text = ""
+    msg = first.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if content is not None and str(content).strip():
+            text = str(content).strip()
+        elif msg.get("reasoning_content") and str(msg["reasoning_content"]).strip():
+            text = str(msg["reasoning_content"]).strip()
+    if not text and first.get("text") is not None:
+        text = str(first["text"]).strip()
+    if not text:
+        raise RuntimeError(f"Could not parse assistant text from {url}: {first!r}")
+    return text, _mean_logprob(first)
 
 
 def _openai_compatible_model_ids() -> list[str]:
