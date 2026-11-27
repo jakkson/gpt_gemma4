@@ -771,6 +771,95 @@ def _prompt_field_cap_for_model(model: str) -> int | None:
     return None
 
 
+# Answers below this groundedness score get one escalation pass (deeper retrieval,
+# same resident model). A no-GPU support check: do the answer's hard claims
+# (numbers, dates, money, proper nouns) actually appear in the retrieved rows?
+_ESCALATE_BELOW = float(os.environ.get("PHOTO_INDEX_ESCALATE_BELOW", "0.45"))
+_CLAIM_RE = re.compile(
+    r"\$\s?\d[\d,]*\.?\d*"                                   # $51.25, $ 1,200
+    r"|\b\d[\d,]*\.?\d*\s?%"                                 # 3.5%
+    r"|\b\d{4}-\d{2}-\d{2}\b"                                # 2026-11-23
+    r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}\b"  # Nov 23
+    r"|\b[A-Z][a-zA-Z0-9&'.-]+(?:\s+[A-Z][a-zA-Z0-9&'.-]+)+\b"  # multiword proper nouns
+    r"|\b\d{3,}\b"                                           # bare multi-digit numbers (amounts, ids)
+)
+
+
+# Sentence-initial capitals that glue onto a real proper noun ("Your SF Log
+# Meeting") must not become part of the claim being matched.
+_CLAIM_LEAD_STOP = {
+    "your", "the", "a", "an", "this", "that", "my", "these", "those",
+    "it", "he", "she", "they", "we", "i", "our", "his", "her", "their",
+}
+
+
+def _norm_claim(c: str) -> str:
+    """Lowercase a captured claim, drop surrounding punctuation and currency
+    marks, and strip a leading determiner/pronoun off a proper-noun phrase."""
+    c = c.strip().strip(".,;:!?)('\"").replace("$", "").strip().lower()
+    parts = c.split()
+    if len(parts) > 1 and parts[0] in _CLAIM_LEAD_STOP:
+        c = " ".join(parts[1:])
+    return c
+
+
+def _answer_confidence(answer: str, rows: list[sqlite3.Row]) -> tuple[float, str]:
+    """No-GPU support score in 0..1: the share of the answer's checkable claims
+    (numbers, dates, money, multiword proper nouns) that appear in the rows the
+    model was shown. Soft answers with nothing checkable are not penalized."""
+    if _policy_refusal_answer(answer):
+        return 0.0, "refusal"
+    if _low_confidence_answer(answer):
+        return 0.2, "hedged"
+    ctx = " ".join(row_to_prompt_block(r) for r in rows).lower()
+    ctx = re.sub(r"\s+", " ", ctx)
+    claims = {_norm_claim(c) for c in _CLAIM_RE.findall(answer)}
+    claims.discard("")
+    # Drop claims that are substrings of a longer claim (e.g. "23" inside "Nov 23")
+    # so a matched date isn't double-counted as an unmatched bare number.
+    claims = {c for c in claims if not any(c != o and c in o for o in claims)}
+    if not claims:
+        return 0.75, "no_hard_claims"
+    hit = sum(1 for c in claims if c in ctx)
+    return hit / len(claims), f"grounded {hit}/{len(claims)}"
+
+
+def _escalate_low_confidence(
+    *,
+    question: str,
+    db_path: Path,
+    rows: list[sqlite3.Row],
+    base_answer: str,
+    qa_model: str,
+    top_k: int,
+    sort_by: str,
+    restrict_finance: bool,
+    conversational: bool,
+    route: str,
+) -> tuple[str, str, str]:
+    """One cheap escalation rung: re-retrieve wider with the SAME resident model,
+    and keep the new answer only if it is better grounded. No model swap, no
+    network. Returns (answer, used_model, route)."""
+    deep = _retrieve_rows(
+        db_path=db_path, question=question, top_k=max(top_k, 40),
+        sort_by=sort_by, restrict_finance=restrict_finance,
+    )
+    if not deep:
+        return base_answer, qa_model, route + "->low_conf_kept"
+    p2 = _build_prompt(
+        question, deep,
+        field_char_cap=_prompt_field_cap_for_model(qa_model),
+        conversational=conversational,
+    )
+    txt, err = _safe_chat(model=qa_model, prompt=p2)
+    if txt and not err:
+        new_conf, _ = _answer_confidence(txt, deep)
+        base_conf, _ = _answer_confidence(base_answer, rows)
+        if new_conf >= _ESCALATE_BELOW or new_conf > base_conf:
+            return txt, qa_model, route + "->deep_retrieval"
+    return base_answer, qa_model, route + "->low_conf_kept"
+
+
 def _safe_chat(*, model: str, prompt: str) -> tuple[str, str | None]:
     opts = inference_opts_for_model(model)
     try:
@@ -3460,6 +3549,18 @@ def answer_question(
             answer = retry_text
             used_model = qa_model
             route = f"{route}->policy_retry_large"
+    # Groundedness gate: if the answer's checkable claims aren't supported by the
+    # retrieved rows, try one wider-retrieval pass on the same resident model
+    # (no model swap, no network). Aggregate pulls already retrieve wide.
+    if rows and not aggregate_mode:
+        conf, conf_why = _answer_confidence(answer, rows)
+        if conf < _ESCALATE_BELOW:
+            answer, used_model, route = _escalate_low_confidence(
+                question=effective_query, db_path=db_path, rows=rows,
+                base_answer=answer, qa_model=qa_model, top_k=effective_top_k,
+                sort_by=sort_by, restrict_finance=restrict_finance,
+                conversational=conversational, route=f"{route}[{conf_why}]",
+            )
     if autocorrect_note:
         answer = f"{autocorrect_note}\n\n---\n\n{answer}"
     preview_rows = _rows_preview(rows)
